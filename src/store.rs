@@ -270,6 +270,15 @@ fn load(tx: &Transaction) -> rusqlite::Result<State> {
             _ => None,
         })
         .collect::<BTreeSet<_>>();
+    let undo: Option<String> = tx
+        .query_row(
+            "SELECT value FROM settings WHERE name = 'undo'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    // Losing an unreadable undo entry only means there is nothing to undo.
+    state.undo = undo.and_then(|json| serde_json::from_str(&json).ok());
     Ok(state)
 }
 
@@ -335,6 +344,14 @@ fn save(tx: &Transaction, state: &State) -> rusqlite::Result<()> {
         "INSERT OR REPLACE INTO settings VALUES ('open_sections', ?1)",
         [sections.join(",")],
     )?;
+    match &state.undo {
+        Some(undo) => tx.execute(
+            "INSERT OR REPLACE INTO settings VALUES ('undo', ?1)",
+            [serde_json::to_string(undo)
+                .map_err(|error| rusqlite::Error::ToSqlConversionFailure(error.into()))?],
+        )?,
+        None => tx.execute("DELETE FROM settings WHERE name = 'undo'", [])?,
+    };
     Ok(())
 }
 
@@ -403,10 +420,10 @@ mod tests {
     }
 
     #[test]
-    fn threads_and_open_sections_survive_a_round_trip() {
+    fn threads_open_sections_and_undo_survive_a_round_trip() {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::at(dir.path().to_owned());
-        store
+        let saved_undo = store
             .transact(|state| {
                 state
                     .records
@@ -419,11 +436,21 @@ mod tests {
                     },
                 );
                 state.open_sections.insert(Section::Settled);
+                state.rename("terminal:t1", Some("release notes".into()), 9);
+                state.undo.clone()
             })
             .unwrap();
-        let (records, sections) = store
-            .transact(|state| (state.records.clone(), state.open_sections.clone()))
+        let (records, sections, undo) = store
+            .transact(|state| {
+                (
+                    state.records.clone(),
+                    state.open_sections.clone(),
+                    state.undo.clone(),
+                )
+            })
             .unwrap();
+        assert!(undo.is_some());
+        assert_eq!(undo, saved_undo);
         assert_eq!(records["session:codex:id:0199-abc"], record());
         assert_eq!(records.len(), 2);
         assert_eq!(sections, BTreeSet::from([Section::Settled]));

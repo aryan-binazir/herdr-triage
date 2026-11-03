@@ -22,7 +22,9 @@ use serde_json::{Map, Value};
 use herdr::{Agent, Herdr, Tab, Workspace};
 use picker::{Effect, Item, Picker};
 use store::Store;
-use triage::{Action, After, Observed, Park, ReopenPlan, Row, Section, SessionRef, State, Thread};
+use triage::{
+    Action, After, Observed, Park, Refusal, ReopenPlan, Row, Section, SessionRef, State, Thread,
+};
 
 const DEFAULT_PIN_ICON: &str = "\u{f435}";
 const WALL_CLOCK_RECHECK_SECS: u64 = 30;
@@ -63,6 +65,7 @@ struct Snapshot {
     tabs: Vec<Tab>,
     rows: Vec<Row>,
     open_sections: BTreeSet<Section>,
+    undoable: bool,
 }
 
 fn now() -> i64 {
@@ -131,6 +134,7 @@ fn sync_locked<R>(
             tabs,
             rows,
             open_sections,
+            undoable: state.undo.is_some(),
         },
         edited,
     ))
@@ -317,21 +321,31 @@ struct Performed {
 }
 
 fn perform(herdr: &mut Herdr, store: &Store, key: &str, action: Action) -> io::Result<Performed> {
-    let (snapshot, after) = sync(herdr, store, |state, observed| {
+    carry_out(herdr, store, |state, observed| {
         let agent = observed.iter().find(|agent| agent.key == key);
-        state.apply(key, agent, action, now())
-    })?;
+        let after = state.apply(key, agent, action, now())?;
+        Ok((key.to_owned(), after))
+    })
+}
+
+/// Makes a triage change, then closes or reopens whatever it asks for.
+fn carry_out(
+    herdr: &mut Herdr,
+    store: &Store,
+    edit: impl FnOnce(&mut State, &[Observed]) -> Result<(String, After), Refusal>,
+) -> io::Result<Performed> {
+    let (snapshot, after) = sync(herdr, store, edit)?;
     let mut performed = Performed::default();
     let outcome = match after {
         Err(refusal) => {
             performed.refusal = Some(refusal.0);
             Ok(())
         }
-        Ok(After::Nothing) => Ok(()),
-        Ok(After::ClosePane) => {
-            close_session(herdr, store, &snapshot, key).map(|notice| performed.notice = notice)
+        Ok((_, After::Nothing)) => Ok(()),
+        Ok((key, After::ClosePane)) => {
+            close_session(herdr, store, &snapshot, &key).map(|notice| performed.notice = notice)
         }
-        Ok(After::Reopen(plan)) => {
+        Ok((_, After::Reopen(plan))) => {
             reopen(herdr, store, &snapshot, &plan).map(|()| performed.reopened = true)
         }
     };
@@ -426,6 +440,7 @@ fn run_picker() -> io::Result<()> {
     let pin_icon = pin_icon();
     let (snapshot, ()) = sync(&mut herdr, &store, |_, _| ())?;
     let mut picker = Picker::new(items(&snapshot), focus.as_deref(), &snapshot.open_sections);
+    picker.set_undoable(snapshot.undoable);
 
     let mut terminal = ratatui::init();
     let started = Instant::now();
@@ -470,24 +485,36 @@ fn run_picker() -> io::Result<()> {
                     Action::Snooze(until) => spawn_waker(until).err(),
                     _ => None,
                 };
-                match perform(&mut herdr, &store, &key, action) {
-                    Ok(Performed { reopened: true, .. }) => break Ok(None),
-                    Ok(Performed {
-                        refusal, notice, ..
-                    }) => {
-                        refresh(&mut herdr, &store, &mut picker, |_, _| ());
-                        if let Some(notice) = notice {
-                            picker.inform(notice);
-                        }
-                        if let Some(refusal) = refusal {
-                            picker.notify(refusal);
-                        }
-                    }
-                    Err(error) => picker.notify(format!("herdr: {error}")),
+                let performed = perform(&mut herdr, &store, &key, action);
+                if show_performed(&mut herdr, &store, &mut picker, performed) {
+                    break Ok(None);
                 }
                 refreshed = Instant::now();
                 if let Some(error) = waker_error {
                     picker.notify(format!("snooze saved, but its wake timer failed: {error}"));
+                }
+            }
+            Effect::Undo => {
+                let mut wake = None;
+                let performed = carry_out(&mut herdr, &store, |state, _| {
+                    let undone = state.undo(now())?;
+                    if let Some(Park::Snoozed { until }) = state.records[&undone.0].park {
+                        wake = Some(until);
+                    }
+                    Ok(undone)
+                });
+                let undid = matches!(&performed, Ok(p) if p.refusal.is_none());
+                if show_performed(&mut herdr, &store, &mut picker, performed) {
+                    break Ok(None);
+                }
+                refreshed = Instant::now();
+                if undid {
+                    picker.inform("undone".into());
+                }
+                if let Some(error) = wake.and_then(|until| spawn_waker(until).err()) {
+                    picker.notify(format!(
+                        "snooze restored, but its wake timer failed: {error}"
+                    ));
                 }
             }
         }
@@ -499,6 +526,31 @@ fn run_picker() -> io::Result<()> {
     }
 }
 
+/// Shows how an action went; true when it reopened a thread, which ends the picker.
+fn show_performed(
+    herdr: &mut Herdr,
+    store: &Store,
+    picker: &mut Picker,
+    performed: io::Result<Performed>,
+) -> bool {
+    match performed {
+        Ok(Performed { reopened: true, .. }) => return true,
+        Ok(Performed {
+            refusal, notice, ..
+        }) => {
+            refresh(herdr, store, picker, |_, _| ());
+            if let Some(notice) = notice {
+                picker.inform(notice);
+            }
+            if let Some(refusal) = refusal {
+                picker.notify(refusal);
+            }
+        }
+        Err(error) => picker.notify(format!("herdr: {error}")),
+    }
+    false
+}
+
 fn refresh(
     herdr: &mut Herdr,
     store: &Store,
@@ -506,7 +558,10 @@ fn refresh(
     edit: impl FnOnce(&mut State, &[Observed]),
 ) {
     match sync(herdr, store, edit) {
-        Ok((snapshot, ())) => picker.refresh(items(&snapshot), &snapshot.open_sections),
+        Ok((snapshot, ())) => {
+            picker.refresh(items(&snapshot), &snapshot.open_sections);
+            picker.set_undoable(snapshot.undoable);
+        }
         Err(error) => picker.notify(format!("herdr: {error}")),
     }
 }
@@ -697,6 +752,28 @@ mod tests {
             "a pending reopen is focused, not repeated"
         );
         assert_eq!(fake.take("pane.focus"), [json!({"pane_id": "w1:p91"})]);
+    }
+
+    #[test]
+    fn undoing_a_settle_that_closed_the_pane_reopens_the_thread() {
+        let fake = FakeHerdr::start(vec![
+            resumable_agent("w1:p1", "idle", 3),
+            resumable_agent("w1:p2", "idle", 4),
+        ]);
+        let (mut herdr, store) = connected(&fake);
+        let key = "session:claude:id:id-w1:p1";
+        perform(&mut herdr, &store, key, Action::ToggleSettle).unwrap();
+        assert_eq!(fake.take("pane.close"), [json!({"pane_id": "w1:p1"})]);
+        fake.agents.lock().unwrap().remove(0);
+
+        let performed = carry_out(&mut herdr, &store, |state, _| state.undo(now())).unwrap();
+        assert!(performed.reopened);
+        assert_eq!(
+            fake.take("pane.send_input"),
+            [json!({"pane_id": "w1:p91", "text": "claude --resume id-w1:p1", "keys": ["Enter"]})]
+        );
+        let parked = store.transact(|state| state.records[key].park).unwrap();
+        assert_eq!(parked, None);
     }
 
     #[test]

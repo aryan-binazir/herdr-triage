@@ -387,6 +387,9 @@ fn footer_line(picker: &Picker) -> Line<'static> {
                     pairs.push(("D", "forget"));
                 }
             }
+            if picker.undoable() {
+                pairs.push(("U", "undo"));
+            }
             if picker.filter().is_empty() {
                 pairs.push(("esc/q", "close"));
             } else {
@@ -798,6 +801,16 @@ mod tests {
             "sections stay open while filtered: {}",
             lines[13]
         );
+    }
+
+    #[test]
+    fn undo_is_offered_only_when_there_is_something_to_undo() {
+        let mut picker = picker();
+        let (lines, _) = render(&mut picker, 160, 14);
+        assert!(!lines[13].contains("U undo"), "{}", lines[13]);
+        picker.set_undoable(true);
+        let (lines, _) = render(&mut picker, 160, 14);
+        assert!(lines[13].contains("r rename  U undo"), "{}", lines[13]);
     }
 
     #[test]

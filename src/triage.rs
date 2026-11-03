@@ -175,6 +175,45 @@ pub struct State {
     pub records: BTreeMap<String, Record>,
     #[serde(default)]
     pub open_sections: BTreeSet<Section>,
+    #[serde(default)]
+    pub undo: Option<Undo>,
+}
+
+/// The last triage change, kept so it can be taken back once.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Undo {
+    pub key: String,
+    before: Triage,
+}
+
+/// What the user set on a thread, as opposed to what Herdr observed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct Triage {
+    pinned: bool,
+    park: Option<Park>,
+    unread: Option<Unread>,
+    ack_seq: Option<u64>,
+    title: Option<String>,
+}
+
+impl Triage {
+    fn of(record: &Record) -> Self {
+        Self {
+            pinned: record.pinned,
+            park: record.park,
+            unread: record.unread,
+            ack_seq: record.ack_seq,
+            title: record.title.clone(),
+        }
+    }
+
+    fn restore(self, record: &mut Record) {
+        record.pinned = self.pinned;
+        record.park = self.park;
+        record.unread = self.unread;
+        record.ack_seq = self.ack_seq;
+        record.title = self.title;
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -528,17 +567,24 @@ impl State {
             if let Some(provisional) = &agent.pre_session_key {
                 self.records.remove(provisional);
             }
-            if let Some(record) = self.records.remove(&reopened) {
-                self.records.insert(agent.key.clone(), record);
-            }
+            self.rekey(&reopened, &agent.key);
             return;
         }
-        let previous = agent
-            .pre_session_key
-            .clone()
-            .filter(|key| self.records.contains_key(key));
-        if let Some(record) = previous.and_then(|key| self.records.remove(&key)) {
-            self.records.insert(agent.key.clone(), record);
+        if let Some(previous) = &agent.pre_session_key
+            && self.records.contains_key(previous)
+        {
+            self.rekey(previous, &agent.key);
+        }
+    }
+
+    fn rekey(&mut self, from: &str, to: &str) {
+        if let Some(record) = self.records.remove(from) {
+            self.records.insert(to.to_owned(), record);
+        }
+        if let Some(undo) = &mut self.undo
+            && undo.key == from
+        {
+            to.clone_into(&mut undo.key);
         }
     }
 
@@ -566,10 +612,43 @@ impl State {
 
     /// Gives a thread its own title; a blank one restores the automatic title.
     pub fn rename(&mut self, key: &str, title: Option<String>, now: i64) {
-        if let Some(record) = self.records.get_mut(key) {
-            record.title = title.map(|t| t.trim().to_owned()).filter(|t| !t.is_empty());
-            record.touch(now);
+        let Some(record) = self.records.get_mut(key) else {
+            return;
+        };
+        let before = Triage::of(record);
+        record.title = title.map(|t| t.trim().to_owned()).filter(|t| !t.is_empty());
+        record.touch(now);
+        self.remember(key, before);
+    }
+
+    fn remember(&mut self, key: &str, before: Triage) {
+        if self
+            .records
+            .get(key)
+            .is_some_and(|r| Triage::of(r) != before)
+        {
+            self.undo = Some(Undo {
+                key: key.to_owned(),
+                before,
+            });
         }
+    }
+
+    /// Takes back the last change. It never closes a pane, but reopens a thread
+    /// that parking had closed.
+    pub fn undo(&mut self, now: i64) -> Result<(String, After), Refusal> {
+        let nothing = || Refusal("nothing to undo".into());
+        let Undo { key, before } = self.undo.take().ok_or_else(nothing)?;
+        let record = self.records.get_mut(&key).ok_or_else(nothing)?;
+        let was_parked = record.park.is_some();
+        before.restore(record);
+        record.touch(now);
+        let after = if !record.live && was_parked && record.park.is_none() {
+            reopen_plan(&key, record, now)?
+        } else {
+            After::Nothing
+        };
+        Ok((key, after))
     }
 
     pub fn pending_wakes(&self) -> Vec<i64> {
@@ -599,6 +678,9 @@ impl State {
                 return Err(Refusal("only closed threads can be forgotten".into()));
             }
             self.records.remove(key);
+            if self.undo.as_ref().is_some_and(|undo| undo.key == key) {
+                self.undo = None;
+            }
             return Ok(After::Nothing);
         }
         let record = match live_agent {
@@ -613,6 +695,7 @@ impl State {
             None => self.records.get_mut(key).ok_or_else(gone)?,
         };
         record.touch(now);
+        let before = Triage::of(record);
         let seq = live_agent.map_or(record.last_seq, |agent| agent.seq);
         // Like T3 Code, a working agent can be snoozed; it only can't be settled or marked.
         let refused = match action {
@@ -637,7 +720,7 @@ impl State {
                 reopen_plan(key, record, now)
             }
         };
-        match action {
+        let after = match action {
             Action::TogglePin if record.park.is_some() => {
                 record.park = None;
                 record.pinned = true;
@@ -671,7 +754,11 @@ impl State {
                 Ok(After::Nothing)
             }
             Action::Forget => Ok(After::Nothing),
+        };
+        if after.is_ok() {
+            self.remember(key, before);
         }
+        after
     }
 
     pub fn ordered(&self, agents: &[Observed]) -> Vec<Row> {
@@ -1651,6 +1738,69 @@ mod tests {
             state.records["a2"].pinned,
             "the reopened thread's pin carries over"
         );
+    }
+
+    #[test]
+    fn undo_reopens_a_thread_whose_settle_closed_it() {
+        let idle = resumable("a", Status::Idle, 4);
+        let mut state = State::default();
+        state.reconcile(GEN, std::slice::from_ref(&idle), NOW);
+        act(&mut state, &idle, Action::TogglePin).unwrap();
+        assert_eq!(
+            act(&mut state, &idle, Action::ToggleSettle),
+            Ok(After::ClosePane)
+        );
+        state.session_closed("a");
+
+        let (key, after) = state.undo(NOW + 5).unwrap();
+        assert_eq!(key, "a");
+        assert!(matches!(after, After::Reopen(plan) if plan.key == "a"));
+        let row = closed(&state, "a");
+        assert_eq!((row.park, row.pinned), (None, true));
+        assert_eq!(state.undo(NOW + 6), Err(Refusal("nothing to undo".into())));
+    }
+
+    #[test]
+    fn undo_restores_a_parked_thread_without_closing_its_pane() {
+        let working = resumable("a", Status::Working, 4);
+        let mut state = State::default();
+        state.reconcile(GEN, std::slice::from_ref(&working), NOW);
+        let until = NOW + 3_600;
+        act(&mut state, &working, Action::Snooze(until)).unwrap();
+        act(&mut state, &working, Action::Wake).unwrap();
+        assert_eq!(state.undo(NOW + 5), Ok(("a".into(), After::Nothing)));
+        assert_eq!(shown(&state, &working).1, Some(Park::Snoozed { until }));
+    }
+
+    #[test]
+    fn undo_covers_renames_and_skips_actions_that_changed_nothing() {
+        let idle = agent("a", Status::Idle, 4);
+        let mut state = State::default();
+        state.reconcile(GEN, std::slice::from_ref(&idle), NOW);
+        state.rename("a", Some("checkout flow".into()), NOW);
+        act(&mut state, &idle, Action::Wake).unwrap();
+        state.undo(NOW + 1).unwrap();
+        assert_eq!(state.records["a"].title, None);
+    }
+
+    #[test]
+    fn undo_follows_a_thread_to_its_session_key_and_forgetting_drops_it() {
+        let by_terminal = agent("terminal:t1", Status::Idle, 4);
+        let mut state = State::default();
+        state.reconcile(GEN, std::slice::from_ref(&by_terminal), NOW);
+        act(&mut state, &by_terminal, Action::TogglePin).unwrap();
+        let by_session = Observed {
+            pre_session_key: Some("terminal:t1".into()),
+            ..resumable("s1", Status::Idle, 4)
+        };
+        state.reconcile(GEN, std::slice::from_ref(&by_session), NOW + 1);
+        assert_eq!(state.undo(NOW + 2), Ok(("s1".into(), After::Nothing)));
+        assert!(!state.records["s1"].pinned);
+
+        act(&mut state, &by_session, Action::ToggleSettle).unwrap();
+        state.session_closed("s1");
+        state.apply("s1", None, Action::Forget, NOW + 3).unwrap();
+        assert_eq!(state.undo(NOW + 4), Err(Refusal("nothing to undo".into())));
     }
 
     fn act_closed_pin(state: &mut State, key: &str) {

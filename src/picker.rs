@@ -33,6 +33,7 @@ pub enum Effect {
     Focus(String),
     Apply { key: String, action: Action },
     Rename { key: String, title: Option<String> },
+    Undo,
     ToggleSection(Section),
 }
 
@@ -89,6 +90,7 @@ pub struct Picker {
     snooze: Option<SnoozePrompt>,
     forget: Option<ForgetPrompt>,
     rename: Option<RenamePrompt>,
+    undoable: bool,
     message: Option<String>,
     message_is_error: bool,
     offset: usize,
@@ -112,6 +114,7 @@ impl Picker {
             snooze: None,
             forget: None,
             rename: None,
+            undoable: false,
             message: None,
             message_is_error: false,
             offset: 0,
@@ -255,6 +258,7 @@ impl Picker {
             KeyCode::Char('s') => return apply(self, Action::ToggleSettle),
             KeyCode::Char('u') => return apply(self, Action::ToggleUnread),
             KeyCode::Char('p') => return apply(self, Action::TogglePin),
+            KeyCode::Char('U') => return Effect::Undo,
             KeyCode::Char('r') => {
                 if let Some(item) = self.selected() {
                     self.rename = Some(RenamePrompt {
@@ -488,6 +492,14 @@ impl Picker {
             _ => {}
         }
         Effect::None
+    }
+
+    pub fn set_undoable(&mut self, undoable: bool) {
+        self.undoable = undoable;
+    }
+
+    pub fn undoable(&self) -> bool {
+        self.undoable
     }
 
     pub fn rename_prompt(&self) -> Option<&RenamePrompt> {
@@ -973,6 +985,12 @@ mod tests {
             press(&mut picker, KeyCode::Char('j'));
         }
         assert_eq!(press(&mut picker, KeyCode::Enter), Effect::None);
+    }
+
+    #[test]
+    fn shift_u_undoes_the_last_change() {
+        let mut picker = Picker::new(items(), Some("p2"), &closed_sections());
+        assert_eq!(press(&mut picker, KeyCode::Char('U')), Effect::Undo);
     }
 
     #[test]
