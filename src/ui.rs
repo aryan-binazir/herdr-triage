@@ -315,15 +315,12 @@ fn prompt_line(picker: &Picker, width: usize) -> Option<Line<'static>> {
         if Line::from(text).width() <= room {
             return Some(rename_line(text));
         }
-        let mut used = 1;
-        let mut start = text.len();
-        for (at, c) in text.char_indices().rev() {
-            used += Span::raw(c.to_string()).width();
-            if used > room {
-                break;
-            }
-            start = at;
-        }
+        let starts: Vec<usize> = text.char_indices().map(|(at, _)| at).collect();
+        let fits = |at: usize| Line::from(format!("…{}", &text[at..])).width() <= room;
+        let start = starts
+            .get(starts.partition_point(|&at| !fits(at)))
+            .copied()
+            .unwrap_or(text.len());
         return Some(rename_line(&format!("…{}", &text[start..])));
     }
     if let Some(prompt) = picker.forget_prompt() {
@@ -862,6 +859,22 @@ mod tests {
                 lines[13]
             );
         }
+    }
+
+    #[test]
+    fn an_emoji_rename_keeps_its_hints_in_view() {
+        let mut picker = picker();
+        press(&mut picker, KeyCode::Char('r'));
+        for c in " ❤️❤️❤️❤️❤️❤️❤️❤️❤️❤️❤️❤️❤️❤️❤️❤️❤️❤️❤️❤️ end".chars()
+        {
+            press(&mut picker, KeyCode::Char(c));
+        }
+        let (lines, _) = render(&mut picker, 48, 14);
+        assert!(
+            lines[13].contains("end") && lines[13].contains("esc cancel"),
+            "{}",
+            lines[13]
+        );
     }
 
     #[test]

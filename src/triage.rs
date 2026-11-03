@@ -696,6 +696,8 @@ impl State {
         }
         record.touch(now);
         let after = if reopen {
+            record.live = false;
+            record.missing_since = None;
             record.ended = false;
             reopen_plan(&key, record, now)?
         } else {
@@ -1998,6 +2000,27 @@ mod tests {
         state.closing("a", true);
         state.reconcile(GEN, &[], NOW + 1);
         assert!(matches!(state.undo(NOW + 2), Ok((_, After::Reopen(_)))));
+    }
+
+    #[test]
+    fn a_session_reopened_inside_its_exit_grace_adopts_its_new_id() {
+        let idle = resumable("a", Status::Idle, 4);
+        let mut state = State::default();
+        state.reconcile(GEN, std::slice::from_ref(&idle), NOW);
+        act(&mut state, &idle, Action::TogglePin).unwrap();
+        state.rename("a", Some("checkout flow".into()), NOW);
+        act(&mut state, &idle, Action::ToggleSettle).unwrap();
+        state.closing("a", true);
+        state.reconcile(GEN, &[], NOW + 1);
+        state.undo(NOW + 2).unwrap();
+        state.reopening("a", "pane-new", GEN, NOW + 2);
+        let resumed = Observed {
+            pane_id: "pane-new".into(),
+            ..resumable("a2", Status::Idle, 1)
+        };
+        state.reconcile(GEN, std::slice::from_ref(&resumed), NOW + 3);
+        assert_eq!(state.records.keys().collect::<Vec<_>>(), ["a2"]);
+        assert_eq!(state.records["a2"].title.as_deref(), Some("checkout flow"));
     }
 
     #[test]
