@@ -328,7 +328,6 @@ fn perform(herdr: &mut Herdr, store: &Store, key: &str, action: Action) -> io::R
     })
 }
 
-/// Makes a triage change, then closes or reopens whatever it asks for.
 fn carry_out(
     herdr: &mut Herdr,
     store: &Store,
@@ -472,12 +471,11 @@ fn run_picker() -> io::Result<()> {
             Effect::Focus(pane) => break Ok(Some(pane)),
             Effect::Rename { key, title } => {
                 refresh(&mut herdr, &store, &mut picker, |state, observed| {
-                    // Herdr may have learned the thread's session since the prompt opened.
-                    let key = observed
+                    let current_key = observed
                         .iter()
                         .find(|agent| agent.pre_session_key.as_deref() == Some(key.as_str()))
                         .map_or(key.as_str(), |agent| agent.key.as_str());
-                    state.rename(key, title, now());
+                    state.rename(current_key, title, now());
                 });
             }
             Effect::ToggleSection(section) => {
@@ -493,7 +491,7 @@ fn run_picker() -> io::Result<()> {
                 let from = picker.selected_row().unwrap_or(0);
                 let performed = perform(&mut herdr, &store, &key, action);
                 let done = matches!(&performed, Ok(p) if p.refusal.is_none());
-                if show_performed(&mut herdr, &store, &mut picker, performed) {
+                if show_unless_reopened(&mut herdr, &store, &mut picker, performed) {
                     break Ok(None);
                 }
                 if done && matches!(action, Action::ToggleSettle | Action::Snooze(_)) {
@@ -514,7 +512,7 @@ fn run_picker() -> io::Result<()> {
                     Ok(undone)
                 });
                 let done = matches!(&performed, Ok(p) if p.refusal.is_none());
-                if show_performed(&mut herdr, &store, &mut picker, performed) {
+                if show_unless_reopened(&mut herdr, &store, &mut picker, performed) {
                     break Ok(None);
                 }
                 refreshed = Instant::now();
@@ -536,8 +534,7 @@ fn run_picker() -> io::Result<()> {
     }
 }
 
-/// Shows how an action went; true when it reopened a thread, which ends the picker.
-fn show_performed(
+fn show_unless_reopened(
     herdr: &mut Herdr,
     store: &Store,
     picker: &mut Picker,

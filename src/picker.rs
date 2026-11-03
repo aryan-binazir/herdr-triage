@@ -21,7 +21,6 @@ pub struct Item {
 }
 
 impl Item {
-    /// Parked threads sit in their section; so do agents busy working, unless pinned.
     pub fn section(&self) -> Option<Section> {
         match self.park {
             Some(park) => Some(park.section()),
@@ -64,7 +63,6 @@ fn without_last_word(text: &str) -> &str {
     &kept[..cut]
 }
 
-/// Edits a thread's title in the footer, bound to that thread across refreshes.
 #[derive(Debug, Clone)]
 pub struct RenamePrompt {
     pub key: String,
@@ -82,7 +80,6 @@ pub struct ForgetPrompt {
 pub struct SnoozePrompt {
     pub key: String,
     pub label: String,
-    /// Fixed when the prompt opens, so each digit keeps meaning what was shown.
     pub presets: Vec<SnoozePreset>,
 }
 
@@ -464,8 +461,6 @@ impl Picker {
         self.offset
     }
 
-    /// After parking a thread, like T3 Code, go on to the next one that needs you:
-    /// blocked first, then finished or unread. With none, the cursor stays put.
     pub fn move_on_from(&mut self, key: &str, from: usize) {
         if !self
             .items
@@ -622,7 +617,6 @@ mod tests {
         }
     }
 
-    /// p1 is pinned, so it stays in the main list while working.
     fn items() -> Vec<Item> {
         vec![
             pinned_working(),
@@ -793,7 +787,6 @@ mod tests {
 
     #[test]
     fn a_snooze_digit_means_the_preset_that_was_shown() {
-        // Shown at 17:20, confirmed at 17:40: "today 18:00" was offered and stays digit 3.
         let shown_at = NOW + 4 * 3_600 + 20 * 60;
         let mut picker = Picker::new(items(), Some("p2"), &closed_sections());
         picker.key(
@@ -804,8 +797,9 @@ mod tests {
         let presets = &picker.snooze_prompt().unwrap().presets;
         assert_eq!(presets[2].label(), "today 18:00");
         let confirm = KeyEvent::new(KeyCode::Char('3'), KeyModifiers::NONE);
+        let confirmed_at = shown_at + 20 * 60;
         assert_eq!(
-            picker.key(confirm, shown_at + 20 * 60, &chrono::Utc),
+            picker.key(confirm, confirmed_at, &chrono::Utc),
             Effect::Apply {
                 key: "k-p2".into(),
                 action: Action::Snooze(NOW + 5 * 3_600)

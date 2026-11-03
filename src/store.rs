@@ -278,7 +278,6 @@ fn load(tx: &Transaction) -> rusqlite::Result<State> {
             |row| row.get(0),
         )
         .optional()?;
-    // Losing an unreadable undo entry only means there is nothing to undo.
     state.undo = undo.and_then(|json| serde_json::from_str(&json).ok());
     Ok(state)
 }

@@ -293,7 +293,6 @@ fn enter_hint(picker: &Picker) -> Option<(&'static str, &'static str)> {
     }
 }
 
-/// The end of `text`, so what is being typed stays in view.
 fn tail(text: &str, width: usize) -> String {
     let count = text.chars().count();
     if count <= width {
@@ -303,7 +302,6 @@ fn tail(text: &str, width: usize) -> String {
     format!("…{kept}")
 }
 
-/// The footer while a rename, forget or snooze prompt waits for an answer.
 fn prompt_line(picker: &Picker) -> Option<Line<'static>> {
     if let Some(prompt) = picker.rename_prompt() {
         return Some(Line::from(vec![

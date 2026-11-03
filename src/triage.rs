@@ -138,7 +138,6 @@ pub struct Record {
     pub reopen_generation: Option<String>,
     #[serde(default)]
     pub restored_at: Option<i64>,
-    /// A title the user gave the thread, shown instead of the automatic one.
     #[serde(default)]
     pub title: Option<String>,
 }
@@ -180,23 +179,19 @@ pub struct State {
     pub undo: Option<Undo>,
 }
 
-/// The last triage change, kept so it can be taken back once.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Undo {
     pub key: String,
     before: Triage,
     after: Triage,
-    /// The change closed the thread's session, so taking it back reopens it.
     #[serde(default)]
     closed: bool,
-    /// Where the agent was when the change was made; activity since outranks it.
     #[serde(default)]
     generation: String,
     #[serde(default)]
     seq: u64,
 }
 
-/// What the user set on a thread, as opposed to what Herdr observed.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct Triage {
     pinned: bool,
@@ -217,9 +212,6 @@ impl Triage {
         }
     }
 
-    /// Puts back what the change set, wherever nothing has changed it since. Once the
-    /// agent has done something new, undo may still bring the thread forward but never
-    /// hides it again, and an acknowledgement of an older turn no longer matters.
     fn restore(self, after: &Triage, record: &mut Record, moved_on: bool) {
         fn undo<T: PartialEq>(field: &mut T, before: T, after: &T) {
             if field == after {
@@ -228,10 +220,12 @@ impl Triage {
         }
         undo(&mut record.pinned, self.pinned, &after.pinned);
         undo(&mut record.title, self.title, &after.title);
-        if !moved_on || self.park.is_none() {
+        let unparks = self.park.is_none();
+        let marks_unread = self.unread.is_some();
+        if !moved_on || unparks {
             undo(&mut record.park, self.park, &after.park);
         }
-        if !moved_on || self.unread.is_some() {
+        if !moved_on || marks_unread {
             undo(&mut record.unread, self.unread, &after.unread);
         }
         if !moved_on {
@@ -358,12 +352,13 @@ impl Row {
         }
     }
 
-    /// T3 Code shows how long a snooze has left rather than when it ends.
     fn countdown(&self, now: i64) -> Option<String> {
         match self.park? {
             Park::Settled => Some("settled".into()),
-            // Rounded up to the minute, so a snooze just set reads as its full length.
-            Park::Snoozed { until } => Some(format!("snoozed · {}", age(until - now + 59))),
+            Park::Snoozed { until } => {
+                let left_rounded_up_to_the_minute = until - now + 59;
+                Some(format!("snoozed · {}", age(left_rounded_up_to_the_minute)))
+            }
         }
     }
 
@@ -406,7 +401,6 @@ where
     }
 }
 
-/// T3 Code's snooze choices.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SnoozePreset {
     OneHour,
@@ -447,9 +441,8 @@ impl SnoozePreset {
     }
 }
 
-/// The presets offered now; "today 18:00" only while it is at least half an hour away.
 pub fn snooze_presets<Tz: TimeZone>(now: i64, tz: &Tz) -> Vec<SnoozePreset> {
-    let evening = SnoozePreset::ThisEvening.until(now, tz) - now >= 1_800;
+    let evening_is_half_an_hour_away = SnoozePreset::ThisEvening.until(now, tz) - now >= 1_800;
     [
         SnoozePreset::OneHour,
         SnoozePreset::ThreeHours,
@@ -458,7 +451,7 @@ pub fn snooze_presets<Tz: TimeZone>(now: i64, tz: &Tz) -> Vec<SnoozePreset> {
         SnoozePreset::NextWeek,
     ]
     .into_iter()
-    .filter(|preset| *preset != SnoozePreset::ThisEvening || evening)
+    .filter(|preset| *preset != SnoozePreset::ThisEvening || evening_is_half_an_hour_away)
     .collect()
 }
 
@@ -512,9 +505,9 @@ impl State {
                 record.ack_seq = None;
                 record.restored_at = (!returned_by_choice).then_some(now);
             } else if agent.seq > record.last_seq && !restoring {
-                // A snooze holds through the agent's own work; only needing you wakes it early.
-                let snoozed = matches!(record.park, Some(Park::Snoozed { .. }));
-                if !snoozed || agent.status == Status::Blocked {
+                let stays_snoozed = matches!(record.park, Some(Park::Snoozed { .. }))
+                    && agent.status != Status::Blocked;
+                if !stays_snoozed {
                     record.park = None;
                     record.unread = None;
                 }
@@ -651,7 +644,6 @@ impl State {
         }
     }
 
-    /// Gives a thread its own title; a blank one restores the automatic title.
     pub fn rename(&mut self, key: &str, title: Option<String>, now: i64) {
         let Some(record) = self.records.get_mut(key) else {
             return;
@@ -679,8 +671,6 @@ impl State {
         }
     }
 
-    /// Takes back the last change. It never closes a pane, but reopens a session
-    /// the change closed.
     pub fn undo(&mut self, now: i64) -> Result<(String, After), Refusal> {
         let nothing = || Refusal("nothing to undo".into());
         let Undo {
@@ -701,7 +691,6 @@ impl State {
         }
         record.touch(now);
         let after = if reopen {
-            // Back by undo rather than by choice, so it keeps the triage just restored.
             record.ended = false;
             reopen_plan(&key, record, now)?
         } else {
@@ -754,7 +743,6 @@ impl State {
         record.touch(now);
         let before = Triage::of(record);
         let seq = live_agent.map_or(record.last_seq, |agent| agent.seq);
-        // Like T3 Code, a working agent can be snoozed; it only can't be settled or marked.
         let refused = match action {
             Action::ToggleSettle | Action::ToggleUnread => shown.busy(),
             Action::Snooze(_) if shown == Display::Blocked => shown.busy(),
@@ -793,7 +781,6 @@ impl State {
                 record.pinned = false;
                 Ok(park(record, seq, Park::Settled, live))
             }
-            // Closing a working agent's pane would kill its work, so it stays open while snoozed.
             Action::Snooze(until) => Ok(park(
                 record,
                 seq,
@@ -1259,7 +1246,7 @@ mod tests {
 
     #[test]
     fn snooze_presets_follow_t3_code() {
-        // ONE_PM is Tuesday 13:00.
+        assert_eq!(local(ONE_PM, &tz()).weekday(), chrono::Weekday::Tue);
         let labels = |now| -> Vec<&str> {
             snooze_presets(now, &tz())
                 .iter()
@@ -2026,7 +2013,6 @@ mod tests {
             &[resumable("active", Status::Idle, 2), agents[1].clone()],
             NOW + 10,
         );
-        // Unread threads stay in the open list once closed, where pinning doesn't move them.
         for agent in &agents {
             act(&mut state, agent, Action::ToggleUnread).unwrap();
         }
