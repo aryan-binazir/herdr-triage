@@ -292,6 +292,46 @@ fn enter_hint(picker: &Picker) -> Option<(&'static str, &'static str)> {
     }
 }
 
+/// The footer while a rename, forget or snooze prompt waits for an answer.
+fn prompt_line(picker: &Picker) -> Option<Line<'static>> {
+    if let Some(prompt) = picker.rename_prompt() {
+        return Some(Line::from(vec![
+            Span::raw(" "),
+            Span::from("rename").cyan().bold(),
+            Span::raw(format!(": {}", prompt.text)),
+            Span::raw("  enter"),
+            Span::from(" save").dim(),
+            Span::raw("  esc"),
+            Span::from(" cancel").dim(),
+        ]));
+    }
+    if let Some(prompt) = picker.forget_prompt() {
+        return Some(Line::from(vec![
+            Span::raw(" "),
+            Span::from("forget").red().bold(),
+            Span::raw(format!(" “{}”?  y", prompt.label)),
+            Span::from(" yes").dim(),
+            Span::raw("  esc"),
+            Span::from(" cancel").dim(),
+        ]));
+    }
+    if let Some(prompt) = picker.snooze_prompt() {
+        let mut spans = vec![
+            Span::raw(" "),
+            Span::from("snooze").yellow().bold(),
+            Span::raw(format!(" “{}”", prompt.label)),
+        ];
+        for (i, label) in prompt.presets.iter().map(|p| p.label()).enumerate() {
+            spans.push(Span::raw(format!("  {}", i + 1)));
+            spans.push(Span::from(format!(" {label}")).dim());
+        }
+        spans.push(Span::raw("  esc"));
+        spans.push(Span::from(" cancel").dim());
+        return Some(Line::from(spans));
+    }
+    None
+}
+
 fn footer_line(picker: &Picker) -> Line<'static> {
     if let Some(message) = picker.message() {
         return if picker.message_is_error() {
@@ -306,29 +346,8 @@ fn footer_line(picker: &Picker) -> Line<'static> {
             ])
         };
     }
-    if let Some(prompt) = picker.forget_prompt() {
-        return Line::from(vec![
-            Span::raw(" "),
-            Span::from("forget").red().bold(),
-            Span::raw(format!(" “{}”?  y", prompt.label)),
-            Span::from(" yes").dim(),
-            Span::raw("  esc"),
-            Span::from(" cancel").dim(),
-        ]);
-    }
-    if let Some(prompt) = picker.snooze_prompt() {
-        let mut spans = vec![
-            Span::raw(" "),
-            Span::from("snooze").yellow().bold(),
-            Span::raw(format!(" “{}”", prompt.label)),
-        ];
-        for (i, label) in prompt.presets.iter().map(|p| p.label()).enumerate() {
-            spans.push(Span::raw(format!("  {}", i + 1)));
-            spans.push(Span::from(format!(" {label}")).dim());
-        }
-        spans.push(Span::raw("  esc"));
-        spans.push(Span::from(" cancel").dim());
-        return Line::from(spans);
+    if let Some(line) = prompt_line(picker) {
+        return line;
     }
     let mut pairs: Vec<(&str, &str)> = enter_hint(picker).into_iter().collect();
     match picker.mode() {
@@ -362,6 +381,7 @@ fn footer_line(picker: &Picker) -> Line<'static> {
                         },
                     ),
                     ("p", if item.pinned { "unpin" } else { "pin" }),
+                    ("r", "rename"),
                 ]);
                 if item.closed() {
                     pairs.push(("D", "forget"));
@@ -475,7 +495,7 @@ mod tests {
                 && lines[9].contains("settled")
         );
         assert!(lines[12].contains("────"));
-        assert!(lines[13].contains("s settle  z snooze  u read  p pin  esc/q close"));
+        assert!(lines[13].contains("s settle  z snooze  u read  p pin  r rename  esc/q close"));
         assert_eq!(lines.iter().filter(|l| l.contains('│')).count(), 1);
     }
 
@@ -642,7 +662,7 @@ mod tests {
         press(&mut picker, KeyCode::Char('f'));
         press(&mut picker, KeyCode::Char('l'));
         press(&mut picker, KeyCode::Esc);
-        let (lines, _) = render(&mut picker, 100, 14);
+        let (lines, _) = render(&mut picker, 120, 14);
         assert!(
             lines[1].contains("❯ fl") && lines[1].contains("1/3"),
             "{}",
@@ -776,6 +796,19 @@ mod tests {
         assert!(
             !lines[13].contains("open/close"),
             "sections stay open while filtered: {}",
+            lines[13]
+        );
+    }
+
+    #[test]
+    fn the_rename_prompt_shows_the_title_being_typed() {
+        let mut picker = picker();
+        press(&mut picker, KeyCode::Char('r'));
+        let (lines, _) = render(&mut picker, 120, 14);
+        assert!(
+            lines[13].contains("rename: fix flaky test")
+                && lines[13].contains("enter save  esc cancel"),
+            "{}",
             lines[13]
         );
     }

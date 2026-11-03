@@ -34,7 +34,8 @@ CREATE TABLE IF NOT EXISTS threads (
     reopen_pane TEXT,
     reopen_at INTEGER,
     reopen_generation TEXT,
-    restored_at INTEGER
+    restored_at INTEGER,
+    title TEXT
 );
 CREATE TABLE IF NOT EXISTS settings (name TEXT PRIMARY KEY, value TEXT NOT NULL);
 ";
@@ -161,10 +162,11 @@ impl std::fmt::Display for DatabaseError {
 
 impl std::error::Error for DatabaseError {}
 
-const LATER_COLUMNS: [(&str, &str); 3] = [
+const LATER_COLUMNS: [(&str, &str); 4] = [
     ("ended", "INTEGER NOT NULL DEFAULT 0"),
     ("reopen_generation", "TEXT"),
     ("restored_at", "INTEGER"),
+    ("title", "TEXT"),
 ];
 
 fn add_missing_columns(connection: &Connection) -> rusqlite::Result<()> {
@@ -244,6 +246,7 @@ fn load(tx: &Transaction) -> rusqlite::Result<State> {
             reopen_at: row.get("reopen_at")?,
             reopen_generation: row.get("reopen_generation")?,
             restored_at: row.get("restored_at")?,
+            title: row.get("title")?,
         };
         Ok((row.get::<_, String>("key")?, record))
     })?;
@@ -276,8 +279,8 @@ fn save(tx: &Transaction, state: &State) -> rusqlite::Result<()> {
         "INSERT INTO threads (key, pinned, park, snooze_until, unread, ack_seq, generation, \
          last_seq, changed_at, touched_at, live, ended, missing_since, last_status, label, agent, \
          cwd, workspace_id, workspace_label, session_source, session_kind, session_value, \
-         reopen_pane, reopen_at, reopen_generation, restored_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, \
-         ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26)",
+         reopen_pane, reopen_at, reopen_generation, restored_at, title) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, \
+         ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27)",
     )?;
     for (key, r) in &state.records {
         let (park, until) = match r.park {
@@ -317,6 +320,7 @@ fn save(tx: &Transaction, state: &State) -> rusqlite::Result<()> {
             r.reopen_at,
             r.reopen_generation,
             r.restored_at,
+            r.title,
         ])?;
     }
     let sections: Vec<&str> = state
@@ -394,6 +398,7 @@ mod tests {
             reopen_at: Some(1_200),
             reopen_generation: Some("g1".into()),
             restored_at: Some(1_300),
+            title: Some("checkout flow".into()),
         }
     }
 

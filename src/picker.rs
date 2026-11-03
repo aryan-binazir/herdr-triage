@@ -32,6 +32,7 @@ pub enum Effect {
     Close,
     Focus(String),
     Apply { key: String, action: Action },
+    Rename { key: String, title: Option<String> },
     ToggleSection(Section),
 }
 
@@ -39,6 +40,13 @@ pub enum Effect {
 pub enum Mode {
     Navigate,
     Search,
+}
+
+/// Edits a thread's title in the footer, bound to that thread across refreshes.
+#[derive(Debug, Clone)]
+pub struct RenamePrompt {
+    pub key: String,
+    pub text: String,
 }
 
 #[derive(Debug, Clone)]
@@ -80,6 +88,7 @@ pub struct Picker {
     selected: usize,
     snooze: Option<SnoozePrompt>,
     forget: Option<ForgetPrompt>,
+    rename: Option<RenamePrompt>,
     message: Option<String>,
     message_is_error: bool,
     offset: usize,
@@ -102,6 +111,7 @@ impl Picker {
             selected: 0,
             snooze: None,
             forget: None,
+            rename: None,
             message: None,
             message_is_error: false,
             offset: 0,
@@ -164,6 +174,9 @@ impl Picker {
             return Effect::Close;
         }
         self.message = None;
+        if self.rename.is_some() {
+            return self.rename_key(key, ctrl);
+        }
         if let Some(prompt) = self.forget.take() {
             return match key.code {
                 KeyCode::Char('y') => Effect::Apply {
@@ -242,6 +255,14 @@ impl Picker {
             KeyCode::Char('s') => return apply(self, Action::ToggleSettle),
             KeyCode::Char('u') => return apply(self, Action::ToggleUnread),
             KeyCode::Char('p') => return apply(self, Action::TogglePin),
+            KeyCode::Char('r') => {
+                if let Some(item) = self.selected() {
+                    self.rename = Some(RenamePrompt {
+                        key: item.key.clone(),
+                        text: item.label.clone(),
+                    });
+                }
+            }
             KeyCode::Char('D') => {
                 let Some(item) = self.selected() else {
                     return Effect::None;
@@ -440,6 +461,37 @@ impl Picker {
 
     pub fn filter(&self) -> &str {
         &self.filter
+    }
+
+    fn rename_key(&mut self, key: KeyEvent, ctrl: bool) -> Effect {
+        let Some(prompt) = &mut self.rename else {
+            return Effect::None;
+        };
+        match key.code {
+            KeyCode::Enter => {
+                let key = prompt.key.clone();
+                let title = Some(prompt.text.trim().to_owned()).filter(|t| !t.is_empty());
+                self.rename = None;
+                return Effect::Rename { key, title };
+            }
+            KeyCode::Esc => self.rename = None,
+            KeyCode::Backspace => {
+                prompt.text.pop();
+            }
+            KeyCode::Char('u') if ctrl => prompt.text.clear(),
+            KeyCode::Char('w') if ctrl => {
+                let kept = prompt.text.trim_end();
+                let cut = kept.rfind(char::is_whitespace).map_or(0, |at| at + 1);
+                prompt.text.truncate(cut);
+            }
+            KeyCode::Char(c) if !ctrl => prompt.text.push(c),
+            _ => {}
+        }
+        Effect::None
+    }
+
+    pub fn rename_prompt(&self) -> Option<&RenamePrompt> {
+        self.rename.as_ref()
     }
 
     pub fn forget_prompt(&self) -> Option<&ForgetPrompt> {
@@ -921,5 +973,40 @@ mod tests {
             press(&mut picker, KeyCode::Char('j'));
         }
         assert_eq!(press(&mut picker, KeyCode::Enter), Effect::None);
+    }
+
+    #[test]
+    fn r_renames_the_selected_thread_in_a_footer_prompt() {
+        let mut picker = Picker::new(items(), Some("p2"), &closed_sections());
+        press(&mut picker, KeyCode::Char('r'));
+        assert_eq!(
+            picker.rename_prompt().map(|p| p.text.as_str()),
+            Some("fix flaky test")
+        );
+        press(&mut picker, KeyCode::Char('u'));
+        assert_eq!(
+            picker.rename_prompt().map(|p| p.text.as_str()),
+            Some("fix flaky testu")
+        );
+        picker.key(
+            KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL),
+            NOW,
+            &chrono::Utc,
+        );
+        for c in "quick fix".chars() {
+            press(&mut picker, KeyCode::Char(c));
+        }
+        assert_eq!(
+            press(&mut picker, KeyCode::Enter),
+            Effect::Rename {
+                key: "k-p2".into(),
+                title: Some("quick fix".into())
+            }
+        );
+        assert!(picker.rename_prompt().is_none());
+
+        press(&mut picker, KeyCode::Char('r'));
+        assert_eq!(press(&mut picker, KeyCode::Esc), Effect::None);
+        assert!(picker.rename_prompt().is_none());
     }
 }

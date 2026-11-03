@@ -137,6 +137,9 @@ pub struct Record {
     pub reopen_generation: Option<String>,
     #[serde(default)]
     pub restored_at: Option<i64>,
+    /// A title the user gave the thread, shown instead of the automatic one.
+    #[serde(default)]
+    pub title: Option<String>,
 }
 
 fn live_by_default() -> bool {
@@ -234,6 +237,7 @@ pub struct Row {
     pub pinned: bool,
     pub changed_at: Option<i64>,
     pub thread: Thread,
+    pub title: Option<String>,
 }
 
 impl Row {
@@ -241,10 +245,7 @@ impl Row {
         self.agent_index.is_some()
     }
 
-    pub fn status_text<Tz: TimeZone>(&self, now: i64, tz: &Tz) -> String
-    where
-        Tz::Offset: std::fmt::Display,
-    {
+    pub fn status_text(&self, now: i64) -> String {
         let text = self.countdown(now).unwrap_or_else(|| {
             let word = match self.display {
                 Display::Blocked => "blocked",
@@ -563,6 +564,14 @@ impl State {
         }
     }
 
+    /// Gives a thread its own title; a blank one restores the automatic title.
+    pub fn rename(&mut self, key: &str, title: Option<String>, now: i64) {
+        if let Some(record) = self.records.get_mut(key) {
+            record.title = title.map(|t| t.trim().to_owned()).filter(|t| !t.is_empty());
+            record.touch(now);
+        }
+    }
+
     pub fn pending_wakes(&self) -> Vec<i64> {
         self.records
             .values()
@@ -677,6 +686,7 @@ impl State {
                 pinned: record.is_some_and(|r| r.pinned),
                 changed_at: record.and_then(|r| r.changed_at),
                 thread: agent.thread.clone(),
+                title: record.and_then(|r| r.title.clone()),
             }
         });
         let closed = self
@@ -692,6 +702,7 @@ impl State {
                 pinned: record.pinned,
                 changed_at: record.changed_at,
                 thread: record.thread.clone(),
+                title: record.title.clone(),
             });
         let mut rows: Vec<Row> = live.chain(closed).collect();
         rows.sort_by_key(|row| {
@@ -1049,7 +1060,7 @@ mod tests {
             rows.iter()
                 .find(|r| r.key == key)
                 .unwrap()
-                .status_text(ONE_PM, &tz())
+                .status_text(ONE_PM)
         };
         assert_eq!(text("w"), "working 4m");
         assert_eq!(text("d"), "done 4m");
@@ -1079,18 +1090,15 @@ mod tests {
         let row = |key: &str| rows.iter().find(|r| r.key == key).unwrap();
 
         assert_eq!(
-            row("snoozed").status_text(ONE_PM, &tz()),
+            row("snoozed").status_text(ONE_PM),
             "snoozed · 1h · stays open"
         );
         assert_eq!(
-            row("tomorrow").status_text(ONE_PM, &tz()),
+            row("tomorrow").status_text(ONE_PM),
             "snoozed · 20h · stays open"
         );
-        assert_eq!(
-            row("settled").status_text(ONE_PM, &tz()),
-            "settled · stays open"
-        );
-        assert_eq!(row("pinned-unread").status_text(ONE_PM, &tz()), "unread");
+        assert_eq!(row("settled").status_text(ONE_PM), "settled · stays open");
+        assert_eq!(row("pinned-unread").status_text(ONE_PM), "unread");
 
         let side = |key: &str| row(key).sidebar_label("P", ONE_PM, &tz());
         assert_eq!(side("snoozed").as_deref(), Some("snoozed → 14:30"));
@@ -1154,14 +1162,8 @@ mod tests {
         let rows = state.ordered(&agents);
         let keys: Vec<&str> = rows.iter().map(|r| r.key.as_str()).collect();
         assert_eq!(keys, ["sooner", "later"]);
-        assert_eq!(
-            rows[0].status_text(ONE_PM, &tz()),
-            "snoozed · 45m · stays open"
-        );
-        assert_eq!(
-            rows[1].status_text(ONE_PM, &tz()),
-            "snoozed · 3d · stays open"
-        );
+        assert_eq!(rows[0].status_text(ONE_PM), "snoozed · 45m · stays open");
+        assert_eq!(rows[1].status_text(ONE_PM), "snoozed · 3d · stays open");
     }
 
     #[test]
@@ -1238,7 +1240,7 @@ mod tests {
         state.reconcile(GEN, &[], NOW + 12);
         let row = closed(&state, "a");
         assert_eq!((row.agent_index, row.park), (None, Some(Park::Settled)));
-        assert_eq!(row.status_text(NOW + 12, &tz()), "settled · closed");
+        assert_eq!(row.status_text(NOW + 12), "settled · closed");
     }
 
     #[test]
@@ -1253,7 +1255,7 @@ mod tests {
             (row.display, row.park),
             (Display::Unread(Unread::Manual), None)
         );
-        assert_eq!(row.status_text(NOW + 12, &tz()), "unread · closed");
+        assert_eq!(row.status_text(NOW + 12), "unread · closed");
     }
 
     #[test]
@@ -1265,7 +1267,7 @@ mod tests {
         state.reconcile("g2", &[], NOW + 60);
         let row = closed(&state, "a");
         assert_eq!(row.park, None);
-        assert_eq!(row.status_text(NOW + 60, &tz()), "idle · closed");
+        assert_eq!(row.status_text(NOW + 60), "idle · closed");
     }
 
     #[test]
@@ -1327,7 +1329,7 @@ mod tests {
             .into_iter()
             .find(|r| r.key == plain.key)
             .unwrap();
-        assert_eq!(row.status_text(NOW, &tz()), "settled · stays open");
+        assert_eq!(row.status_text(NOW), "settled · stays open");
     }
 
     fn closed_settled(state: &mut State, agent: &Observed) {
@@ -1376,7 +1378,7 @@ mod tests {
             (row.display, row.park),
             (Display::Unread(Unread::Manual), None)
         );
-        assert_eq!(row.status_text(NOW + 20, &tz()), "unread · closed");
+        assert_eq!(row.status_text(NOW + 20), "unread · closed");
     }
 
     #[test]
@@ -1414,7 +1416,7 @@ mod tests {
             (row.display, row.park),
             (Display::Unread(Unread::Woke), None)
         );
-        assert_eq!(row.status_text(NOW + 61, &tz()), "woke · closed");
+        assert_eq!(row.status_text(NOW + 61), "woke · closed");
     }
 
     #[test]
@@ -1826,6 +1828,31 @@ mod tests {
             (row.pinned, row.park),
             (true, None),
             "a pinned snoozed thread is promoted, not unpinned"
+        );
+    }
+
+    #[test]
+    fn a_renamed_thread_keeps_its_title_live_and_closed() {
+        let a = resumable("a", Status::Idle, 1);
+        let mut state = State::default();
+        state.reconcile(GEN, std::slice::from_ref(&a), NOW);
+        state.rename("a", Some("  checkout flow  ".into()), NOW);
+        let title = |state: &State| {
+            state
+                .ordered(&[])
+                .into_iter()
+                .chain(state.ordered(std::slice::from_ref(&a)))
+                .find(|r| r.key == "a")
+                .and_then(|r| r.title)
+        };
+        assert_eq!(title(&state).as_deref(), Some("checkout flow"));
+        closed_settled(&mut state, &a);
+        assert_eq!(title(&state).as_deref(), Some("checkout flow"));
+        state.rename("a", Some("   ".into()), NOW + 20);
+        assert_eq!(
+            title(&state),
+            None,
+            "a blank title restores the automatic one"
         );
     }
 }

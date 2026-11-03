@@ -455,6 +455,11 @@ fn run_picker() -> io::Result<()> {
             Effect::None => {}
             Effect::Close => break Ok(None),
             Effect::Focus(pane) => break Ok(Some(pane)),
+            Effect::Rename { key, title } => {
+                refresh(&mut herdr, &store, &mut picker, |state, _| {
+                    state.rename(&key, title, now());
+                });
+            }
             Effect::ToggleSection(section) => {
                 refresh(&mut herdr, &store, &mut picker, |state, _| {
                     state.toggle_section(section);
@@ -513,10 +518,10 @@ fn items(snapshot: &Snapshot) -> Vec<Item> {
         .iter()
         .map(|row| {
             let agent = row.agent_index.map(|index| &snapshot.agents[index]);
-            let label = if row.thread.label.is_empty() {
-                "Untitled thread".into()
-            } else {
-                row.thread.label.clone()
+            let label = match &row.title {
+                Some(title) => title.clone(),
+                None if row.thread.label.is_empty() => "Untitled thread".into(),
+                None => row.thread.label.clone(),
             };
             let location = match agent {
                 Some(agent) => location(agent, &snapshot.workspaces, &snapshot.tabs),
@@ -534,14 +539,14 @@ fn items(snapshot: &Snapshot) -> Vec<Item> {
             Item {
                 pane_id: agent.map(|agent| agent.pane_id.clone()),
                 key: row.key.clone(),
-                search: format!("{kind} {label} {location} {cwd}"),
+                search: format!("{kind} {label} {} {location} {cwd}", row.thread.label),
                 label,
                 location,
                 kind,
                 display: row.display,
                 park: row.park,
                 pinned: row.pinned,
-                status: row.status_text(now, &Local),
+                status: row.status_text(now),
                 focused: agent.is_some_and(|agent| agent.focused),
             }
         })
@@ -717,6 +722,7 @@ mod tests {
             park,
             pinned: false,
             changed_at: None,
+            title: None,
             thread: Thread::default(),
         };
         assert_eq!(view_label(&[row(None)]), "triage");
