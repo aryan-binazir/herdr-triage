@@ -630,11 +630,11 @@ impl State {
     }
 
     /// Closing the viewed pane can end the picker before it records the close.
-    pub fn closing(&mut self, key: &str) {
+    pub fn closing(&mut self, key: &str, closing: bool) {
         if let Some(undo) = &mut self.undo
             && undo.key == key
         {
-            undo.closed = true;
+            undo.closed = closing;
         }
     }
 
@@ -689,7 +689,8 @@ impl State {
         let moved_on = record.generation != generation || record.last_seq != seq;
         let current = Triage::of(record);
         before.restore(&after, record, moved_on);
-        let reopen = closed && !record.live;
+        let gone = !record.live || record.missing_since.is_some();
+        let reopen = closed && gone;
         if Triage::of(record) == current && !reopen {
             return Err(nothing());
         }
@@ -1803,7 +1804,7 @@ mod tests {
             act(&mut state, &idle, Action::ToggleSettle),
             Ok(After::ClosePane)
         );
-        state.closing("a");
+        state.closing("a", true);
         state.session_closed("a");
 
         let (key, after) = state.undo(NOW + 5).unwrap();
@@ -1880,7 +1881,7 @@ mod tests {
             act(&mut state, &idle, Action::Snooze(NOW + 60)),
             Ok(After::ClosePane)
         );
-        state.closing("a");
+        state.closing("a", true);
         state.session_closed("a");
         state.reconcile(GEN, &[], NOW + 120);
         assert!(matches!(state.undo(NOW + 121), Ok((_, After::Reopen(_)))));
@@ -1937,7 +1938,7 @@ mod tests {
             act(&mut state, &finished, Action::ToggleSettle),
             Ok(After::ClosePane)
         );
-        state.closing("a");
+        state.closing("a", true);
         state.session_closed("a");
 
         assert!(matches!(state.undo(NOW + 2), Ok((_, After::Reopen(_)))));
@@ -1982,10 +1983,34 @@ mod tests {
             act(&mut state, &idle, Action::ToggleSettle),
             Ok(After::ClosePane)
         );
-        state.closing("a");
+        state.closing("a", true);
         state.reconcile(GEN, &[], NOW + 1);
         state.reconcile(GEN, &[], NOW + 60);
         assert!(matches!(state.undo(NOW + 61), Ok((_, After::Reopen(_)))));
+    }
+
+    #[test]
+    fn undo_reopens_a_closed_session_still_inside_its_exit_grace() {
+        let idle = resumable("a", Status::Idle, 4);
+        let mut state = State::default();
+        state.reconcile(GEN, std::slice::from_ref(&idle), NOW);
+        act(&mut state, &idle, Action::ToggleSettle).unwrap();
+        state.closing("a", true);
+        state.reconcile(GEN, &[], NOW + 1);
+        assert!(matches!(state.undo(NOW + 2), Ok((_, After::Reopen(_)))));
+    }
+
+    #[test]
+    fn a_close_herdr_refused_is_not_reopened_by_undo() {
+        let idle = resumable("a", Status::Idle, 4);
+        let mut state = State::default();
+        state.reconcile(GEN, std::slice::from_ref(&idle), NOW);
+        act(&mut state, &idle, Action::ToggleSettle).unwrap();
+        state.closing("a", true);
+        state.closing("a", false);
+        state.reconcile(GEN, &[], NOW + 1);
+        state.reconcile(GEN, &[], NOW + 60);
+        assert!(matches!(state.undo(NOW + 61), Ok((_, After::Nothing))));
     }
 
     fn act_closed_pin(state: &mut State, key: &str) {

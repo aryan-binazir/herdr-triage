@@ -310,16 +310,21 @@ fn rename_line(text: &str) -> Line<'static> {
 
 fn prompt_line(picker: &Picker, width: usize) -> Option<Line<'static>> {
     if let Some(prompt) = picker.rename_prompt() {
-        let text = &prompt.text;
-        let fitting = text
-            .char_indices()
-            .map(|(at, _)| match at {
-                0 => rename_line(text),
-                _ => rename_line(&format!("…{}", &text[at..])),
-            })
-            .find(|line| line.width() <= width)
-            .unwrap_or_else(|| rename_line("…"));
-        return Some(fitting);
+        let text = prompt.text.as_str();
+        let room = width.saturating_sub(rename_line("").width());
+        if Line::from(text).width() <= room {
+            return Some(rename_line(text));
+        }
+        let mut used = 1;
+        let mut start = text.len();
+        for (at, c) in text.char_indices().rev() {
+            used += Span::raw(c.to_string()).width();
+            if used > room {
+                break;
+            }
+            start = at;
+        }
+        return Some(rename_line(&format!("…{}", &text[start..])));
     }
     if let Some(prompt) = picker.forget_prompt() {
         return Some(Line::from(vec![
@@ -857,6 +862,19 @@ mod tests {
                 lines[13]
             );
         }
+    }
+
+    #[test]
+    fn a_cleared_rename_shows_an_empty_title() {
+        let mut picker = picker();
+        press(&mut picker, KeyCode::Char('r'));
+        picker.key(
+            KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL),
+            NOW,
+            &chrono::Utc,
+        );
+        let (lines, _) = render(&mut picker, 80, 14);
+        assert!(lines[13].contains("rename:   enter save"), "{}", lines[13]);
     }
 
     #[test]

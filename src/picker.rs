@@ -66,6 +66,7 @@ fn without_last_word(text: &str) -> &str {
 #[derive(Debug, Clone)]
 pub struct RenamePrompt {
     pub key: String,
+    pane_id: Option<String>,
     pub text: String,
 }
 
@@ -171,6 +172,16 @@ impl Picker {
             Entry::Section { section, .. } => Err(section),
         });
         self.items = items;
+        // Herdr rekeys a thread once it learns its session; the pane stays the same.
+        if let Some(prompt) = &mut self.rename
+            && !self.items.iter().any(|item| item.key == prompt.key)
+            && let Some(item) = self
+                .items
+                .iter()
+                .find(|item| item.pane_id.is_some() && item.pane_id == prompt.pane_id)
+        {
+            prompt.key.clone_from(&item.key);
+        }
         self.open_sections.clone_from(open_sections);
         self.refilter();
         let at = match selected {
@@ -281,6 +292,7 @@ impl Picker {
                 if let Some(item) = self.selected() {
                     self.rename = Some(RenamePrompt {
                         key: item.key.clone(),
+                        pane_id: item.pane_id.clone(),
                         text: item.label.clone(),
                     });
                 }
@@ -1115,6 +1127,22 @@ mod tests {
         }
         picker.key(ctrl('w'), NOW, &chrono::Utc);
         assert_eq!(picker.filter(), "foo\u{3000}");
+    }
+
+    #[test]
+    fn a_rename_keeps_its_thread_when_herdr_learns_the_session() {
+        let mut picker = Picker::new(items(), Some("p2"), &closed_sections());
+        press(&mut picker, KeyCode::Char('r'));
+        let mut rekeyed = items();
+        rekeyed[1].key = "session:claude:id:abc".into();
+        picker.refresh(rekeyed, &closed_sections());
+        assert_eq!(
+            press(&mut picker, KeyCode::Enter),
+            Effect::Rename {
+                key: "session:claude:id:abc".into(),
+                title: Some("fix flaky test".into())
+            }
+        );
     }
 
     #[test]

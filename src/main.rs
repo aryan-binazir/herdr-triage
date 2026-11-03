@@ -315,6 +315,7 @@ fn wake_at(until: Option<i64>) -> io::Result<()> {
 
 #[derive(Debug, Default, PartialEq, Eq)]
 struct Performed {
+    key: String,
     refusal: Option<String>,
     notice: Option<String>,
     reopened: bool,
@@ -349,12 +350,16 @@ fn carry_out(
             performed.refusal = Some(refusal.0);
             Ok(())
         }
-        Ok((_, After::Nothing)) => Ok(()),
-        Ok((key, After::ClosePane)) => {
-            close_session(herdr, store, &snapshot, &key).map(|notice| performed.notice = notice)
-        }
-        Ok((_, After::Reopen(plan))) => {
-            reopen(herdr, store, &snapshot, &plan).map(|()| performed.reopened = true)
+        Ok((key, after)) => {
+            performed.key.clone_from(&key);
+            match after {
+                After::Nothing => Ok(()),
+                After::ClosePane => close_session(herdr, store, &snapshot, &key)
+                    .map(|notice| performed.notice = notice),
+                After::Reopen(plan) => {
+                    reopen(herdr, store, &snapshot, &plan).map(|()| performed.reopened = true)
+                }
+            }
         }
     };
     let served = serve_sync_requests(herdr, store);
@@ -382,8 +387,11 @@ fn close_session(
             "kept open: it is the last pane in its workspace".into(),
         ));
     }
-    store.transact(|state| state.closing(key))?;
-    herdr.close_pane(&agent.pane_id)?;
+    store.transact(|state| state.closing(key, true))?;
+    if let Err(error) = herdr.close_pane(&agent.pane_id) {
+        store.transact(|state| state.closing(key, false))?;
+        return Err(error);
+    }
     store.transact(|state| state.session_closed(key))?;
     Ok(None)
 }
@@ -496,11 +504,16 @@ fn run_picker() -> io::Result<()> {
                 };
                 let from = picker.selected_row().unwrap_or(0);
                 let performed = perform(&mut herdr, &store, &key, action);
-                let done = matches!(&performed, Ok(p) if p.refusal.is_none());
+                let done = match &performed {
+                    Ok(p) if p.refusal.is_none() => Some(p.key.clone()),
+                    _ => None,
+                };
                 if show_unless_reopened(&mut herdr, &store, &mut picker, performed) {
                     break Ok(None);
                 }
-                if done && matches!(action, Action::ToggleSettle | Action::Snooze(_)) {
+                if let Some(key) = done
+                    && matches!(action, Action::ToggleSettle | Action::Snooze(_))
+                {
                     picker.move_on_from(&key, from);
                 }
                 refreshed = Instant::now();
@@ -705,7 +718,13 @@ mod tests {
             Action::ToggleSettle,
         )
         .unwrap();
-        assert_eq!(performed, Performed::default());
+        assert_eq!(
+            performed,
+            Performed {
+                key: "session:claude:id:id-w1:p1".into(),
+                ..Performed::default()
+            }
+        );
         assert_eq!(fake.take("pane.close"), [json!({"pane_id": "w1:p1"})]);
         let shown = store.transact(|state| state.ordered(&[])).unwrap();
         assert_eq!(
@@ -875,6 +894,7 @@ mod tests {
         let performed =
             perform(&mut herdr, &store, "terminal:t-w1:p1", Action::ToggleSettle).unwrap();
         assert_eq!(performed.refusal, None);
+        assert_eq!(performed.key, "session:claude:id:id-w1:p1");
         let parked = store
             .transact(|state| state.records["session:claude:id:id-w1:p1"].park)
             .unwrap();
