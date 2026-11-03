@@ -1,0 +1,52 @@
+id = "ar.triage"
+name = "Triage"
+version = "0.2.0"
+min_herdr_version = "0.9.1"
+description = "Agent picker with T3 Code-style triage: settle, snooze, unread and pin, with closed threads you can reopen"
+platforms = ["linux", "macos"]
+
+[[build]]
+command = ["cargo", "build", "--release", "--locked"]
+
+[[startup]]
+command = ["./target/release/herdr-triage", "startup"]
+
+[[actions]]
+id = "open"
+title = "Open agent triage picker"
+contexts = ["workspace"]
+command = ["./target/release/herdr-triage", "open"]
+
+[[actions]]
+id = "next"
+title = "Jump to the next agent that needs you"
+contexts = ["workspace"]
+command = ["./target/release/herdr-triage", "next"]
+
+[[events]]
+on = "pane.agent_status_changed"
+command = ["./target/release/herdr-triage", "sync"]
+
+[[events]]
+on = "pane.agent_detected"
+command = ["./target/release/herdr-triage", "sync"]
+
+[[events]]
+on = "pane.focused"
+command = ["./target/release/herdr-triage", "sync"]
+
+[[events]]
+on = "pane.exited"
+command = ["./target/release/herdr-triage", "sync"]
+
+[[events]]
+on = "pane.closed"
+command = ["./target/release/herdr-triage", "sync"]
+
+[[panes]]
+id = "picker"
+title = "Agents"
+placement = "popup"
+width = "95%"
+height = "60%"
+command = ["./target/release/herdr-triage", "picker"]

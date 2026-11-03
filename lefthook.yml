@@ -1,0 +1,6 @@
+pre-push:
+  commands:
+    check:
+      only:
+        - run: test "${RUN_PRE_PUSH_CHECKS-}" = 1
+      run: make check

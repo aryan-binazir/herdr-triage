@@ -1,0 +1,33 @@
+[package]
+name = "herdr-triage"
+version = "0.2.0"
+edition = "2024"
+description = "Herdr agent picker with T3 Code-style triage"
+license = "MIT"
+repository = "https://github.com/aryan-binazir/herdr-triage"
+publish = false
+
+[dependencies]
+ratatui = "0.29"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rusqlite = { version = "0.41", features = ["bundled"] }
+toml = "0.8"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+unwrap_used = "deny"
+expect_used = "deny"
+
+[profile.release]
+lto = true
+strip = true
+codegen-units = 1
+
+[dev-dependencies]
+tempfile = "3"
