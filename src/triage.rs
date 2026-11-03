@@ -1,7 +1,7 @@
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet};
 
-use chrono::TimeZone;
+use chrono::{Datelike, TimeZone};
 use serde::{Deserialize, Serialize};
 
 const CLOSED_RETENTION_SECS: i64 = 30 * 86_400;
@@ -245,7 +245,7 @@ impl Row {
     where
         Tz::Offset: std::fmt::Display,
     {
-        let text = self.park_text(now, tz).unwrap_or_else(|| {
+        let text = self.countdown(now).unwrap_or_else(|| {
             let word = match self.display {
                 Display::Blocked => "blocked",
                 Display::Working => "working",
@@ -294,6 +294,14 @@ impl Row {
         }
     }
 
+    /// T3 Code shows how long a snooze has left rather than when it ends.
+    fn countdown(&self, now: i64) -> Option<String> {
+        match self.park? {
+            Park::Settled => Some("settled".into()),
+            Park::Snoozed { until } => Some(format!("snoozed · {}", age(until - now))),
+        }
+    }
+
     fn park_text<Tz: TimeZone>(&self, now: i64, tz: &Tz) -> Option<String>
     where
         Tz::Offset: std::fmt::Display,
@@ -333,20 +341,60 @@ where
     }
 }
 
-pub fn snooze_presets<Tz: TimeZone>(now: i64, tz: &Tz) -> Vec<(String, i64)> {
-    let mut presets = vec![
-        ("30m".to_owned(), now + 1_800),
-        ("1h".to_owned(), now + 3_600),
-        ("3h".to_owned(), now + 10_800),
-    ];
-    let tomorrow = local(now, tz).date_naive().succ_opt();
-    if let Some(morning) = tomorrow
-        .and_then(|day| day.and_hms_opt(9, 0, 0))
-        .and_then(|at| tz.from_local_datetime(&at).earliest())
-    {
-        presets.push(("tomorrow 09:00".to_owned(), morning.timestamp()));
+/// T3 Code's snooze choices.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SnoozePreset {
+    OneHour,
+    ThreeHours,
+    ThisEvening,
+    TomorrowMorning,
+    NextWeek,
+}
+
+impl SnoozePreset {
+    pub fn label(self) -> &'static str {
+        match self {
+            SnoozePreset::OneHour => "1h",
+            SnoozePreset::ThreeHours => "3h",
+            SnoozePreset::ThisEvening => "today 18:00",
+            SnoozePreset::TomorrowMorning => "tomorrow 09:00",
+            SnoozePreset::NextWeek => "next Mon 09:00",
+        }
     }
-    presets
+
+    pub fn until<Tz: TimeZone>(self, now: i64, tz: &Tz) -> i64 {
+        let today = local(now, tz).date_naive();
+        let at = |day: Option<chrono::NaiveDate>, hour| {
+            day.and_then(|day| day.and_hms_opt(hour, 0, 0))
+                .and_then(|at| tz.from_local_datetime(&at).earliest())
+                .map_or(now, |at| at.timestamp())
+        };
+        match self {
+            SnoozePreset::OneHour => now + 3_600,
+            SnoozePreset::ThreeHours => now + 3 * 3_600,
+            SnoozePreset::ThisEvening => at(Some(today), 18),
+            SnoozePreset::TomorrowMorning => at(today.succ_opt(), 9),
+            SnoozePreset::NextWeek => {
+                let days = 7 - i64::from(today.weekday().num_days_from_monday());
+                at(today.checked_add_signed(chrono::Duration::days(days)), 9)
+            }
+        }
+    }
+}
+
+/// The presets offered now; "today 18:00" only while it is at least half an hour away.
+pub fn snooze_presets<Tz: TimeZone>(now: i64, tz: &Tz) -> Vec<SnoozePreset> {
+    let evening = SnoozePreset::ThisEvening.until(now, tz) - now >= 1_800;
+    [
+        SnoozePreset::OneHour,
+        SnoozePreset::ThreeHours,
+        SnoozePreset::ThisEvening,
+        SnoozePreset::TomorrowMorning,
+        SnoozePreset::NextWeek,
+    ]
+    .into_iter()
+    .filter(|preset| *preset != SnoozePreset::ThisEvening || evening)
+    .collect()
 }
 
 fn display(agent: &Observed, record: Option<&Record>) -> Display {
@@ -399,8 +447,12 @@ impl State {
                 record.ack_seq = None;
                 record.restored_at = (!returned_by_choice).then_some(now);
             } else if agent.seq > record.last_seq && !restoring {
-                record.park = None;
-                record.unread = None;
+                // A snooze holds through the agent's own work; only needing you wakes it early.
+                let snoozed = matches!(record.park, Some(Park::Snoozed { .. }));
+                if !snoozed || agent.status == Status::Blocked {
+                    record.park = None;
+                    record.unread = None;
+                }
                 record.changed_at = Some(now);
             }
             record.last_seq = agent.seq;
@@ -553,12 +605,13 @@ impl State {
         };
         record.touch(now);
         let seq = live_agent.map_or(record.last_seq, |agent| agent.seq);
-        if let Some(busy) = shown.busy()
-            && matches!(
-                action,
-                Action::ToggleSettle | Action::Snooze(_) | Action::ToggleUnread
-            )
-        {
+        // Like T3 Code, a working agent can be snoozed; it only can't be settled or marked.
+        let refused = match action {
+            Action::ToggleSettle | Action::ToggleUnread => shown.busy(),
+            Action::Snooze(_) if shown == Display::Blocked => shown.busy(),
+            _ => None,
+        };
+        if let Some(busy) = refused {
             let verb = match action {
                 Action::ToggleSettle => "settle",
                 Action::Snooze(_) => "snooze",
@@ -576,14 +629,28 @@ impl State {
             }
         };
         match action {
+            Action::TogglePin if record.park.is_some() => {
+                record.park = None;
+                record.pinned = true;
+                Ok(After::Nothing)
+            }
             Action::TogglePin => {
                 record.pinned = !record.pinned;
                 Ok(After::Nothing)
             }
             Action::Wake | Action::Reopen => unpark(record),
             Action::ToggleSettle if record.park == Some(Park::Settled) => unpark(record),
-            Action::ToggleSettle => Ok(park(record, seq, Park::Settled, live)),
-            Action::Snooze(until) => Ok(park(record, seq, Park::Snoozed { until }, live)),
+            Action::ToggleSettle => {
+                record.pinned = false;
+                Ok(park(record, seq, Park::Settled, live))
+            }
+            // Closing a working agent's pane would kill its work, so it stays open while snoozed.
+            Action::Snooze(until) => Ok(park(
+                record,
+                seq,
+                Park::Snoozed { until },
+                live && shown != Display::Working,
+            )),
             Action::ToggleUnread if matches!(shown, Display::Done | Display::Unread(_)) => {
                 record.unread = None;
                 record.ack_seq = Some(seq);
@@ -633,7 +700,17 @@ impl State {
             } else {
                 u64::try_from(row.changed_at.unwrap_or(0)).unwrap_or(0)
             };
-            (row.rank(), !row.live(), Reverse(recency), Reverse(row.seq))
+            let wake = match row.park {
+                Some(Park::Snoozed { until }) => until,
+                _ => 0,
+            };
+            (
+                row.rank(),
+                wake,
+                !row.live(),
+                Reverse(recency),
+                Reverse(row.seq),
+            )
         });
         rows
     }
@@ -682,11 +759,11 @@ pub fn next_attention<'a>(rows: &'a [Row], current: Option<&str>) -> Option<&'a 
         .copied()
 }
 
-fn park(record: &mut Record, seq: u64, park: Park, live: bool) -> After {
+fn park(record: &mut Record, seq: u64, park: Park, close_pane: bool) -> After {
     record.park = Some(park);
     record.unread = None;
     record.ack_seq = Some(seq);
-    if live && record.resumable() {
+    if close_pane && record.resumable() {
         After::ClosePane
     } else {
         After::Nothing
@@ -788,9 +865,9 @@ mod tests {
         state.reconcile(GEN, &agents, NOW);
         for a in &agents {
             assert!(act(&mut state, a, Action::ToggleSettle).is_err());
-            assert!(act(&mut state, a, Action::Snooze(NOW + 60)).is_err());
             assert!(act(&mut state, a, Action::ToggleUnread).is_err());
         }
+        assert!(act(&mut state, &agents[1], Action::Snooze(NOW + 60)).is_err());
         assert!(act(&mut state, &agents[0], Action::TogglePin).is_ok());
     }
 
@@ -1003,11 +1080,11 @@ mod tests {
 
         assert_eq!(
             row("snoozed").status_text(ONE_PM, &tz()),
-            "snoozed → 14:30 · stays open"
+            "snoozed · 1h · stays open"
         );
         assert_eq!(
             row("tomorrow").status_text(ONE_PM, &tz()),
-            "snoozed → tmrw 09:00 · stays open"
+            "snoozed · 20h · stays open"
         );
         assert_eq!(
             row("settled").status_text(ONE_PM, &tz()),
@@ -1024,19 +1101,66 @@ mod tests {
     }
 
     #[test]
-    fn snooze_presets_end_at_fixed_offsets_and_tomorrow_morning() {
-        let presets = snooze_presets(ONE_PM, &tz());
-        let labels: Vec<&str> = presets.iter().map(|(label, _)| label.as_str()).collect();
-        assert_eq!(labels, ["30m", "1h", "3h", "tomorrow 09:00"]);
-        let untils: Vec<i64> = presets.iter().map(|(_, until)| *until).collect();
+    fn snooze_presets_follow_t3_code() {
+        // ONE_PM is Tuesday 13:00.
+        let labels = |now| -> Vec<&str> {
+            snooze_presets(now, &tz())
+                .iter()
+                .map(|p| p.label())
+                .collect()
+        };
+        assert_eq!(
+            labels(ONE_PM),
+            [
+                "1h",
+                "3h",
+                "today 18:00",
+                "tomorrow 09:00",
+                "next Mon 09:00"
+            ]
+        );
+        let untils: Vec<i64> = snooze_presets(ONE_PM, &tz())
+            .iter()
+            .map(|p| p.until(ONE_PM, &tz()))
+            .collect();
         assert_eq!(
             untils,
             [
-                ONE_PM + 1_800,
                 ONE_PM + 3_600,
-                ONE_PM + 10_800,
-                ONE_PM + 20 * 3_600
+                ONE_PM + 3 * 3_600,
+                ONE_PM + 5 * 3_600,
+                ONE_PM + 20 * 3_600,
+                ONE_PM + 6 * 86_400 - 4 * 3_600,
             ]
+        );
+        let evening = ONE_PM + 4 * 3_600 + 40 * 60;
+        assert_eq!(
+            labels(evening),
+            ["1h", "3h", "tomorrow 09:00", "next Mon 09:00"],
+            "too close to 18:00"
+        );
+    }
+
+    #[test]
+    fn snoozed_threads_count_down_and_sort_by_wake_time() {
+        let agents = [
+            agent("later", Status::Idle, 9),
+            agent("sooner", Status::Idle, 1),
+        ];
+        let mut state = State::default();
+        state.reconcile(GEN, &agents, ONE_PM);
+        act(&mut state, &agents[0], Action::Snooze(ONE_PM + 3 * 86_400)).unwrap();
+        act(&mut state, &agents[1], Action::Snooze(ONE_PM + 45 * 60)).unwrap();
+        let rows = state.ordered(&agents);
+        let keys: Vec<&str> = rows.iter().map(|r| r.key.as_str()).collect();
+        assert_eq!(keys, ["sooner", "later"]);
+        assert_eq!(
+            rows[0].status_text(ONE_PM, &tz()),
+            "snoozed · 45m · stays open"
+        );
+        assert_eq!(
+            rows[1].status_text(ONE_PM, &tz()),
+            "snoozed · 3d · stays open"
         );
     }
 
@@ -1046,7 +1170,7 @@ mod tests {
         let mut state = State::default();
         state.reconcile(GEN, std::slice::from_ref(&by_terminal), ONE_PM);
         act(&mut state, &by_terminal, Action::TogglePin).unwrap();
-        act(&mut state, &by_terminal, Action::ToggleSettle).unwrap();
+        act(&mut state, &by_terminal, Action::Snooze(ONE_PM + 3_600)).unwrap();
 
         let by_session = Observed {
             pre_session_key: Some("terminal:t1".into()),
@@ -1055,7 +1179,12 @@ mod tests {
         state.reconcile(GEN, std::slice::from_ref(&by_session), ONE_PM + 1);
         let row = state.ordered(std::slice::from_ref(&by_session)).remove(0);
         assert!(row.pinned);
-        assert_eq!(row.park, Some(Park::Settled));
+        assert_eq!(
+            row.park,
+            Some(Park::Snoozed {
+                until: ONE_PM + 3_600
+            })
+        );
         assert!(!state.records.contains_key("terminal:t1"));
     }
 
@@ -1569,6 +1698,10 @@ mod tests {
             &[resumable("active", Status::Idle, 2), agents[1].clone()],
             NOW + 10,
         );
+        // Unread threads stay in the open list once closed, where pinning doesn't move them.
+        for agent in &agents {
+            act(&mut state, agent, Action::ToggleUnread).unwrap();
+        }
         for at in [NOW + 20, NOW + 31] {
             state.reconcile(GEN, &[], at);
         }
@@ -1630,6 +1763,69 @@ mod tests {
         assert_eq!(
             state.reconcile(GEN, &[], NOW + 1),
             [NOW + 1 + EXIT_GRACE_SECS]
+        );
+    }
+
+    #[test]
+    fn a_snoozed_agent_wakes_only_when_it_needs_you() {
+        let idle = agent("a", Status::Idle, 1);
+        let mut state = State::default();
+        state.reconcile(GEN, std::slice::from_ref(&idle), NOW);
+        act(&mut state, &idle, Action::Snooze(NOW + 3_600)).unwrap();
+        for (status, seq) in [(Status::Working, 2), (Status::Done, 3), (Status::Idle, 4)] {
+            let busy = agent("a", status, seq);
+            state.reconcile(
+                GEN,
+                std::slice::from_ref(&busy),
+                NOW + i64::try_from(seq).unwrap(),
+            );
+            assert_eq!(
+                shown(&state, &busy).1,
+                Some(Park::Snoozed { until: NOW + 3_600 }),
+                "{status:?}"
+            );
+        }
+        let blocked = agent("a", Status::Blocked, 5);
+        state.reconcile(GEN, std::slice::from_ref(&blocked), NOW + 10);
+        assert_eq!(shown(&state, &blocked), (Display::Blocked, None));
+    }
+
+    #[test]
+    fn snoozing_a_working_agent_keeps_its_pane_open() {
+        let working = resumable("a", Status::Working, 1);
+        let mut state = State::default();
+        state.reconcile(GEN, std::slice::from_ref(&working), NOW);
+        assert_eq!(
+            act(&mut state, &working, Action::Snooze(NOW + 60)),
+            Ok(After::Nothing)
+        );
+        assert_eq!(
+            shown(&state, &working).1,
+            Some(Park::Snoozed { until: NOW + 60 })
+        );
+    }
+
+    #[test]
+    fn settling_unpins_and_pinning_a_parked_thread_brings_it_back_pinned() {
+        let a = agent("a", Status::Idle, 1);
+        let mut state = State::default();
+        state.reconcile(GEN, std::slice::from_ref(&a), NOW);
+        act(&mut state, &a, Action::TogglePin).unwrap();
+        act(&mut state, &a, Action::ToggleSettle).unwrap();
+        let row = state.ordered(std::slice::from_ref(&a)).remove(0);
+        assert_eq!((row.pinned, row.park), (false, Some(Park::Settled)));
+
+        act(&mut state, &a, Action::TogglePin).unwrap();
+        let row = state.ordered(std::slice::from_ref(&a)).remove(0);
+        assert_eq!((row.pinned, row.park), (true, None));
+
+        act(&mut state, &a, Action::Snooze(NOW + 60)).unwrap();
+        act(&mut state, &a, Action::TogglePin).unwrap();
+        let row = state.ordered(std::slice::from_ref(&a)).remove(0);
+        assert_eq!(
+            (row.pinned, row.park),
+            (true, None),
+            "a pinned snoozed thread is promoted, not unpinned"
         );
     }
 }

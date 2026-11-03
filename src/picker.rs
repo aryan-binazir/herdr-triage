@@ -3,7 +3,7 @@ use std::collections::BTreeSet;
 use chrono::TimeZone;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-use crate::triage::{Action, Display, Park, Section, snooze_presets};
+use crate::triage::{Action, Display, Park, Section, SnoozePreset, snooze_presets};
 
 #[derive(Debug, Clone)]
 pub struct Item {
@@ -51,7 +51,8 @@ pub struct ForgetPrompt {
 pub struct SnoozePrompt {
     pub key: String,
     pub label: String,
-    pub preset_labels: Vec<String>,
+    /// Fixed when the prompt opens, so each digit keeps meaning what was shown.
+    pub presets: Vec<SnoozePreset>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -183,7 +184,11 @@ impl Picker {
                 }
                 _ => return Effect::None,
             };
-            let Some(until) = snooze_presets(now, tz).get(choice).map(|(_, until)| *until) else {
+            let Some(until) = prompt
+                .presets
+                .get(choice)
+                .map(|preset| preset.until(now, tz))
+            else {
                 return Effect::None;
             };
             let key = prompt.key.clone();
@@ -257,17 +262,14 @@ impl Picker {
                 if matches!(item.park, Some(Park::Snoozed { .. })) {
                     return apply(self, Action::Wake);
                 }
-                if let Some(busy) = item.display.busy() {
-                    self.notify(format!("can't snooze a {busy} agent"));
+                if item.display == Display::Blocked {
+                    self.notify("can't snooze a blocked agent".into());
                     return Effect::None;
                 }
                 self.snooze = Some(SnoozePrompt {
                     key: item.key.clone(),
                     label: item.label.clone(),
-                    preset_labels: snooze_presets(now, tz)
-                        .into_iter()
-                        .map(|(label, _)| label)
-                        .collect(),
+                    presets: snooze_presets(now, tz),
                 });
             }
             _ => {}
@@ -625,7 +627,7 @@ mod tests {
         );
 
         let later = NOW + 600;
-        let confirm = KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE);
+        let confirm = KeyEvent::new(KeyCode::Char('1'), KeyModifiers::NONE);
         assert_eq!(
             picker.key(confirm, later, &chrono::Utc),
             Effect::Apply {
@@ -649,10 +651,41 @@ mod tests {
             }
         );
 
-        let mut picker = Picker::new(items(), Some("p1"), &closed_sections());
+        let mut blocked = items();
+        blocked[0].display = Display::Blocked;
+        let mut picker = Picker::new(blocked, Some("p1"), &closed_sections());
         assert_eq!(press(&mut picker, KeyCode::Char('z')), Effect::None);
         assert!(picker.snooze_prompt().is_none());
-        assert_eq!(picker.message(), Some("can't snooze a working agent"));
+        assert_eq!(picker.message(), Some("can't snooze a blocked agent"));
+
+        let mut picker = Picker::new(items(), Some("p1"), &closed_sections());
+        press(&mut picker, KeyCode::Char('z'));
+        assert!(
+            picker.snooze_prompt().is_some(),
+            "a working agent can be snoozed"
+        );
+    }
+
+    #[test]
+    fn a_snooze_digit_means_the_preset_that_was_shown() {
+        // Shown at 17:20, confirmed at 17:40: "today 18:00" was offered and stays digit 3.
+        let shown_at = NOW + 4 * 3_600 + 20 * 60;
+        let mut picker = Picker::new(items(), Some("p2"), &closed_sections());
+        picker.key(
+            KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE),
+            shown_at,
+            &chrono::Utc,
+        );
+        let presets = &picker.snooze_prompt().unwrap().presets;
+        assert_eq!(presets[2].label(), "today 18:00");
+        let confirm = KeyEvent::new(KeyCode::Char('3'), KeyModifiers::NONE);
+        assert_eq!(
+            picker.key(confirm, shown_at + 20 * 60, &chrono::Utc),
+            Effect::Apply {
+                key: "k-p2".into(),
+                action: Action::Snooze(NOW + 5 * 3_600)
+            }
+        );
     }
 
     #[test]

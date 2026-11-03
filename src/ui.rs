@@ -322,7 +322,7 @@ fn footer_line(picker: &Picker) -> Line<'static> {
             Span::from("snooze").yellow().bold(),
             Span::raw(format!(" “{}”", prompt.label)),
         ];
-        for (i, label) in prompt.preset_labels.iter().enumerate() {
+        for (i, label) in prompt.presets.iter().map(|p| p.label()).enumerate() {
             spans.push(Span::raw(format!("  {}", i + 1)));
             spans.push(Span::from(format!(" {label}")).dim());
         }
@@ -497,10 +497,10 @@ mod tests {
     fn snooze_prompt_replaces_the_hints() {
         let mut picker = picker();
         press(&mut picker, KeyCode::Char('z'));
-        let (lines, _) = render(&mut picker, 100, 14);
+        let (lines, _) = render(&mut picker, 120, 14);
         assert!(
             lines[13].contains(
-                "snooze “fix flaky test”  1 30m  2 1h  3 3h  4 tomorrow 09:00  esc cancel"
+                "snooze “fix flaky test”  1 1h  2 3h  3 today 18:00  4 tomorrow 09:00  5 next Mon 09:00  esc cancel"
             )
         );
     }
@@ -508,10 +508,9 @@ mod tests {
     #[test]
     fn refusals_show_in_the_footer() {
         let mut picker = picker();
-        press(&mut picker, KeyCode::Char('k'));
-        press(&mut picker, KeyCode::Char('z'));
+        picker.notify("can't settle a working agent".into());
         let (lines, _) = render(&mut picker, 100, 14);
-        assert!(lines[13].contains("✗ can't snooze a working agent"));
+        assert!(lines[13].contains("✗ can't settle a working agent"));
     }
 
     #[test]
