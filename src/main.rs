@@ -471,8 +471,13 @@ fn run_picker() -> io::Result<()> {
             Effect::Close => break Ok(None),
             Effect::Focus(pane) => break Ok(Some(pane)),
             Effect::Rename { key, title } => {
-                refresh(&mut herdr, &store, &mut picker, |state, _| {
-                    state.rename(&key, title, now());
+                refresh(&mut herdr, &store, &mut picker, |state, observed| {
+                    // Herdr may have learned the thread's session since the prompt opened.
+                    let key = observed
+                        .iter()
+                        .find(|agent| agent.pre_session_key.as_deref() == Some(key.as_str()))
+                        .map_or(key.as_str(), |agent| agent.key.as_str());
+                    state.rename(key, title, now());
                 });
             }
             Effect::ToggleSection(section) => {

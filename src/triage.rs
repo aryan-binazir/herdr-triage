@@ -189,6 +189,11 @@ pub struct Undo {
     /// The change closed the thread's session, so taking it back reopens it.
     #[serde(default)]
     closed: bool,
+    /// Where the agent was when the change was made; activity since outranks it.
+    #[serde(default)]
+    generation: String,
+    #[serde(default)]
+    seq: u64,
 }
 
 /// What the user set on a thread, as opposed to what Herdr observed.
@@ -212,18 +217,21 @@ impl Triage {
         }
     }
 
-    /// Puts back what the change set, wherever nothing has changed it since.
-    fn restore(self, after: &Triage, record: &mut Record) {
+    /// Puts back what the change set, wherever nothing has changed it since. Once the
+    /// agent has done something new, its attention state stays as that left it.
+    fn restore(self, after: &Triage, record: &mut Record, moved_on: bool) {
         fn undo<T: PartialEq>(field: &mut T, before: T, after: &T) {
             if field == after {
                 *field = before;
             }
         }
         undo(&mut record.pinned, self.pinned, &after.pinned);
-        undo(&mut record.park, self.park, &after.park);
-        undo(&mut record.unread, self.unread, &after.unread);
-        undo(&mut record.ack_seq, self.ack_seq, &after.ack_seq);
         undo(&mut record.title, self.title, &after.title);
+        if !moved_on {
+            undo(&mut record.park, self.park, &after.park);
+            undo(&mut record.unread, self.unread, &after.unread);
+            undo(&mut record.ack_seq, self.ack_seq, &after.ack_seq);
+        }
     }
 }
 
@@ -650,15 +658,18 @@ impl State {
     }
 
     fn remember(&mut self, key: &str, before: Triage) {
-        let Some(after) = self.records.get(key).map(Triage::of) else {
+        let Some(record) = self.records.get(key) else {
             return;
         };
+        let after = Triage::of(record);
         if after != before {
             self.undo = Some(Undo {
                 key: key.to_owned(),
                 before,
                 after,
                 closed: false,
+                generation: record.generation.clone(),
+                seq: record.last_seq,
             });
         }
     }
@@ -672,11 +683,16 @@ impl State {
             before,
             after,
             closed,
+            generation,
+            seq,
         } = self.undo.take().ok_or_else(nothing)?;
         let record = self.records.get_mut(&key).ok_or_else(nothing)?;
-        before.restore(&after, record);
+        let moved_on = record.generation != generation || record.last_seq != seq;
+        before.restore(&after, record, moved_on);
         record.touch(now);
         let after = if closed && !record.live {
+            // Back by undo rather than by choice, so it keeps the triage just restored.
+            record.ended = false;
             reopen_plan(&key, record, now)?
         } else {
             After::Nothing
@@ -1889,6 +1905,45 @@ mod tests {
         state.reconcile(GEN, &[], NOW + 60);
         assert!(!state.records.contains_key("terminal:t1"));
         assert_eq!(state.undo, None);
+    }
+
+    #[test]
+    fn undo_leaves_attention_alone_once_the_agent_has_moved_on() {
+        let working = resumable("a", Status::Working, 4);
+        let mut state = State::default();
+        state.reconcile(GEN, std::slice::from_ref(&working), NOW);
+        act(&mut state, &working, Action::Snooze(NOW + 3_600)).unwrap();
+        act(&mut state, &working, Action::TogglePin).unwrap();
+        let blocked = resumable("a", Status::Blocked, 5);
+        state.reconcile(GEN, std::slice::from_ref(&blocked), NOW + 1);
+        state.undo(NOW + 2).unwrap();
+        assert!(!state.records["a"].pinned);
+        assert_eq!(shown(&state, &blocked), (Display::Blocked, None));
+    }
+
+    #[test]
+    fn undoing_a_settle_reopens_the_thread_still_snoozed() {
+        let working = resumable("a", Status::Working, 4);
+        let mut state = State::default();
+        state.reconcile(GEN, std::slice::from_ref(&working), NOW);
+        let until = NOW + 3_600;
+        act(&mut state, &working, Action::Snooze(until)).unwrap();
+        let finished = resumable("a", Status::Idle, 5);
+        state.reconcile(GEN, std::slice::from_ref(&finished), NOW + 1);
+        assert_eq!(
+            act(&mut state, &finished, Action::ToggleSettle),
+            Ok(After::ClosePane)
+        );
+        state.session_closed("a");
+
+        assert!(matches!(state.undo(NOW + 2), Ok((_, After::Reopen(_)))));
+        state.reopening("a", "pane-new", GEN, NOW + 2);
+        let back = Observed {
+            pane_id: "pane-new".into(),
+            ..resumable("a", Status::Idle, 1)
+        };
+        state.reconcile(GEN, std::slice::from_ref(&back), NOW + 3);
+        assert_eq!(shown(&state, &back).1, Some(Park::Snoozed { until }));
     }
 
     fn act_closed_pin(state: &mut State, key: &str) {
