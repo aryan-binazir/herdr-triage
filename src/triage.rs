@@ -1,7 +1,7 @@
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet};
 
-use chrono::TimeZone;
+use chrono::{Datelike, TimeZone};
 use serde::{Deserialize, Serialize};
 
 const CLOSED_RETENTION_SECS: i64 = 30 * 86_400;
@@ -90,6 +90,7 @@ impl Park {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Section {
+    Working,
     Snoozed,
     Settled,
 }
@@ -137,6 +138,8 @@ pub struct Record {
     pub reopen_generation: Option<String>,
     #[serde(default)]
     pub restored_at: Option<i64>,
+    #[serde(default)]
+    pub title: Option<String>,
 }
 
 fn live_by_default() -> bool {
@@ -172,6 +175,63 @@ pub struct State {
     pub records: BTreeMap<String, Record>,
     #[serde(default)]
     pub open_sections: BTreeSet<Section>,
+    #[serde(default)]
+    pub undo: Option<Undo>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Undo {
+    pub key: String,
+    before: Triage,
+    after: Triage,
+    #[serde(default)]
+    closed: bool,
+    #[serde(default)]
+    generation: String,
+    #[serde(default)]
+    seq: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct Triage {
+    pinned: bool,
+    park: Option<Park>,
+    unread: Option<Unread>,
+    ack_seq: Option<u64>,
+    title: Option<String>,
+}
+
+impl Triage {
+    fn of(record: &Record) -> Self {
+        Self {
+            pinned: record.pinned,
+            park: record.park,
+            unread: record.unread,
+            ack_seq: record.ack_seq,
+            title: record.title.clone(),
+        }
+    }
+
+    fn restore(self, after: &Triage, record: &mut Record, moved_on: bool) {
+        fn undo<T: PartialEq>(field: &mut T, before: T, after: &T) {
+            if field == after {
+                *field = before;
+            }
+        }
+        undo(&mut record.pinned, self.pinned, &after.pinned);
+        undo(&mut record.title, self.title, &after.title);
+        let unparks = self.park.is_none();
+        let marks_unread = self.unread.is_some();
+        if !moved_on || unparks {
+            undo(&mut record.park, self.park, &after.park);
+        }
+        if !moved_on || marks_unread {
+            undo(&mut record.unread, self.unread, &after.unread);
+        }
+        if !moved_on {
+            undo(&mut record.ack_seq, self.ack_seq, &after.ack_seq);
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -234,6 +294,7 @@ pub struct Row {
     pub pinned: bool,
     pub changed_at: Option<i64>,
     pub thread: Thread,
+    pub title: Option<String>,
 }
 
 impl Row {
@@ -241,11 +302,8 @@ impl Row {
         self.agent_index.is_some()
     }
 
-    pub fn status_text<Tz: TimeZone>(&self, now: i64, tz: &Tz) -> String
-    where
-        Tz::Offset: std::fmt::Display,
-    {
-        let text = self.park_text(now, tz).unwrap_or_else(|| {
+    pub fn status_text(&self, now: i64) -> String {
+        let text = self.countdown(now).unwrap_or_else(|| {
             let word = match self.display {
                 Display::Blocked => "blocked",
                 Display::Working => "working",
@@ -294,6 +352,16 @@ impl Row {
         }
     }
 
+    fn countdown(&self, now: i64) -> Option<String> {
+        match self.park? {
+            Park::Settled => Some("settled".into()),
+            Park::Snoozed { until } => {
+                let left_rounded_up_to_the_minute = until - now + 59;
+                Some(format!("snoozed · {}", age(left_rounded_up_to_the_minute)))
+            }
+        }
+    }
+
     fn park_text<Tz: TimeZone>(&self, now: i64, tz: &Tz) -> Option<String>
     where
         Tz::Offset: std::fmt::Display,
@@ -333,20 +401,58 @@ where
     }
 }
 
-pub fn snooze_presets<Tz: TimeZone>(now: i64, tz: &Tz) -> Vec<(String, i64)> {
-    let mut presets = vec![
-        ("30m".to_owned(), now + 1_800),
-        ("1h".to_owned(), now + 3_600),
-        ("3h".to_owned(), now + 10_800),
-    ];
-    let tomorrow = local(now, tz).date_naive().succ_opt();
-    if let Some(morning) = tomorrow
-        .and_then(|day| day.and_hms_opt(9, 0, 0))
-        .and_then(|at| tz.from_local_datetime(&at).earliest())
-    {
-        presets.push(("tomorrow 09:00".to_owned(), morning.timestamp()));
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SnoozePreset {
+    OneHour,
+    ThreeHours,
+    ThisEvening,
+    TomorrowMorning,
+    NextWeek,
+}
+
+impl SnoozePreset {
+    pub fn label(self) -> &'static str {
+        match self {
+            SnoozePreset::OneHour => "1h",
+            SnoozePreset::ThreeHours => "3h",
+            SnoozePreset::ThisEvening => "today 18:00",
+            SnoozePreset::TomorrowMorning => "tomorrow 09:00",
+            SnoozePreset::NextWeek => "next Mon 09:00",
+        }
     }
-    presets
+
+    pub fn until<Tz: TimeZone>(self, now: i64, tz: &Tz) -> i64 {
+        let today = local(now, tz).date_naive();
+        let at = |day: Option<chrono::NaiveDate>, hour| {
+            day.and_then(|day| day.and_hms_opt(hour, 0, 0))
+                .and_then(|at| tz.from_local_datetime(&at).earliest())
+                .map_or(now, |at| at.timestamp())
+        };
+        match self {
+            SnoozePreset::OneHour => now + 3_600,
+            SnoozePreset::ThreeHours => now + 3 * 3_600,
+            SnoozePreset::ThisEvening => at(Some(today), 18),
+            SnoozePreset::TomorrowMorning => at(today.succ_opt(), 9),
+            SnoozePreset::NextWeek => {
+                let days = 7 - i64::from(today.weekday().num_days_from_monday());
+                at(today.checked_add_signed(chrono::Duration::days(days)), 9)
+            }
+        }
+    }
+}
+
+pub fn snooze_presets<Tz: TimeZone>(now: i64, tz: &Tz) -> Vec<SnoozePreset> {
+    let evening_is_half_an_hour_away = SnoozePreset::ThisEvening.until(now, tz) - now >= 1_800;
+    [
+        SnoozePreset::OneHour,
+        SnoozePreset::ThreeHours,
+        SnoozePreset::ThisEvening,
+        SnoozePreset::TomorrowMorning,
+        SnoozePreset::NextWeek,
+    ]
+    .into_iter()
+    .filter(|preset| *preset != SnoozePreset::ThisEvening || evening_is_half_an_hour_away)
+    .collect()
 }
 
 fn display(agent: &Observed, record: Option<&Record>) -> Display {
@@ -399,8 +505,12 @@ impl State {
                 record.ack_seq = None;
                 record.restored_at = (!returned_by_choice).then_some(now);
             } else if agent.seq > record.last_seq && !restoring {
-                record.park = None;
-                record.unread = None;
+                let stays_snoozed = matches!(record.park, Some(Park::Snoozed { .. }))
+                    && agent.status != Status::Blocked;
+                if !stays_snoozed {
+                    record.park = None;
+                    record.unread = None;
+                }
                 record.changed_at = Some(now);
             }
             record.last_seq = agent.seq;
@@ -451,6 +561,7 @@ impl State {
                 || (record.resumable()
                     && (record.pinned || now - record.touched_at <= CLOSED_RETENTION_SECS))
         });
+        self.drop_orphaned_undo();
         exit_checks
     }
 
@@ -475,17 +586,24 @@ impl State {
             if let Some(provisional) = &agent.pre_session_key {
                 self.records.remove(provisional);
             }
-            if let Some(record) = self.records.remove(&reopened) {
-                self.records.insert(agent.key.clone(), record);
-            }
+            self.rekey(&reopened, &agent.key);
             return;
         }
-        let previous = agent
-            .pre_session_key
-            .clone()
-            .filter(|key| self.records.contains_key(key));
-        if let Some(record) = previous.and_then(|key| self.records.remove(&key)) {
-            self.records.insert(agent.key.clone(), record);
+        if let Some(previous) = &agent.pre_session_key
+            && self.records.contains_key(previous)
+        {
+            self.rekey(previous, &agent.key);
+        }
+    }
+
+    fn rekey(&mut self, from: &str, to: &str) {
+        if let Some(record) = self.records.remove(from) {
+            self.records.insert(to.to_owned(), record);
+        }
+        if let Some(undo) = &mut self.undo
+            && undo.key == from
+        {
+            to.clone_into(&mut undo.key);
         }
     }
 
@@ -509,6 +627,76 @@ impl State {
             record.ended = true;
             record.missing_since = None;
         }
+        if let Some(undo) = &mut self.undo
+            && undo.key == key
+        {
+            undo.closed = true;
+        }
+    }
+
+    fn drop_orphaned_undo(&mut self) {
+        if self
+            .undo
+            .as_ref()
+            .is_some_and(|undo| !self.records.contains_key(&undo.key))
+        {
+            self.undo = None;
+        }
+    }
+
+    pub fn rename(&mut self, key: &str, title: Option<String>, now: i64) {
+        let Some(record) = self.records.get_mut(key) else {
+            return;
+        };
+        let before = Triage::of(record);
+        record.title = title.map(|t| t.trim().to_owned()).filter(|t| !t.is_empty());
+        record.touch(now);
+        self.remember(key, before);
+    }
+
+    fn remember(&mut self, key: &str, before: Triage) {
+        let Some(record) = self.records.get(key) else {
+            return;
+        };
+        let after = Triage::of(record);
+        if after != before {
+            self.undo = Some(Undo {
+                key: key.to_owned(),
+                before,
+                after,
+                closed: false,
+                generation: record.generation.clone(),
+                seq: record.last_seq,
+            });
+        }
+    }
+
+    pub fn undo(&mut self, now: i64) -> Result<(String, After), Refusal> {
+        let nothing = || Refusal("nothing to undo".into());
+        let Undo {
+            key,
+            before,
+            after,
+            closed,
+            generation,
+            seq,
+        } = self.undo.take().ok_or_else(nothing)?;
+        let record = self.records.get_mut(&key).ok_or_else(nothing)?;
+        let moved_on = record.generation != generation || record.last_seq != seq;
+        let current = Triage::of(record);
+        before.restore(&after, record, moved_on);
+        let reopen = closed && !record.live;
+        if Triage::of(record) == current && !reopen {
+            return Err(nothing());
+        }
+        record.touch(now);
+        let after = if reopen {
+            record.ended = false;
+            reopen_plan(&key, record, now)?
+        } else {
+            After::Nothing
+        };
+        Ok((key, after))
     }
 
     pub fn pending_wakes(&self) -> Vec<i64> {
@@ -538,6 +726,7 @@ impl State {
                 return Err(Refusal("only closed threads can be forgotten".into()));
             }
             self.records.remove(key);
+            self.drop_orphaned_undo();
             return Ok(After::Nothing);
         }
         let record = match live_agent {
@@ -552,13 +741,14 @@ impl State {
             None => self.records.get_mut(key).ok_or_else(gone)?,
         };
         record.touch(now);
+        let before = Triage::of(record);
         let seq = live_agent.map_or(record.last_seq, |agent| agent.seq);
-        if let Some(busy) = shown.busy()
-            && matches!(
-                action,
-                Action::ToggleSettle | Action::Snooze(_) | Action::ToggleUnread
-            )
-        {
+        let refused = match action {
+            Action::ToggleSettle | Action::ToggleUnread => shown.busy(),
+            Action::Snooze(_) if shown == Display::Blocked => shown.busy(),
+            _ => None,
+        };
+        if let Some(busy) = refused {
             let verb = match action {
                 Action::ToggleSettle => "settle",
                 Action::Snooze(_) => "snooze",
@@ -575,15 +765,28 @@ impl State {
                 reopen_plan(key, record, now)
             }
         };
-        match action {
+        let after = match action {
+            Action::TogglePin if record.park.is_some() => {
+                record.park = None;
+                record.pinned = true;
+                Ok(After::Nothing)
+            }
             Action::TogglePin => {
                 record.pinned = !record.pinned;
                 Ok(After::Nothing)
             }
             Action::Wake | Action::Reopen => unpark(record),
             Action::ToggleSettle if record.park == Some(Park::Settled) => unpark(record),
-            Action::ToggleSettle => Ok(park(record, seq, Park::Settled, live)),
-            Action::Snooze(until) => Ok(park(record, seq, Park::Snoozed { until }, live)),
+            Action::ToggleSettle => {
+                record.pinned = false;
+                Ok(park(record, seq, Park::Settled, live))
+            }
+            Action::Snooze(until) => Ok(park(
+                record,
+                seq,
+                Park::Snoozed { until },
+                live && shown != Display::Working,
+            )),
             Action::ToggleUnread if matches!(shown, Display::Done | Display::Unread(_)) => {
                 record.unread = None;
                 record.ack_seq = Some(seq);
@@ -595,7 +798,11 @@ impl State {
                 Ok(After::Nothing)
             }
             Action::Forget => Ok(After::Nothing),
+        };
+        if after.is_ok() {
+            self.remember(key, before);
         }
+        after
     }
 
     pub fn ordered(&self, agents: &[Observed]) -> Vec<Row> {
@@ -610,6 +817,7 @@ impl State {
                 pinned: record.is_some_and(|r| r.pinned),
                 changed_at: record.and_then(|r| r.changed_at),
                 thread: agent.thread.clone(),
+                title: record.and_then(|r| r.title.clone()),
             }
         });
         let closed = self
@@ -625,6 +833,7 @@ impl State {
                 pinned: record.pinned,
                 changed_at: record.changed_at,
                 thread: record.thread.clone(),
+                title: record.title.clone(),
             });
         let mut rows: Vec<Row> = live.chain(closed).collect();
         rows.sort_by_key(|row| {
@@ -633,7 +842,17 @@ impl State {
             } else {
                 u64::try_from(row.changed_at.unwrap_or(0)).unwrap_or(0)
             };
-            (row.rank(), !row.live(), Reverse(recency), Reverse(row.seq))
+            let wake = match row.park {
+                Some(Park::Snoozed { until }) => until,
+                _ => 0,
+            };
+            (
+                row.rank(),
+                wake,
+                !row.live(),
+                Reverse(recency),
+                Reverse(row.seq),
+            )
         });
         rows
     }
@@ -682,11 +901,11 @@ pub fn next_attention<'a>(rows: &'a [Row], current: Option<&str>) -> Option<&'a 
         .copied()
 }
 
-fn park(record: &mut Record, seq: u64, park: Park, live: bool) -> After {
+fn park(record: &mut Record, seq: u64, park: Park, close_pane: bool) -> After {
     record.park = Some(park);
     record.unread = None;
     record.ack_seq = Some(seq);
-    if live && record.resumable() {
+    if close_pane && record.resumable() {
         After::ClosePane
     } else {
         After::Nothing
@@ -788,9 +1007,9 @@ mod tests {
         state.reconcile(GEN, &agents, NOW);
         for a in &agents {
             assert!(act(&mut state, a, Action::ToggleSettle).is_err());
-            assert!(act(&mut state, a, Action::Snooze(NOW + 60)).is_err());
             assert!(act(&mut state, a, Action::ToggleUnread).is_err());
         }
+        assert!(act(&mut state, &agents[1], Action::Snooze(NOW + 60)).is_err());
         assert!(act(&mut state, &agents[0], Action::TogglePin).is_ok());
     }
 
@@ -972,7 +1191,7 @@ mod tests {
             rows.iter()
                 .find(|r| r.key == key)
                 .unwrap()
-                .status_text(ONE_PM, &tz())
+                .status_text(ONE_PM)
         };
         assert_eq!(text("w"), "working 4m");
         assert_eq!(text("d"), "done 4m");
@@ -1002,18 +1221,20 @@ mod tests {
         let row = |key: &str| rows.iter().find(|r| r.key == key).unwrap();
 
         assert_eq!(
-            row("snoozed").status_text(ONE_PM, &tz()),
-            "snoozed → 14:30 · stays open"
+            row("snoozed").status_text(ONE_PM),
+            "snoozed · 1h · stays open"
         );
         assert_eq!(
-            row("tomorrow").status_text(ONE_PM, &tz()),
-            "snoozed → tmrw 09:00 · stays open"
+            row("tomorrow").status_text(ONE_PM),
+            "snoozed · 20h · stays open"
         );
         assert_eq!(
-            row("settled").status_text(ONE_PM, &tz()),
-            "settled · stays open"
+            row("tomorrow").status_text(ONE_PM + 5),
+            "snoozed · 20h · stays open",
+            "a snooze just set reads as its full length"
         );
-        assert_eq!(row("pinned-unread").status_text(ONE_PM, &tz()), "unread");
+        assert_eq!(row("settled").status_text(ONE_PM), "settled · stays open");
+        assert_eq!(row("pinned-unread").status_text(ONE_PM), "unread");
 
         let side = |key: &str| row(key).sidebar_label("P", ONE_PM, &tz());
         assert_eq!(side("snoozed").as_deref(), Some("snoozed → 14:30"));
@@ -1024,20 +1245,61 @@ mod tests {
     }
 
     #[test]
-    fn snooze_presets_end_at_fixed_offsets_and_tomorrow_morning() {
-        let presets = snooze_presets(ONE_PM, &tz());
-        let labels: Vec<&str> = presets.iter().map(|(label, _)| label.as_str()).collect();
-        assert_eq!(labels, ["30m", "1h", "3h", "tomorrow 09:00"]);
-        let untils: Vec<i64> = presets.iter().map(|(_, until)| *until).collect();
+    fn snooze_presets_follow_t3_code() {
+        assert_eq!(local(ONE_PM, &tz()).weekday(), chrono::Weekday::Tue);
+        let labels = |now| -> Vec<&str> {
+            snooze_presets(now, &tz())
+                .iter()
+                .map(|p| p.label())
+                .collect()
+        };
+        assert_eq!(
+            labels(ONE_PM),
+            [
+                "1h",
+                "3h",
+                "today 18:00",
+                "tomorrow 09:00",
+                "next Mon 09:00"
+            ]
+        );
+        let untils: Vec<i64> = snooze_presets(ONE_PM, &tz())
+            .iter()
+            .map(|p| p.until(ONE_PM, &tz()))
+            .collect();
         assert_eq!(
             untils,
             [
-                ONE_PM + 1_800,
                 ONE_PM + 3_600,
-                ONE_PM + 10_800,
-                ONE_PM + 20 * 3_600
+                ONE_PM + 3 * 3_600,
+                ONE_PM + 5 * 3_600,
+                ONE_PM + 20 * 3_600,
+                ONE_PM + 6 * 86_400 - 4 * 3_600,
             ]
         );
+        let evening = ONE_PM + 4 * 3_600 + 40 * 60;
+        assert_eq!(
+            labels(evening),
+            ["1h", "3h", "tomorrow 09:00", "next Mon 09:00"],
+            "too close to 18:00"
+        );
+    }
+
+    #[test]
+    fn snoozed_threads_count_down_and_sort_by_wake_time() {
+        let agents = [
+            agent("later", Status::Idle, 9),
+            agent("sooner", Status::Idle, 1),
+        ];
+        let mut state = State::default();
+        state.reconcile(GEN, &agents, ONE_PM);
+        act(&mut state, &agents[0], Action::Snooze(ONE_PM + 3 * 86_400)).unwrap();
+        act(&mut state, &agents[1], Action::Snooze(ONE_PM + 45 * 60)).unwrap();
+        let rows = state.ordered(&agents);
+        let keys: Vec<&str> = rows.iter().map(|r| r.key.as_str()).collect();
+        assert_eq!(keys, ["sooner", "later"]);
+        assert_eq!(rows[0].status_text(ONE_PM), "snoozed · 45m · stays open");
+        assert_eq!(rows[1].status_text(ONE_PM), "snoozed · 3d · stays open");
     }
 
     #[test]
@@ -1046,7 +1308,7 @@ mod tests {
         let mut state = State::default();
         state.reconcile(GEN, std::slice::from_ref(&by_terminal), ONE_PM);
         act(&mut state, &by_terminal, Action::TogglePin).unwrap();
-        act(&mut state, &by_terminal, Action::ToggleSettle).unwrap();
+        act(&mut state, &by_terminal, Action::Snooze(ONE_PM + 3_600)).unwrap();
 
         let by_session = Observed {
             pre_session_key: Some("terminal:t1".into()),
@@ -1055,7 +1317,12 @@ mod tests {
         state.reconcile(GEN, std::slice::from_ref(&by_session), ONE_PM + 1);
         let row = state.ordered(std::slice::from_ref(&by_session)).remove(0);
         assert!(row.pinned);
-        assert_eq!(row.park, Some(Park::Settled));
+        assert_eq!(
+            row.park,
+            Some(Park::Snoozed {
+                until: ONE_PM + 3_600
+            })
+        );
         assert!(!state.records.contains_key("terminal:t1"));
     }
 
@@ -1109,7 +1376,7 @@ mod tests {
         state.reconcile(GEN, &[], NOW + 12);
         let row = closed(&state, "a");
         assert_eq!((row.agent_index, row.park), (None, Some(Park::Settled)));
-        assert_eq!(row.status_text(NOW + 12, &tz()), "settled · closed");
+        assert_eq!(row.status_text(NOW + 12), "settled · closed");
     }
 
     #[test]
@@ -1124,7 +1391,7 @@ mod tests {
             (row.display, row.park),
             (Display::Unread(Unread::Manual), None)
         );
-        assert_eq!(row.status_text(NOW + 12, &tz()), "unread · closed");
+        assert_eq!(row.status_text(NOW + 12), "unread · closed");
     }
 
     #[test]
@@ -1136,7 +1403,7 @@ mod tests {
         state.reconcile("g2", &[], NOW + 60);
         let row = closed(&state, "a");
         assert_eq!(row.park, None);
-        assert_eq!(row.status_text(NOW + 60, &tz()), "idle · closed");
+        assert_eq!(row.status_text(NOW + 60), "idle · closed");
     }
 
     #[test]
@@ -1198,7 +1465,7 @@ mod tests {
             .into_iter()
             .find(|r| r.key == plain.key)
             .unwrap();
-        assert_eq!(row.status_text(NOW, &tz()), "settled · stays open");
+        assert_eq!(row.status_text(NOW), "settled · stays open");
     }
 
     fn closed_settled(state: &mut State, agent: &Observed) {
@@ -1247,7 +1514,7 @@ mod tests {
             (row.display, row.park),
             (Display::Unread(Unread::Manual), None)
         );
-        assert_eq!(row.status_text(NOW + 20, &tz()), "unread · closed");
+        assert_eq!(row.status_text(NOW + 20), "unread · closed");
     }
 
     #[test]
@@ -1285,7 +1552,7 @@ mod tests {
             (row.display, row.park),
             (Display::Unread(Unread::Woke), None)
         );
-        assert_eq!(row.status_text(NOW + 61, &tz()), "woke · closed");
+        assert_eq!(row.status_text(NOW + 61), "woke · closed");
     }
 
     #[test]
@@ -1522,6 +1789,183 @@ mod tests {
         );
     }
 
+    #[test]
+    fn undo_reopens_a_thread_whose_settle_closed_it() {
+        let idle = resumable("a", Status::Idle, 4);
+        let mut state = State::default();
+        state.reconcile(GEN, std::slice::from_ref(&idle), NOW);
+        act(&mut state, &idle, Action::TogglePin).unwrap();
+        assert_eq!(
+            act(&mut state, &idle, Action::ToggleSettle),
+            Ok(After::ClosePane)
+        );
+        state.session_closed("a");
+
+        let (key, after) = state.undo(NOW + 5).unwrap();
+        assert_eq!(key, "a");
+        assert!(matches!(after, After::Reopen(plan) if plan.key == "a"));
+        let row = closed(&state, "a");
+        assert_eq!((row.park, row.pinned), (None, true));
+        assert_eq!(state.undo(NOW + 6), Err(Refusal("nothing to undo".into())));
+    }
+
+    #[test]
+    fn undo_restores_a_parked_thread_without_closing_its_pane() {
+        let working = resumable("a", Status::Working, 4);
+        let mut state = State::default();
+        state.reconcile(GEN, std::slice::from_ref(&working), NOW);
+        let until = NOW + 3_600;
+        act(&mut state, &working, Action::Snooze(until)).unwrap();
+        act(&mut state, &working, Action::Wake).unwrap();
+        assert_eq!(state.undo(NOW + 5), Ok(("a".into(), After::Nothing)));
+        assert_eq!(shown(&state, &working).1, Some(Park::Snoozed { until }));
+    }
+
+    #[test]
+    fn undo_covers_renames_and_skips_actions_that_changed_nothing() {
+        let idle = agent("a", Status::Idle, 4);
+        let mut state = State::default();
+        state.reconcile(GEN, std::slice::from_ref(&idle), NOW);
+        state.rename("a", Some("checkout flow".into()), NOW);
+        act(&mut state, &idle, Action::Wake).unwrap();
+        state.undo(NOW + 1).unwrap();
+        assert_eq!(state.records["a"].title, None);
+    }
+
+    #[test]
+    fn undo_follows_a_thread_to_its_session_key_and_forgetting_drops_it() {
+        let by_terminal = agent("terminal:t1", Status::Idle, 4);
+        let mut state = State::default();
+        state.reconcile(GEN, std::slice::from_ref(&by_terminal), NOW);
+        act(&mut state, &by_terminal, Action::TogglePin).unwrap();
+        let by_session = Observed {
+            pre_session_key: Some("terminal:t1".into()),
+            ..resumable("s1", Status::Idle, 4)
+        };
+        state.reconcile(GEN, std::slice::from_ref(&by_session), NOW + 1);
+        assert_eq!(state.undo(NOW + 2), Ok(("s1".into(), After::Nothing)));
+        assert!(!state.records["s1"].pinned);
+
+        act(&mut state, &by_session, Action::ToggleSettle).unwrap();
+        state.session_closed("s1");
+        state.apply("s1", None, Action::Forget, NOW + 3).unwrap();
+        assert_eq!(state.undo(NOW + 4), Err(Refusal("nothing to undo".into())));
+    }
+
+    #[test]
+    fn undo_takes_back_only_what_its_change_did() {
+        let working = resumable("a", Status::Working, 4);
+        let mut state = State::default();
+        state.reconcile(GEN, std::slice::from_ref(&working), NOW);
+        act(&mut state, &working, Action::Snooze(NOW + 3_600)).unwrap();
+        state.rename("a", Some("checkout flow".into()), NOW + 1);
+        let blocked = resumable("a", Status::Blocked, 5);
+        state.reconcile(GEN, std::slice::from_ref(&blocked), NOW + 2);
+        state.undo(NOW + 3).unwrap();
+        assert_eq!(state.records["a"].title, None);
+        assert_eq!(shown(&state, &blocked), (Display::Blocked, None));
+    }
+
+    #[test]
+    fn undo_reopens_a_session_its_change_closed_even_after_the_snooze_ran_out() {
+        let idle = resumable("a", Status::Idle, 4);
+        let mut state = State::default();
+        state.reconcile(GEN, std::slice::from_ref(&idle), NOW);
+        assert_eq!(
+            act(&mut state, &idle, Action::Snooze(NOW + 60)),
+            Ok(After::ClosePane)
+        );
+        state.session_closed("a");
+        state.reconcile(GEN, &[], NOW + 120);
+        assert!(matches!(state.undo(NOW + 121), Ok((_, After::Reopen(_)))));
+    }
+
+    #[test]
+    fn undoing_a_rename_never_reopens_a_thread_that_ended_since() {
+        let idle = resumable("a", Status::Idle, 4);
+        let mut state = State::default();
+        state.reconcile(GEN, std::slice::from_ref(&idle), NOW);
+        state.rename("a", Some("checkout flow".into()), NOW);
+        state.reconcile(GEN, &[], NOW + 1);
+        state.reconcile(GEN, &[], NOW + 60);
+        assert_eq!(state.undo(NOW + 61), Ok(("a".into(), After::Nothing)));
+        assert_eq!(closed(&state, "a").park, Some(Park::Settled));
+    }
+
+    #[test]
+    fn a_thread_forgotten_on_exit_takes_its_undo_with_it() {
+        let plain = agent("terminal:t1", Status::Idle, 4);
+        let mut state = State::default();
+        state.reconcile(GEN, std::slice::from_ref(&plain), NOW);
+        act(&mut state, &plain, Action::TogglePin).unwrap();
+        state.reconcile(GEN, &[], NOW + 1);
+        state.reconcile(GEN, &[], NOW + 60);
+        assert!(!state.records.contains_key("terminal:t1"));
+        assert_eq!(state.undo, None);
+    }
+
+    #[test]
+    fn undo_leaves_attention_alone_once_the_agent_has_moved_on() {
+        let working = resumable("a", Status::Working, 4);
+        let mut state = State::default();
+        state.reconcile(GEN, std::slice::from_ref(&working), NOW);
+        act(&mut state, &working, Action::Snooze(NOW + 3_600)).unwrap();
+        act(&mut state, &working, Action::TogglePin).unwrap();
+        let blocked = resumable("a", Status::Blocked, 5);
+        state.reconcile(GEN, std::slice::from_ref(&blocked), NOW + 1);
+        state.undo(NOW + 2).unwrap();
+        assert!(!state.records["a"].pinned);
+        assert_eq!(shown(&state, &blocked), (Display::Blocked, None));
+    }
+
+    #[test]
+    fn undoing_a_settle_reopens_the_thread_still_snoozed() {
+        let working = resumable("a", Status::Working, 4);
+        let mut state = State::default();
+        state.reconcile(GEN, std::slice::from_ref(&working), NOW);
+        let until = NOW + 3_600;
+        act(&mut state, &working, Action::Snooze(until)).unwrap();
+        let finished = resumable("a", Status::Idle, 5);
+        state.reconcile(GEN, std::slice::from_ref(&finished), NOW + 1);
+        assert_eq!(
+            act(&mut state, &finished, Action::ToggleSettle),
+            Ok(After::ClosePane)
+        );
+        state.session_closed("a");
+
+        assert!(matches!(state.undo(NOW + 2), Ok((_, After::Reopen(_)))));
+        state.reopening("a", "pane-new", GEN, NOW + 2);
+        let back = Observed {
+            pane_id: "pane-new".into(),
+            ..resumable("a", Status::Idle, 1)
+        };
+        state.reconcile(GEN, std::slice::from_ref(&back), NOW + 3);
+        assert_eq!(shown(&state, &back).1, Some(Park::Snoozed { until }));
+    }
+
+    #[test]
+    fn undo_still_unsnoozes_an_agent_that_worked_on_since() {
+        let working = resumable("a", Status::Working, 4);
+        let mut state = State::default();
+        state.reconcile(GEN, std::slice::from_ref(&working), NOW);
+        act(&mut state, &working, Action::Snooze(NOW + 3_600)).unwrap();
+        let finished = resumable("a", Status::Idle, 5);
+        state.reconcile(GEN, std::slice::from_ref(&finished), NOW + 1);
+        state.undo(NOW + 2).unwrap();
+        assert_eq!(shown(&state, &finished).1, None);
+    }
+
+    #[test]
+    fn undo_that_would_change_nothing_says_so() {
+        let idle = agent("a", Status::Idle, 4);
+        let mut state = State::default();
+        state.reconcile(GEN, std::slice::from_ref(&idle), NOW);
+        act(&mut state, &idle, Action::ToggleSettle).unwrap();
+        let busy = agent("a", Status::Working, 5);
+        state.reconcile(GEN, std::slice::from_ref(&busy), NOW + 1);
+        assert_eq!(state.undo(NOW + 2), Err(Refusal("nothing to undo".into())));
+    }
+
     fn act_closed_pin(state: &mut State, key: &str) {
         state.apply(key, None, Action::TogglePin, NOW + 15).unwrap();
     }
@@ -1569,6 +2013,9 @@ mod tests {
             &[resumable("active", Status::Idle, 2), agents[1].clone()],
             NOW + 10,
         );
+        for agent in &agents {
+            act(&mut state, agent, Action::ToggleUnread).unwrap();
+        }
         for at in [NOW + 20, NOW + 31] {
             state.reconcile(GEN, &[], at);
         }
@@ -1630,6 +2077,94 @@ mod tests {
         assert_eq!(
             state.reconcile(GEN, &[], NOW + 1),
             [NOW + 1 + EXIT_GRACE_SECS]
+        );
+    }
+
+    #[test]
+    fn a_snoozed_agent_wakes_only_when_it_needs_you() {
+        let idle = agent("a", Status::Idle, 1);
+        let mut state = State::default();
+        state.reconcile(GEN, std::slice::from_ref(&idle), NOW);
+        act(&mut state, &idle, Action::Snooze(NOW + 3_600)).unwrap();
+        for (status, seq) in [(Status::Working, 2), (Status::Done, 3), (Status::Idle, 4)] {
+            let busy = agent("a", status, seq);
+            state.reconcile(
+                GEN,
+                std::slice::from_ref(&busy),
+                NOW + i64::try_from(seq).unwrap(),
+            );
+            assert_eq!(
+                shown(&state, &busy).1,
+                Some(Park::Snoozed { until: NOW + 3_600 }),
+                "{status:?}"
+            );
+        }
+        let blocked = agent("a", Status::Blocked, 5);
+        state.reconcile(GEN, std::slice::from_ref(&blocked), NOW + 10);
+        assert_eq!(shown(&state, &blocked), (Display::Blocked, None));
+    }
+
+    #[test]
+    fn snoozing_a_working_agent_keeps_its_pane_open() {
+        let working = resumable("a", Status::Working, 1);
+        let mut state = State::default();
+        state.reconcile(GEN, std::slice::from_ref(&working), NOW);
+        assert_eq!(
+            act(&mut state, &working, Action::Snooze(NOW + 60)),
+            Ok(After::Nothing)
+        );
+        assert_eq!(
+            shown(&state, &working).1,
+            Some(Park::Snoozed { until: NOW + 60 })
+        );
+    }
+
+    #[test]
+    fn settling_unpins_and_pinning_a_parked_thread_brings_it_back_pinned() {
+        let a = agent("a", Status::Idle, 1);
+        let mut state = State::default();
+        state.reconcile(GEN, std::slice::from_ref(&a), NOW);
+        act(&mut state, &a, Action::TogglePin).unwrap();
+        act(&mut state, &a, Action::ToggleSettle).unwrap();
+        let row = state.ordered(std::slice::from_ref(&a)).remove(0);
+        assert_eq!((row.pinned, row.park), (false, Some(Park::Settled)));
+
+        act(&mut state, &a, Action::TogglePin).unwrap();
+        let row = state.ordered(std::slice::from_ref(&a)).remove(0);
+        assert_eq!((row.pinned, row.park), (true, None));
+
+        act(&mut state, &a, Action::Snooze(NOW + 60)).unwrap();
+        act(&mut state, &a, Action::TogglePin).unwrap();
+        let row = state.ordered(std::slice::from_ref(&a)).remove(0);
+        assert_eq!(
+            (row.pinned, row.park),
+            (true, None),
+            "a pinned snoozed thread is promoted, not unpinned"
+        );
+    }
+
+    #[test]
+    fn a_renamed_thread_keeps_its_title_live_and_closed() {
+        let a = resumable("a", Status::Idle, 1);
+        let mut state = State::default();
+        state.reconcile(GEN, std::slice::from_ref(&a), NOW);
+        state.rename("a", Some("  checkout flow  ".into()), NOW);
+        let title = |state: &State| {
+            state
+                .ordered(&[])
+                .into_iter()
+                .chain(state.ordered(std::slice::from_ref(&a)))
+                .find(|r| r.key == "a")
+                .and_then(|r| r.title)
+        };
+        assert_eq!(title(&state).as_deref(), Some("checkout flow"));
+        closed_settled(&mut state, &a);
+        assert_eq!(title(&state).as_deref(), Some("checkout flow"));
+        state.rename("a", Some("   ".into()), NOW + 20);
+        assert_eq!(
+            title(&state),
+            None,
+            "a blank title restores the automatic one"
         );
     }
 }

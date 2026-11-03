@@ -34,7 +34,8 @@ CREATE TABLE IF NOT EXISTS threads (
     reopen_pane TEXT,
     reopen_at INTEGER,
     reopen_generation TEXT,
-    restored_at INTEGER
+    restored_at INTEGER,
+    title TEXT
 );
 CREATE TABLE IF NOT EXISTS settings (name TEXT PRIMARY KEY, value TEXT NOT NULL);
 ";
@@ -161,10 +162,11 @@ impl std::fmt::Display for DatabaseError {
 
 impl std::error::Error for DatabaseError {}
 
-const LATER_COLUMNS: [(&str, &str); 3] = [
+const LATER_COLUMNS: [(&str, &str); 4] = [
     ("ended", "INTEGER NOT NULL DEFAULT 0"),
     ("reopen_generation", "TEXT"),
     ("restored_at", "INTEGER"),
+    ("title", "TEXT"),
 ];
 
 fn add_missing_columns(connection: &Connection) -> rusqlite::Result<()> {
@@ -244,6 +246,7 @@ fn load(tx: &Transaction) -> rusqlite::Result<State> {
             reopen_at: row.get("reopen_at")?,
             reopen_generation: row.get("reopen_generation")?,
             restored_at: row.get("restored_at")?,
+            title: row.get("title")?,
         };
         Ok((row.get::<_, String>("key")?, record))
     })?;
@@ -262,11 +265,20 @@ fn load(tx: &Transaction) -> rusqlite::Result<State> {
         .unwrap_or_default()
         .split(',')
         .filter_map(|name| match name {
+            "working" => Some(Section::Working),
             "snoozed" => Some(Section::Snoozed),
             "settled" => Some(Section::Settled),
             _ => None,
         })
         .collect::<BTreeSet<_>>();
+    let undo: Option<String> = tx
+        .query_row(
+            "SELECT value FROM settings WHERE name = 'undo'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    state.undo = undo.and_then(|json| serde_json::from_str(&json).ok());
     Ok(state)
 }
 
@@ -276,8 +288,8 @@ fn save(tx: &Transaction, state: &State) -> rusqlite::Result<()> {
         "INSERT INTO threads (key, pinned, park, snooze_until, unread, ack_seq, generation, \
          last_seq, changed_at, touched_at, live, ended, missing_since, last_status, label, agent, \
          cwd, workspace_id, workspace_label, session_source, session_kind, session_value, \
-         reopen_pane, reopen_at, reopen_generation, restored_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, \
-         ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26)",
+         reopen_pane, reopen_at, reopen_generation, restored_at, title) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, \
+         ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27)",
     )?;
     for (key, r) in &state.records {
         let (park, until) = match r.park {
@@ -317,12 +329,14 @@ fn save(tx: &Transaction, state: &State) -> rusqlite::Result<()> {
             r.reopen_at,
             r.reopen_generation,
             r.restored_at,
+            r.title,
         ])?;
     }
     let sections: Vec<&str> = state
         .open_sections
         .iter()
         .map(|section| match section {
+            Section::Working => "working",
             Section::Snoozed => "snoozed",
             Section::Settled => "settled",
         })
@@ -331,6 +345,14 @@ fn save(tx: &Transaction, state: &State) -> rusqlite::Result<()> {
         "INSERT OR REPLACE INTO settings VALUES ('open_sections', ?1)",
         [sections.join(",")],
     )?;
+    match &state.undo {
+        Some(undo) => tx.execute(
+            "INSERT OR REPLACE INTO settings VALUES ('undo', ?1)",
+            [serde_json::to_string(undo)
+                .map_err(|error| rusqlite::Error::ToSqlConversionFailure(error.into()))?],
+        )?,
+        None => tx.execute("DELETE FROM settings WHERE name = 'undo'", [])?,
+    };
     Ok(())
 }
 
@@ -394,14 +416,15 @@ mod tests {
             reopen_at: Some(1_200),
             reopen_generation: Some("g1".into()),
             restored_at: Some(1_300),
+            title: Some("checkout flow".into()),
         }
     }
 
     #[test]
-    fn threads_and_open_sections_survive_a_round_trip() {
+    fn threads_open_sections_and_undo_survive_a_round_trip() {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::at(dir.path().to_owned());
-        store
+        let saved_undo = store
             .transact(|state| {
                 state
                     .records
@@ -414,14 +437,28 @@ mod tests {
                     },
                 );
                 state.open_sections.insert(Section::Settled);
+                state.open_sections.insert(Section::Working);
+                state.rename("terminal:t1", Some("release notes".into()), 9);
+                state.undo.clone()
             })
             .unwrap();
-        let (records, sections) = store
-            .transact(|state| (state.records.clone(), state.open_sections.clone()))
+        let (records, sections, undo) = store
+            .transact(|state| {
+                (
+                    state.records.clone(),
+                    state.open_sections.clone(),
+                    state.undo.clone(),
+                )
+            })
             .unwrap();
+        assert!(undo.is_some());
+        assert_eq!(undo, saved_undo);
         assert_eq!(records["session:codex:id:0199-abc"], record());
         assert_eq!(records.len(), 2);
-        assert_eq!(sections, BTreeSet::from([Section::Settled]));
+        assert_eq!(
+            sections,
+            BTreeSet::from([Section::Working, Section::Settled])
+        );
     }
 
     #[test]

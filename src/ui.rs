@@ -232,6 +232,7 @@ fn row<'a>(
 
 fn section_row(section: Section, count: usize, open: bool) -> Row<'static> {
     let name = match section {
+        Section::Working => "working",
         Section::Snoozed => "snoozed",
         Section::Settled => "settled",
     };
@@ -292,6 +293,54 @@ fn enter_hint(picker: &Picker) -> Option<(&'static str, &'static str)> {
     }
 }
 
+fn tail(text: &str, width: usize) -> String {
+    let count = text.chars().count();
+    if count <= width {
+        return text.to_owned();
+    }
+    let kept: String = text.chars().skip(count - width + 1).collect();
+    format!("…{kept}")
+}
+
+fn prompt_line(picker: &Picker) -> Option<Line<'static>> {
+    if let Some(prompt) = picker.rename_prompt() {
+        return Some(Line::from(vec![
+            Span::raw(" "),
+            Span::from("rename").cyan().bold(),
+            Span::raw(format!(": {}", tail(&prompt.text, 40))),
+            Span::raw("  enter"),
+            Span::from(" save").dim(),
+            Span::raw("  esc"),
+            Span::from(" cancel").dim(),
+        ]));
+    }
+    if let Some(prompt) = picker.forget_prompt() {
+        return Some(Line::from(vec![
+            Span::raw(" "),
+            Span::from("forget").red().bold(),
+            Span::raw(format!(" “{}”?  y", prompt.label)),
+            Span::from(" yes").dim(),
+            Span::raw("  esc"),
+            Span::from(" cancel").dim(),
+        ]));
+    }
+    if let Some(prompt) = picker.snooze_prompt() {
+        let mut spans = vec![
+            Span::raw(" "),
+            Span::from("snooze").yellow().bold(),
+            Span::raw(format!(" “{}”", prompt.label)),
+        ];
+        for (i, label) in prompt.presets.iter().map(|p| p.label()).enumerate() {
+            spans.push(Span::raw(format!("  {}", i + 1)));
+            spans.push(Span::from(format!(" {label}")).dim());
+        }
+        spans.push(Span::raw("  esc"));
+        spans.push(Span::from(" cancel").dim());
+        return Some(Line::from(spans));
+    }
+    None
+}
+
 fn footer_line(picker: &Picker) -> Line<'static> {
     if let Some(message) = picker.message() {
         return if picker.message_is_error() {
@@ -306,29 +355,8 @@ fn footer_line(picker: &Picker) -> Line<'static> {
             ])
         };
     }
-    if let Some(prompt) = picker.forget_prompt() {
-        return Line::from(vec![
-            Span::raw(" "),
-            Span::from("forget").red().bold(),
-            Span::raw(format!(" “{}”?  y", prompt.label)),
-            Span::from(" yes").dim(),
-            Span::raw("  esc"),
-            Span::from(" cancel").dim(),
-        ]);
-    }
-    if let Some(prompt) = picker.snooze_prompt() {
-        let mut spans = vec![
-            Span::raw(" "),
-            Span::from("snooze").yellow().bold(),
-            Span::raw(format!(" “{}”", prompt.label)),
-        ];
-        for (i, label) in prompt.preset_labels.iter().enumerate() {
-            spans.push(Span::raw(format!("  {}", i + 1)));
-            spans.push(Span::from(format!(" {label}")).dim());
-        }
-        spans.push(Span::raw("  esc"));
-        spans.push(Span::from(" cancel").dim());
-        return Line::from(spans);
+    if let Some(line) = prompt_line(picker) {
+        return line;
     }
     let mut pairs: Vec<(&str, &str)> = enter_hint(picker).into_iter().collect();
     match picker.mode() {
@@ -362,10 +390,14 @@ fn footer_line(picker: &Picker) -> Line<'static> {
                         },
                     ),
                     ("p", if item.pinned { "unpin" } else { "pin" }),
+                    ("r", "rename"),
                 ]);
                 if item.closed() {
                     pairs.push(("D", "forget"));
                 }
+            }
+            if picker.undoable() {
+                pairs.push(("U", "undo"));
             }
             if picker.filter().is_empty() {
                 pairs.push(("esc/q", "close"));
@@ -475,7 +507,7 @@ mod tests {
                 && lines[9].contains("settled")
         );
         assert!(lines[12].contains("────"));
-        assert!(lines[13].contains("s settle  z snooze  u read  p pin  esc/q close"));
+        assert!(lines[13].contains("s settle  z snooze  u read  p pin  r rename  esc/q close"));
         assert_eq!(lines.iter().filter(|l| l.contains('│')).count(), 1);
     }
 
@@ -497,10 +529,10 @@ mod tests {
     fn snooze_prompt_replaces_the_hints() {
         let mut picker = picker();
         press(&mut picker, KeyCode::Char('z'));
-        let (lines, _) = render(&mut picker, 100, 14);
+        let (lines, _) = render(&mut picker, 120, 14);
         assert!(
             lines[13].contains(
-                "snooze “fix flaky test”  1 30m  2 1h  3 3h  4 tomorrow 09:00  esc cancel"
+                "snooze “fix flaky test”  1 1h  2 3h  3 today 18:00  4 tomorrow 09:00  5 next Mon 09:00  esc cancel"
             )
         );
     }
@@ -508,10 +540,9 @@ mod tests {
     #[test]
     fn refusals_show_in_the_footer() {
         let mut picker = picker();
-        press(&mut picker, KeyCode::Char('k'));
-        press(&mut picker, KeyCode::Char('z'));
+        picker.notify("can't settle a working agent".into());
         let (lines, _) = render(&mut picker, 100, 14);
-        assert!(lines[13].contains("✗ can't snooze a working agent"));
+        assert!(lines[13].contains("✗ can't settle a working agent"));
     }
 
     #[test]
@@ -643,7 +674,7 @@ mod tests {
         press(&mut picker, KeyCode::Char('f'));
         press(&mut picker, KeyCode::Char('l'));
         press(&mut picker, KeyCode::Esc);
-        let (lines, _) = render(&mut picker, 100, 14);
+        let (lines, _) = render(&mut picker, 120, 14);
         assert!(
             lines[1].contains("❯ fl") && lines[1].contains("1/3"),
             "{}",
@@ -777,6 +808,44 @@ mod tests {
         assert!(
             !lines[13].contains("open/close"),
             "sections stay open while filtered: {}",
+            lines[13]
+        );
+    }
+
+    #[test]
+    fn undo_is_offered_only_when_there_is_something_to_undo() {
+        let mut picker = picker();
+        let (lines, _) = render(&mut picker, 160, 14);
+        assert!(!lines[13].contains("U undo"), "{}", lines[13]);
+        picker.set_undoable(true);
+        let (lines, _) = render(&mut picker, 160, 14);
+        assert!(lines[13].contains("r rename  U undo"), "{}", lines[13]);
+    }
+
+    #[test]
+    fn a_long_rename_keeps_its_end_in_view() {
+        let mut picker = picker();
+        press(&mut picker, KeyCode::Char('r'));
+        for c in " and also the payment retries that keep timing out".chars() {
+            press(&mut picker, KeyCode::Char(c));
+        }
+        let (lines, _) = render(&mut picker, 80, 14);
+        assert!(
+            lines[13].contains("keep timing out") && lines[13].contains("esc cancel"),
+            "{}",
+            lines[13]
+        );
+    }
+
+    #[test]
+    fn the_rename_prompt_shows_the_title_being_typed() {
+        let mut picker = picker();
+        press(&mut picker, KeyCode::Char('r'));
+        let (lines, _) = render(&mut picker, 120, 14);
+        assert!(
+            lines[13].contains("rename: fix flaky test")
+                && lines[13].contains("enter save  esc cancel"),
+            "{}",
             lines[13]
         );
     }

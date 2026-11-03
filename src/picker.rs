@@ -3,7 +3,7 @@ use std::collections::BTreeSet;
 use chrono::TimeZone;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-use crate::triage::{Action, Display, Park, Section, snooze_presets};
+use crate::triage::{Action, Display, Park, Section, SnoozePreset, snooze_presets};
 
 #[derive(Debug, Clone)]
 pub struct Item {
@@ -21,6 +21,16 @@ pub struct Item {
 }
 
 impl Item {
+    pub fn section(&self) -> Option<Section> {
+        match self.park {
+            Some(park) => Some(park.section()),
+            None if self.display == Display::Working && !self.pinned && !self.closed() => {
+                Some(Section::Working)
+            }
+            None => None,
+        }
+    }
+
     pub fn closed(&self) -> bool {
         self.pane_id.is_none()
     }
@@ -32,6 +42,8 @@ pub enum Effect {
     Close,
     Focus(String),
     Apply { key: String, action: Action },
+    Rename { key: String, title: Option<String> },
+    Undo,
     ToggleSection(Section),
 }
 
@@ -39,6 +51,23 @@ pub enum Effect {
 pub enum Mode {
     Navigate,
     Search,
+}
+
+fn without_last_word(text: &str) -> &str {
+    let kept = text.trim_end();
+    let cut = kept
+        .char_indices()
+        .rev()
+        .find(|(_, c)| c.is_whitespace())
+        .map_or(0, |(at, c)| at + c.len_utf8());
+    &kept[..cut]
+}
+
+#[derive(Debug, Clone)]
+pub struct RenamePrompt {
+    pub key: String,
+    pane_id: Option<String>,
+    pub text: String,
 }
 
 #[derive(Debug, Clone)]
@@ -51,7 +80,7 @@ pub struct ForgetPrompt {
 pub struct SnoozePrompt {
     pub key: String,
     pub label: String,
-    pub preset_labels: Vec<String>,
+    pub presets: Vec<SnoozePreset>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -79,6 +108,8 @@ pub struct Picker {
     selected: usize,
     snooze: Option<SnoozePrompt>,
     forget: Option<ForgetPrompt>,
+    rename: Option<RenamePrompt>,
+    undoable: bool,
     message: Option<String>,
     message_is_error: bool,
     offset: usize,
@@ -101,6 +132,8 @@ impl Picker {
             selected: 0,
             snooze: None,
             forget: None,
+            rename: None,
+            undoable: false,
             message: None,
             message_is_error: false,
             offset: 0,
@@ -126,7 +159,7 @@ impl Picker {
             .iter()
             .position(|&entry| entry == Entry::Agent(index))
             .or_else(|| {
-                let section = self.items[index].park?.section();
+                let section = self.items[index].section()?;
                 self.entries.iter().position(
                     |entry| matches!(entry, Entry::Section { section: s, .. } if *s == section),
                 )
@@ -139,6 +172,16 @@ impl Picker {
             Entry::Section { section, .. } => Err(section),
         });
         self.items = items;
+        // Herdr rekeys a thread once it learns its session; the pane stays the same.
+        if let Some(prompt) = &mut self.rename
+            && !self.items.iter().any(|item| item.key == prompt.key)
+            && let Some(item) = self
+                .items
+                .iter()
+                .find(|item| item.pane_id.is_some() && item.pane_id == prompt.pane_id)
+        {
+            prompt.key.clone_from(&item.key);
+        }
         self.open_sections.clone_from(open_sections);
         self.refilter();
         let at = match selected {
@@ -163,6 +206,9 @@ impl Picker {
             return Effect::Close;
         }
         self.message = None;
+        if self.rename.is_some() {
+            return self.rename_key(key, ctrl);
+        }
         if let Some(prompt) = self.forget.take() {
             return match key.code {
                 KeyCode::Char('y') => Effect::Apply {
@@ -183,7 +229,11 @@ impl Picker {
                 }
                 _ => return Effect::None,
             };
-            let Some(until) = snooze_presets(now, tz).get(choice).map(|(_, until)| *until) else {
+            let Some(until) = prompt
+                .presets
+                .get(choice)
+                .map(|preset| preset.until(now, tz))
+            else {
                 return Effect::None;
             };
             let key = prompt.key.clone();
@@ -237,6 +287,16 @@ impl Picker {
             KeyCode::Char('s') => return apply(self, Action::ToggleSettle),
             KeyCode::Char('u') => return apply(self, Action::ToggleUnread),
             KeyCode::Char('p') => return apply(self, Action::TogglePin),
+            KeyCode::Char('U') => return Effect::Undo,
+            KeyCode::Char('r') => {
+                if let Some(item) = self.selected() {
+                    self.rename = Some(RenamePrompt {
+                        key: item.key.clone(),
+                        pane_id: item.pane_id.clone(),
+                        text: item.label.clone(),
+                    });
+                }
+            }
             KeyCode::Char('D') => {
                 let Some(item) = self.selected() else {
                     return Effect::None;
@@ -257,17 +317,14 @@ impl Picker {
                 if matches!(item.park, Some(Park::Snoozed { .. })) {
                     return apply(self, Action::Wake);
                 }
-                if let Some(busy) = item.display.busy() {
-                    self.notify(format!("can't snooze a {busy} agent"));
+                if item.display == Display::Blocked {
+                    self.notify("can't snooze a blocked agent".into());
                     return Effect::None;
                 }
                 self.snooze = Some(SnoozePrompt {
                     key: item.key.clone(),
                     label: item.label.clone(),
-                    preset_labels: snooze_presets(now, tz)
-                        .into_iter()
-                        .map(|(label, _)| label)
-                        .collect(),
+                    presets: snooze_presets(now, tz),
                 });
             }
             _ => {}
@@ -284,9 +341,7 @@ impl Picker {
             KeyCode::Char('n' | 'j') if ctrl => self.step(1),
             KeyCode::Char('u') if ctrl => self.set_filter(String::new()),
             KeyCode::Char('w') if ctrl => {
-                let kept = self.filter.trim_end();
-                let cut = kept.rfind(char::is_whitespace).map_or(0, |at| at + 1);
-                self.set_filter(kept[..cut].to_owned());
+                self.set_filter(without_last_word(&self.filter).to_owned());
             }
             KeyCode::Backspace => {
                 let mut filter = self.filter.clone();
@@ -348,11 +403,11 @@ impl Picker {
             matches
                 .iter()
                 .copied()
-                .filter(|&i| items[i].park.map(Park::section) == section)
+                .filter(|&i| items[i].section() == section)
                 .collect()
         };
         let mut entries: Vec<Entry> = in_section(None).into_iter().map(Entry::Agent).collect();
-        for section in [Section::Snoozed, Section::Settled] {
+        for section in [Section::Working, Section::Snoozed, Section::Settled] {
             let members = in_section(Some(section));
             if members.is_empty() {
                 continue;
@@ -406,6 +461,27 @@ impl Picker {
         self.offset
     }
 
+    pub fn move_on_from(&mut self, key: &str, from: usize) {
+        if !self
+            .items
+            .iter()
+            .any(|item| item.key == key && item.park.is_some())
+        {
+            return;
+        }
+        let waiting = |wanted: fn(Display) -> bool| {
+            self.entries.iter().position(|&entry| {
+                matches!(entry, Entry::Agent(i) if {
+                    let item = &self.items[i];
+                    item.park.is_none() && !item.closed() && wanted(item.display)
+                })
+            })
+        };
+        self.selected = waiting(|d| d == Display::Blocked)
+            .or_else(|| waiting(|d| matches!(d, Display::Done | Display::Unread(_))))
+            .unwrap_or_else(|| from.min(self.entries.len().saturating_sub(1)));
+    }
+
     pub fn selected_row(&self) -> Option<usize> {
         (!self.entries.is_empty()).then_some(self.selected)
     }
@@ -438,6 +514,44 @@ impl Picker {
 
     pub fn filter(&self) -> &str {
         &self.filter
+    }
+
+    fn rename_key(&mut self, key: KeyEvent, ctrl: bool) -> Effect {
+        let Some(prompt) = &mut self.rename else {
+            return Effect::None;
+        };
+        match key.code {
+            KeyCode::Enter => {
+                let key = prompt.key.clone();
+                let title = Some(prompt.text.trim().to_owned()).filter(|t| !t.is_empty());
+                self.rename = None;
+                return Effect::Rename { key, title };
+            }
+            KeyCode::Esc => self.rename = None,
+            KeyCode::Backspace => {
+                prompt.text.pop();
+            }
+            KeyCode::Char('u') if ctrl => prompt.text.clear(),
+            KeyCode::Char('w') if ctrl => {
+                let kept = without_last_word(&prompt.text).len();
+                prompt.text.truncate(kept);
+            }
+            KeyCode::Char(c) if !ctrl => prompt.text.push(c),
+            _ => {}
+        }
+        Effect::None
+    }
+
+    pub fn set_undoable(&mut self, undoable: bool) {
+        self.undoable = undoable;
+    }
+
+    pub fn undoable(&self) -> bool {
+        self.undoable
+    }
+
+    pub fn rename_prompt(&self) -> Option<&RenamePrompt> {
+        self.rename.as_ref()
     }
 
     pub fn forget_prompt(&self) -> Option<&ForgetPrompt> {
@@ -505,7 +619,7 @@ mod tests {
 
     fn items() -> Vec<Item> {
         vec![
-            item("p1", "api refactor", Display::Working),
+            pinned_working(),
             item("p2", "fix flaky test", Display::Done),
             item("p3", "terraform plan", Display::Idle),
         ]
@@ -522,9 +636,16 @@ mod tests {
         }
     }
 
+    fn pinned_working() -> Item {
+        Item {
+            pinned: true,
+            ..item("p1", "api refactor", Display::Working)
+        }
+    }
+
     fn shelf() -> Vec<Item> {
         vec![
-            item("p1", "api refactor", Display::Working),
+            pinned_working(),
             parked("p2", "bench run", Park::Snoozed { until: NOW + 60 }),
             parked("p3", "release notes", Park::Settled),
             parked("p4", "old spike", Park::Settled),
@@ -625,7 +746,7 @@ mod tests {
         );
 
         let later = NOW + 600;
-        let confirm = KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE);
+        let confirm = KeyEvent::new(KeyCode::Char('1'), KeyModifiers::NONE);
         assert_eq!(
             picker.key(confirm, later, &chrono::Utc),
             Effect::Apply {
@@ -649,10 +770,41 @@ mod tests {
             }
         );
 
-        let mut picker = Picker::new(items(), Some("p1"), &closed_sections());
+        let mut blocked = items();
+        blocked[0].display = Display::Blocked;
+        let mut picker = Picker::new(blocked, Some("p1"), &closed_sections());
         assert_eq!(press(&mut picker, KeyCode::Char('z')), Effect::None);
         assert!(picker.snooze_prompt().is_none());
-        assert_eq!(picker.message(), Some("can't snooze a working agent"));
+        assert_eq!(picker.message(), Some("can't snooze a blocked agent"));
+
+        let mut picker = Picker::new(items(), Some("p1"), &closed_sections());
+        press(&mut picker, KeyCode::Char('z'));
+        assert!(
+            picker.snooze_prompt().is_some(),
+            "a working agent can be snoozed"
+        );
+    }
+
+    #[test]
+    fn a_snooze_digit_means_the_preset_that_was_shown() {
+        let shown_at = NOW + 4 * 3_600 + 20 * 60;
+        let mut picker = Picker::new(items(), Some("p2"), &closed_sections());
+        picker.key(
+            KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE),
+            shown_at,
+            &chrono::Utc,
+        );
+        let presets = &picker.snooze_prompt().unwrap().presets;
+        assert_eq!(presets[2].label(), "today 18:00");
+        let confirm = KeyEvent::new(KeyCode::Char('3'), KeyModifiers::NONE);
+        let confirmed_at = shown_at + 20 * 60;
+        assert_eq!(
+            picker.key(confirm, confirmed_at, &chrono::Utc),
+            Effect::Apply {
+                key: "k-p2".into(),
+                action: Action::Snooze(NOW + 5 * 3_600)
+            }
+        );
     }
 
     #[test]
@@ -763,6 +915,34 @@ mod tests {
     }
 
     #[test]
+    fn working_agents_wait_in_their_own_section_unless_pinned() {
+        let mut pinned = item("p5", "deploy", Display::Working);
+        pinned.pinned = true;
+        let list = vec![
+            item("p1", "api refactor", Display::Working),
+            item("p2", "fix flaky test", Display::Done),
+            pinned,
+            parked("p3", "release notes", Park::Settled),
+        ];
+        let picker = Picker::new(list.clone(), Some("p1"), &closed_sections());
+        assert_eq!(
+            layout(&picker),
+            ["p2", "p5", "Working:1:false", "Settled:1:false"]
+        );
+        assert_eq!(
+            picker.selected_row(),
+            Some(2),
+            "opens on the agent's header"
+        );
+
+        let picker = Picker::new(list, None, &BTreeSet::from([Section::Working]));
+        assert_eq!(
+            layout(&picker),
+            ["p2", "p5", "Working:1:true", "p1", "Settled:1:false"]
+        );
+    }
+
+    #[test]
     fn searching_reaches_into_collapsed_sections() {
         let mut picker = Picker::new(shelf(), None, &closed_sections());
         press(&mut picker, KeyCode::Char('/'));
@@ -815,11 +995,49 @@ mod tests {
     }
 
     #[test]
-    fn opening_a_closed_thread_reopens_it() {
-        let list = vec![
-            item("p1", "api refactor", Display::Working),
-            closed("p2", "old spike"),
+    fn parking_moves_on_to_the_next_agent_that_needs_you() {
+        let list = |first_parked: bool| {
+            let mut first = item("p1", "api refactor", Display::Idle);
+            if first_parked {
+                first.park = Some(Park::Settled);
+            }
+            vec![
+                first,
+                item("p2", "fix flaky test", Display::Done),
+                item("p3", "terraform plan", Display::Idle),
+                item("p4", "bench run", Display::Blocked),
+            ]
+        };
+        let mut picker = Picker::new(list(false), Some("p1"), &closed_sections());
+        picker.refresh(list(true), &closed_sections());
+        picker.move_on_from("k-p1", 0);
+        assert_eq!(picker.selected().map(|i| i.key.as_str()), Some("k-p4"));
+
+        let calm = vec![
+            parked("p1", "api refactor", Park::Settled),
+            item("p3", "terraform plan", Display::Idle),
         ];
+        let mut picker = Picker::new(calm.clone(), Some("p3"), &closed_sections());
+        picker.refresh(calm, &closed_sections());
+        picker.move_on_from("k-p1", 0);
+        assert_eq!(
+            picker.selected().map(|i| i.key.as_str()),
+            Some("k-p3"),
+            "with nothing waiting, the cursor stays where the parked row was"
+        );
+
+        let mut picker = Picker::new(list(false), Some("p3"), &closed_sections());
+        picker.move_on_from("k-p1", 2);
+        assert_eq!(
+            picker.selected().map(|i| i.key.as_str()),
+            Some("k-p3"),
+            "an unparked thread keeps the selection"
+        );
+    }
+
+    #[test]
+    fn opening_a_closed_thread_reopens_it() {
+        let list = vec![pinned_working(), closed("p2", "old spike")];
         let mut picker = Picker::new(list, None, &closed_sections());
         let reopen = Effect::Apply {
             key: "k-p2".into(),
@@ -832,10 +1050,7 @@ mod tests {
 
     #[test]
     fn shift_d_forgets_a_closed_thread_after_confirmation() {
-        let list = vec![
-            item("p1", "api refactor", Display::Working),
-            closed("p2", "old spike"),
-        ];
+        let list = vec![pinned_working(), closed("p2", "old spike")];
         let mut picker = Picker::new(list, None, &closed_sections());
         assert_eq!(press(&mut picker, KeyCode::Char('D')), Effect::None);
         assert_eq!(
@@ -888,5 +1103,86 @@ mod tests {
             press(&mut picker, KeyCode::Char('j'));
         }
         assert_eq!(press(&mut picker, KeyCode::Enter), Effect::None);
+    }
+
+    #[test]
+    fn ctrl_w_deletes_a_word_after_wide_whitespace() {
+        let mut picker = Picker::new(items(), Some("p2"), &closed_sections());
+        press(&mut picker, KeyCode::Char('r'));
+        let ctrl = |c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL);
+        picker.key(ctrl('u'), NOW, &chrono::Utc);
+        for c in "foo\u{3000}bar".chars() {
+            press(&mut picker, KeyCode::Char(c));
+        }
+        picker.key(ctrl('w'), NOW, &chrono::Utc);
+        assert_eq!(
+            picker.rename_prompt().map(|p| p.text.as_str()),
+            Some("foo\u{3000}")
+        );
+
+        press(&mut picker, KeyCode::Esc);
+        press(&mut picker, KeyCode::Char('/'));
+        for c in "foo\u{3000}bar".chars() {
+            press(&mut picker, KeyCode::Char(c));
+        }
+        picker.key(ctrl('w'), NOW, &chrono::Utc);
+        assert_eq!(picker.filter(), "foo\u{3000}");
+    }
+
+    #[test]
+    fn a_rename_keeps_its_thread_when_herdr_learns_the_session() {
+        let mut picker = Picker::new(items(), Some("p2"), &closed_sections());
+        press(&mut picker, KeyCode::Char('r'));
+        let mut rekeyed = items();
+        rekeyed[1].key = "session:claude:id:abc".into();
+        picker.refresh(rekeyed, &closed_sections());
+        assert_eq!(
+            press(&mut picker, KeyCode::Enter),
+            Effect::Rename {
+                key: "session:claude:id:abc".into(),
+                title: Some("fix flaky test".into())
+            }
+        );
+    }
+
+    #[test]
+    fn shift_u_undoes_the_last_change() {
+        let mut picker = Picker::new(items(), Some("p2"), &closed_sections());
+        assert_eq!(press(&mut picker, KeyCode::Char('U')), Effect::Undo);
+    }
+
+    #[test]
+    fn r_renames_the_selected_thread_in_a_footer_prompt() {
+        let mut picker = Picker::new(items(), Some("p2"), &closed_sections());
+        press(&mut picker, KeyCode::Char('r'));
+        assert_eq!(
+            picker.rename_prompt().map(|p| p.text.as_str()),
+            Some("fix flaky test")
+        );
+        press(&mut picker, KeyCode::Char('u'));
+        assert_eq!(
+            picker.rename_prompt().map(|p| p.text.as_str()),
+            Some("fix flaky testu")
+        );
+        picker.key(
+            KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL),
+            NOW,
+            &chrono::Utc,
+        );
+        for c in "quick fix".chars() {
+            press(&mut picker, KeyCode::Char(c));
+        }
+        assert_eq!(
+            press(&mut picker, KeyCode::Enter),
+            Effect::Rename {
+                key: "k-p2".into(),
+                title: Some("quick fix".into())
+            }
+        );
+        assert!(picker.rename_prompt().is_none());
+
+        press(&mut picker, KeyCode::Char('r'));
+        assert_eq!(press(&mut picker, KeyCode::Esc), Effect::None);
+        assert!(picker.rename_prompt().is_none());
     }
 }
