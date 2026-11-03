@@ -81,7 +81,10 @@ pub fn draw(frame: &mut Frame, picker: &mut Picker, tick: usize, pin_icon: &str)
         frame.render_stateful_widget(table, list, &mut state);
         picker.set_viewport(state.offset(), usize::from(list.height));
     }
-    frame.render_widget(Paragraph::new(footer_line(picker)), footer);
+    frame.render_widget(
+        Paragraph::new(footer_line(picker, usize::from(footer.width))),
+        footer,
+    );
 }
 
 fn draw_search(frame: &mut Frame, picker: &Picker, area: Rect) {
@@ -293,26 +296,30 @@ fn enter_hint(picker: &Picker) -> Option<(&'static str, &'static str)> {
     }
 }
 
-fn tail(text: &str, width: usize) -> String {
-    let count = text.chars().count();
-    if count <= width {
-        return text.to_owned();
-    }
-    let kept: String = text.chars().skip(count - width + 1).collect();
-    format!("…{kept}")
+fn rename_line(text: &str) -> Line<'static> {
+    Line::from(vec![
+        Span::raw(" "),
+        Span::from("rename").cyan().bold(),
+        Span::raw(format!(": {text}")),
+        Span::raw("  enter"),
+        Span::from(" save").dim(),
+        Span::raw("  esc"),
+        Span::from(" cancel").dim(),
+    ])
 }
 
-fn prompt_line(picker: &Picker) -> Option<Line<'static>> {
+fn prompt_line(picker: &Picker, width: usize) -> Option<Line<'static>> {
     if let Some(prompt) = picker.rename_prompt() {
-        return Some(Line::from(vec![
-            Span::raw(" "),
-            Span::from("rename").cyan().bold(),
-            Span::raw(format!(": {}", tail(&prompt.text, 40))),
-            Span::raw("  enter"),
-            Span::from(" save").dim(),
-            Span::raw("  esc"),
-            Span::from(" cancel").dim(),
-        ]));
+        let text = &prompt.text;
+        let fitting = text
+            .char_indices()
+            .map(|(at, _)| match at {
+                0 => rename_line(text),
+                _ => rename_line(&format!("…{}", &text[at..])),
+            })
+            .find(|line| line.width() <= width)
+            .unwrap_or_else(|| rename_line("…"));
+        return Some(fitting);
     }
     if let Some(prompt) = picker.forget_prompt() {
         return Some(Line::from(vec![
@@ -341,7 +348,7 @@ fn prompt_line(picker: &Picker) -> Option<Line<'static>> {
     None
 }
 
-fn footer_line(picker: &Picker) -> Line<'static> {
+fn footer_line(picker: &Picker, width: usize) -> Line<'static> {
     if let Some(message) = picker.message() {
         return if picker.message_is_error() {
             Line::from(vec![
@@ -355,7 +362,7 @@ fn footer_line(picker: &Picker) -> Line<'static> {
             ])
         };
     }
-    if let Some(line) = prompt_line(picker) {
+    if let Some(line) = prompt_line(picker, width) {
         return line;
     }
     let mut pairs: Vec<(&str, &str)> = enter_hint(picker).into_iter().collect();
@@ -820,6 +827,36 @@ mod tests {
         picker.set_undoable(true);
         let (lines, _) = render(&mut picker, 160, 14);
         assert!(lines[13].contains("r rename  U undo"), "{}", lines[13]);
+    }
+
+    #[test]
+    fn a_long_rename_keeps_its_end_and_hints_in_view_at_any_width() {
+        for (width, text) in [
+            (80, " and also the payment retries that keep timing out END"),
+            (60, " 決済の再試行がタイムアウトし続ける問題を修正する終"),
+            (48, " with a long tail END"),
+        ] {
+            let mut picker = picker();
+            press(&mut picker, KeyCode::Char('r'));
+            for c in text.chars() {
+                press(&mut picker, KeyCode::Char(c));
+            }
+            let (lines, _) = render(&mut picker, width, 14);
+            let end = text
+                .chars()
+                .rev()
+                .take(3)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect::<String>();
+            let footer = lines[13].replace(' ', "");
+            assert!(
+                footer.contains(&end.replace(' ', "")) && footer.contains("esccancel"),
+                "{width}: {}",
+                lines[13]
+            );
+        }
     }
 
     #[test]

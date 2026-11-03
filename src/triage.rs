@@ -627,6 +627,10 @@ impl State {
             record.ended = true;
             record.missing_since = None;
         }
+    }
+
+    /// Closing the viewed pane can end the picker before it records the close.
+    pub fn closing(&mut self, key: &str) {
         if let Some(undo) = &mut self.undo
             && undo.key == key
         {
@@ -1799,6 +1803,7 @@ mod tests {
             act(&mut state, &idle, Action::ToggleSettle),
             Ok(After::ClosePane)
         );
+        state.closing("a");
         state.session_closed("a");
 
         let (key, after) = state.undo(NOW + 5).unwrap();
@@ -1875,6 +1880,7 @@ mod tests {
             act(&mut state, &idle, Action::Snooze(NOW + 60)),
             Ok(After::ClosePane)
         );
+        state.closing("a");
         state.session_closed("a");
         state.reconcile(GEN, &[], NOW + 120);
         assert!(matches!(state.undo(NOW + 121), Ok((_, After::Reopen(_)))));
@@ -1931,6 +1937,7 @@ mod tests {
             act(&mut state, &finished, Action::ToggleSettle),
             Ok(After::ClosePane)
         );
+        state.closing("a");
         state.session_closed("a");
 
         assert!(matches!(state.undo(NOW + 2), Ok((_, After::Reopen(_)))));
@@ -1964,6 +1971,21 @@ mod tests {
         let busy = agent("a", Status::Working, 5);
         state.reconcile(GEN, std::slice::from_ref(&busy), NOW + 1);
         assert_eq!(state.undo(NOW + 2), Err(Refusal("nothing to undo".into())));
+    }
+
+    #[test]
+    fn undo_reopens_a_session_closed_with_the_picker_that_closed_it() {
+        let idle = resumable("a", Status::Idle, 4);
+        let mut state = State::default();
+        state.reconcile(GEN, std::slice::from_ref(&idle), NOW);
+        assert_eq!(
+            act(&mut state, &idle, Action::ToggleSettle),
+            Ok(After::ClosePane)
+        );
+        state.closing("a");
+        state.reconcile(GEN, &[], NOW + 1);
+        state.reconcile(GEN, &[], NOW + 60);
+        assert!(matches!(state.undo(NOW + 61), Ok((_, After::Reopen(_)))));
     }
 
     fn act_closed_pin(state: &mut State, key: &str) {

@@ -322,10 +322,19 @@ struct Performed {
 
 fn perform(herdr: &mut Herdr, store: &Store, key: &str, action: Action) -> io::Result<Performed> {
     carry_out(herdr, store, |state, observed| {
+        let key = current_key(observed, key);
         let agent = observed.iter().find(|agent| agent.key == key);
         let after = state.apply(key, agent, action, now())?;
         Ok((key.to_owned(), after))
     })
+}
+
+/// Herdr rekeys a thread once it learns its session, possibly after the picker last looked.
+fn current_key<'a>(observed: &'a [Observed], key: &'a str) -> &'a str {
+    observed
+        .iter()
+        .find(|agent| agent.pre_session_key.as_deref() == Some(key))
+        .map_or(key, |agent| agent.key.as_str())
 }
 
 fn carry_out(
@@ -373,6 +382,7 @@ fn close_session(
             "kept open: it is the last pane in its workspace".into(),
         ));
     }
+    store.transact(|state| state.closing(key))?;
     herdr.close_pane(&agent.pane_id)?;
     store.transact(|state| state.session_closed(key))?;
     Ok(None)
@@ -471,11 +481,7 @@ fn run_picker() -> io::Result<()> {
             Effect::Focus(pane) => break Ok(Some(pane)),
             Effect::Rename { key, title } => {
                 refresh(&mut herdr, &store, &mut picker, |state, observed| {
-                    let current_key = observed
-                        .iter()
-                        .find(|agent| agent.pre_session_key.as_deref() == Some(key.as_str()))
-                        .map_or(key.as_str(), |agent| agent.key.as_str());
-                    state.rename(current_key, title, now());
+                    state.rename(current_key(observed, &key), title, now());
                 });
             }
             Effect::ToggleSection(section) => {
@@ -857,6 +863,22 @@ mod tests {
         assert_eq!(thread_label(&agent(None, "π - docs pass")), "docs pass");
         assert_eq!(thread_label(&agent(Some("  "), "Codex")), "Untitled thread");
         assert_eq!(thread_label(&agent(None, "pinning bug")), "pinning bug");
+    }
+
+    #[test]
+    fn an_action_on_a_thread_herdr_has_since_rekeyed_lands_on_it() {
+        let fake = FakeHerdr::start(vec![
+            resumable_agent("w1:p1", "idle", 3),
+            resumable_agent("w1:p2", "idle", 4),
+        ]);
+        let (mut herdr, store) = connected(&fake);
+        let performed =
+            perform(&mut herdr, &store, "terminal:t-w1:p1", Action::ToggleSettle).unwrap();
+        assert_eq!(performed.refusal, None);
+        let parked = store
+            .transact(|state| state.records["session:claude:id:id-w1:p1"].park)
+            .unwrap();
+        assert_eq!(parked, Some(Park::Settled));
     }
 
     #[test]
