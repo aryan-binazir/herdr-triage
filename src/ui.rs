@@ -296,6 +296,14 @@ fn enter_hint(picker: &Picker) -> Option<(&'static str, &'static str)> {
     }
 }
 
+/// Cells as the buffer lays them out, grapheme by grapheme; a whole-string width can differ.
+fn cells(text: &str) -> usize {
+    Span::raw(text)
+        .styled_graphemes(Style::new())
+        .map(|grapheme| Span::raw(grapheme.symbol).width())
+        .sum()
+}
+
 fn rename_line(text: &str) -> Line<'static> {
     Line::from(vec![
         Span::raw(" "),
@@ -312,11 +320,11 @@ fn prompt_line(picker: &Picker, width: usize) -> Option<Line<'static>> {
     if let Some(prompt) = picker.rename_prompt() {
         let text = prompt.text.as_str();
         let room = width.saturating_sub(rename_line("").width());
-        if Line::from(text).width() <= room {
+        if cells(text) <= room {
             return Some(rename_line(text));
         }
         let starts: Vec<usize> = text.char_indices().map(|(at, _)| at).collect();
-        let fits = |at: usize| Line::from(format!("…{}", &text[at..])).width() <= room;
+        let fits = |at: usize| cells("…") + cells(&text[at..]) <= room;
         let start = starts
             .get(starts.partition_point(|&at| !fits(at)))
             .copied()
@@ -875,6 +883,17 @@ mod tests {
             "{}",
             lines[13]
         );
+    }
+
+    #[test]
+    fn an_arabic_rename_keeps_its_hints_in_view() {
+        let mut picker = picker();
+        press(&mut picker, KeyCode::Char('r'));
+        for c in format!(" {} end", "لا".repeat(25)).chars() {
+            press(&mut picker, KeyCode::Char(c));
+        }
+        let (lines, _) = render(&mut picker, 48, 14);
+        assert!(lines[13].contains("esc cancel"), "{}", lines[13]);
     }
 
     #[test]
