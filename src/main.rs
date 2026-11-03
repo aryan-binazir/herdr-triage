@@ -485,9 +485,14 @@ fn run_picker() -> io::Result<()> {
                     Action::Snooze(until) => spawn_waker(until).err(),
                     _ => None,
                 };
+                let from = picker.selected_row().unwrap_or(0);
                 let performed = perform(&mut herdr, &store, &key, action);
+                let done = matches!(&performed, Ok(p) if p.refusal.is_none());
                 if show_performed(&mut herdr, &store, &mut picker, performed) {
                     break Ok(None);
+                }
+                if done && matches!(action, Action::ToggleSettle | Action::Snooze(_)) {
+                    picker.move_on_from(&key, from);
                 }
                 refreshed = Instant::now();
                 if let Some(error) = waker_error {
@@ -503,12 +508,12 @@ fn run_picker() -> io::Result<()> {
                     }
                     Ok(undone)
                 });
-                let undid = matches!(&performed, Ok(p) if p.refusal.is_none());
+                let done = matches!(&performed, Ok(p) if p.refusal.is_none());
                 if show_performed(&mut herdr, &store, &mut picker, performed) {
                     break Ok(None);
                 }
                 refreshed = Instant::now();
-                if undid {
+                if done {
                     picker.inform("undone".into());
                 }
                 if let Some(error) = wake.and_then(|until| spawn_waker(until).err()) {

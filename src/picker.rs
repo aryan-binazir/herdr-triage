@@ -444,6 +444,29 @@ impl Picker {
         self.offset
     }
 
+    /// After parking a thread, like T3 Code, go on to the next one that needs you:
+    /// blocked first, then finished or unread. With none, the cursor stays put.
+    pub fn move_on_from(&mut self, key: &str, from: usize) {
+        if !self
+            .items
+            .iter()
+            .any(|item| item.key == key && item.park.is_some())
+        {
+            return;
+        }
+        let waiting = |wanted: fn(Display) -> bool| {
+            self.entries.iter().position(|&entry| {
+                matches!(entry, Entry::Agent(i) if {
+                    let item = &self.items[i];
+                    item.park.is_none() && !item.closed() && wanted(item.display)
+                })
+            })
+        };
+        self.selected = waiting(|d| d == Display::Blocked)
+            .or_else(|| waiting(|d| matches!(d, Display::Done | Display::Unread(_))))
+            .unwrap_or_else(|| from.min(self.entries.len().saturating_sub(1)));
+    }
+
     pub fn selected_row(&self) -> Option<usize> {
         (!self.entries.is_empty()).then_some(self.selected)
     }
@@ -956,6 +979,47 @@ mod tests {
             pane_id: None,
             ..item(pane, label, Display::Idle)
         }
+    }
+
+    #[test]
+    fn parking_moves_on_to_the_next_agent_that_needs_you() {
+        let list = |first_parked: bool| {
+            let mut first = item("p1", "api refactor", Display::Idle);
+            if first_parked {
+                first.park = Some(Park::Settled);
+            }
+            vec![
+                first,
+                item("p2", "fix flaky test", Display::Done),
+                item("p3", "terraform plan", Display::Idle),
+                item("p4", "bench run", Display::Blocked),
+            ]
+        };
+        let mut picker = Picker::new(list(false), Some("p1"), &closed_sections());
+        picker.refresh(list(true), &closed_sections());
+        picker.move_on_from("k-p1", 0);
+        assert_eq!(picker.selected().map(|i| i.key.as_str()), Some("k-p4"));
+
+        let calm = vec![
+            parked("p1", "api refactor", Park::Settled),
+            item("p3", "terraform plan", Display::Idle),
+        ];
+        let mut picker = Picker::new(calm.clone(), Some("p3"), &closed_sections());
+        picker.refresh(calm, &closed_sections());
+        picker.move_on_from("k-p1", 0);
+        assert_eq!(
+            picker.selected().map(|i| i.key.as_str()),
+            Some("k-p3"),
+            "with nothing waiting, the cursor stays where the parked row was"
+        );
+
+        let mut picker = Picker::new(list(false), Some("p3"), &closed_sections());
+        picker.move_on_from("k-p1", 2);
+        assert_eq!(
+            picker.selected().map(|i| i.key.as_str()),
+            Some("k-p3"),
+            "an unparked thread keeps the selection"
+        );
     }
 
     #[test]
