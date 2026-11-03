@@ -339,7 +339,8 @@ impl Row {
     fn countdown(&self, now: i64) -> Option<String> {
         match self.park? {
             Park::Settled => Some("settled".into()),
-            Park::Snoozed { until } => Some(format!("snoozed · {}", age(until - now))),
+            // Rounded up to the minute, so a snooze just set reads as its full length.
+            Park::Snoozed { until } => Some(format!("snoozed · {}", age(until - now + 59))),
         }
     }
 
@@ -1184,6 +1185,11 @@ mod tests {
         assert_eq!(
             row("tomorrow").status_text(ONE_PM),
             "snoozed · 20h · stays open"
+        );
+        assert_eq!(
+            row("tomorrow").status_text(ONE_PM + 5),
+            "snoozed · 20h · stays open",
+            "a snooze just set reads as its full length"
         );
         assert_eq!(row("settled").status_text(ONE_PM), "settled · stays open");
         assert_eq!(row("pinned-unread").status_text(ONE_PM), "unread");
