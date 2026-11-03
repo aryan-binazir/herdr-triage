@@ -108,8 +108,9 @@ is offered until 30 minutes before, so later in the day the digits after it shif
   if you hadn't seen its result. Settle and unread are refused while an agent is working or blocked;
   snooze only while it is blocked.
 - **Undo** (`U`) takes back the last settle, snooze, wake, unread, pin or rename, once. It never closes
-  a pane; undoing a settle or snooze that closed a session reopens it. Forgetting a thread can't be
-  undone.
+  a pane; undoing a settle or snooze that closed a session reopens it. Once the agent has done
+  something new, undo can still bring a thread back but won't park it again. Forgetting a thread
+  can't be undone.
 - **Rename** (`r`) gives a thread its own title in the picker; search still finds the automatic one.
 - **`next`** focuses blocked agents first, then done or unread ones, skipping parked and closed threads.
 
