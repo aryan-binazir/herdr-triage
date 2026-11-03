@@ -232,6 +232,7 @@ fn row<'a>(
 
 fn section_row(section: Section, count: usize, open: bool) -> Row<'static> {
     let name = match section {
+        Section::Working => "working",
         Section::Snoozed => "snoozed",
         Section::Settled => "settled",
     };

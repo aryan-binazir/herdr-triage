@@ -21,6 +21,17 @@ pub struct Item {
 }
 
 impl Item {
+    /// Parked threads sit in their section; so do agents busy working, unless pinned.
+    pub fn section(&self) -> Option<Section> {
+        match self.park {
+            Some(park) => Some(park.section()),
+            None if self.display == Display::Working && !self.pinned && !self.closed() => {
+                Some(Section::Working)
+            }
+            None => None,
+        }
+    }
+
     pub fn closed(&self) -> bool {
         self.pane_id.is_none()
     }
@@ -140,7 +151,7 @@ impl Picker {
             .iter()
             .position(|&entry| entry == Entry::Agent(index))
             .or_else(|| {
-                let section = self.items[index].park?.section();
+                let section = self.items[index].section()?;
                 self.entries.iter().position(
                     |entry| matches!(entry, Entry::Section { section: s, .. } if *s == section),
                 )
@@ -375,11 +386,11 @@ impl Picker {
             matches
                 .iter()
                 .copied()
-                .filter(|&i| items[i].park.map(Park::section) == section)
+                .filter(|&i| items[i].section() == section)
                 .collect()
         };
         let mut entries: Vec<Entry> = in_section(None).into_iter().map(Entry::Agent).collect();
-        for section in [Section::Snoozed, Section::Settled] {
+        for section in [Section::Working, Section::Snoozed, Section::Settled] {
             let members = in_section(Some(section));
             if members.is_empty() {
                 continue;
@@ -569,9 +580,10 @@ mod tests {
         }
     }
 
+    /// p1 is pinned, so it stays in the main list while working.
     fn items() -> Vec<Item> {
         vec![
-            item("p1", "api refactor", Display::Working),
+            pinned_working(),
             item("p2", "fix flaky test", Display::Done),
             item("p3", "terraform plan", Display::Idle),
         ]
@@ -588,9 +600,16 @@ mod tests {
         }
     }
 
+    fn pinned_working() -> Item {
+        Item {
+            pinned: true,
+            ..item("p1", "api refactor", Display::Working)
+        }
+    }
+
     fn shelf() -> Vec<Item> {
         vec![
-            item("p1", "api refactor", Display::Working),
+            pinned_working(),
             parked("p2", "bench run", Park::Snoozed { until: NOW + 60 }),
             parked("p3", "release notes", Park::Settled),
             parked("p4", "old spike", Park::Settled),
@@ -860,6 +879,34 @@ mod tests {
     }
 
     #[test]
+    fn working_agents_wait_in_their_own_section_unless_pinned() {
+        let mut pinned = item("p5", "deploy", Display::Working);
+        pinned.pinned = true;
+        let list = vec![
+            item("p1", "api refactor", Display::Working),
+            item("p2", "fix flaky test", Display::Done),
+            pinned,
+            parked("p3", "release notes", Park::Settled),
+        ];
+        let picker = Picker::new(list.clone(), Some("p1"), &closed_sections());
+        assert_eq!(
+            layout(&picker),
+            ["p2", "p5", "Working:1:false", "Settled:1:false"]
+        );
+        assert_eq!(
+            picker.selected_row(),
+            Some(2),
+            "opens on the agent's header"
+        );
+
+        let picker = Picker::new(list, None, &BTreeSet::from([Section::Working]));
+        assert_eq!(
+            layout(&picker),
+            ["p2", "p5", "Working:1:true", "p1", "Settled:1:false"]
+        );
+    }
+
+    #[test]
     fn searching_reaches_into_collapsed_sections() {
         let mut picker = Picker::new(shelf(), None, &closed_sections());
         press(&mut picker, KeyCode::Char('/'));
@@ -913,10 +960,7 @@ mod tests {
 
     #[test]
     fn opening_a_closed_thread_reopens_it() {
-        let list = vec![
-            item("p1", "api refactor", Display::Working),
-            closed("p2", "old spike"),
-        ];
+        let list = vec![pinned_working(), closed("p2", "old spike")];
         let mut picker = Picker::new(list, None, &closed_sections());
         let reopen = Effect::Apply {
             key: "k-p2".into(),
@@ -929,10 +973,7 @@ mod tests {
 
     #[test]
     fn shift_d_forgets_a_closed_thread_after_confirmation() {
-        let list = vec![
-            item("p1", "api refactor", Display::Working),
-            closed("p2", "old spike"),
-        ];
+        let list = vec![pinned_working(), closed("p2", "old spike")];
         let mut picker = Picker::new(list, None, &closed_sections());
         assert_eq!(press(&mut picker, KeyCode::Char('D')), Effect::None);
         assert_eq!(

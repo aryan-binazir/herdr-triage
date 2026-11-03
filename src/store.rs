@@ -265,6 +265,7 @@ fn load(tx: &Transaction) -> rusqlite::Result<State> {
         .unwrap_or_default()
         .split(',')
         .filter_map(|name| match name {
+            "working" => Some(Section::Working),
             "snoozed" => Some(Section::Snoozed),
             "settled" => Some(Section::Settled),
             _ => None,
@@ -336,6 +337,7 @@ fn save(tx: &Transaction, state: &State) -> rusqlite::Result<()> {
         .open_sections
         .iter()
         .map(|section| match section {
+            Section::Working => "working",
             Section::Snoozed => "snoozed",
             Section::Settled => "settled",
         })
@@ -436,6 +438,7 @@ mod tests {
                     },
                 );
                 state.open_sections.insert(Section::Settled);
+                state.open_sections.insert(Section::Working);
                 state.rename("terminal:t1", Some("release notes".into()), 9);
                 state.undo.clone()
             })
@@ -453,7 +456,10 @@ mod tests {
         assert_eq!(undo, saved_undo);
         assert_eq!(records["session:codex:id:0199-abc"], record());
         assert_eq!(records.len(), 2);
-        assert_eq!(sections, BTreeSet::from([Section::Settled]));
+        assert_eq!(
+            sections,
+            BTreeSet::from([Section::Working, Section::Settled])
+        );
     }
 
     #[test]

@@ -90,6 +90,7 @@ impl Park {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Section {
+    Working,
     Snoozed,
     Settled,
 }
