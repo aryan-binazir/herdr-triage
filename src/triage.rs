@@ -185,6 +185,10 @@ pub struct State {
 pub struct Undo {
     pub key: String,
     before: Triage,
+    after: Triage,
+    /// The change closed the thread's session, so taking it back reopens it.
+    #[serde(default)]
+    closed: bool,
 }
 
 /// What the user set on a thread, as opposed to what Herdr observed.
@@ -208,12 +212,18 @@ impl Triage {
         }
     }
 
-    fn restore(self, record: &mut Record) {
-        record.pinned = self.pinned;
-        record.park = self.park;
-        record.unread = self.unread;
-        record.ack_seq = self.ack_seq;
-        record.title = self.title;
+    /// Puts back what the change set, wherever nothing has changed it since.
+    fn restore(self, after: &Triage, record: &mut Record) {
+        fn undo<T: PartialEq>(field: &mut T, before: T, after: &T) {
+            if field == after {
+                *field = before;
+            }
+        }
+        undo(&mut record.pinned, self.pinned, &after.pinned);
+        undo(&mut record.park, self.park, &after.park);
+        undo(&mut record.unread, self.unread, &after.unread);
+        undo(&mut record.ack_seq, self.ack_seq, &after.ack_seq);
+        undo(&mut record.title, self.title, &after.title);
     }
 }
 
@@ -545,6 +555,7 @@ impl State {
                 || (record.resumable()
                     && (record.pinned || now - record.touched_at <= CLOSED_RETENTION_SECS))
         });
+        self.drop_orphaned_undo();
         exit_checks
     }
 
@@ -610,6 +621,21 @@ impl State {
             record.ended = true;
             record.missing_since = None;
         }
+        if let Some(undo) = &mut self.undo
+            && undo.key == key
+        {
+            undo.closed = true;
+        }
+    }
+
+    fn drop_orphaned_undo(&mut self) {
+        if self
+            .undo
+            .as_ref()
+            .is_some_and(|undo| !self.records.contains_key(&undo.key))
+        {
+            self.undo = None;
+        }
     }
 
     /// Gives a thread its own title; a blank one restores the automatic title.
@@ -624,28 +650,33 @@ impl State {
     }
 
     fn remember(&mut self, key: &str, before: Triage) {
-        if self
-            .records
-            .get(key)
-            .is_some_and(|r| Triage::of(r) != before)
-        {
+        let Some(after) = self.records.get(key).map(Triage::of) else {
+            return;
+        };
+        if after != before {
             self.undo = Some(Undo {
                 key: key.to_owned(),
                 before,
+                after,
+                closed: false,
             });
         }
     }
 
-    /// Takes back the last change. It never closes a pane, but reopens a thread
-    /// that parking had closed.
+    /// Takes back the last change. It never closes a pane, but reopens a session
+    /// the change closed.
     pub fn undo(&mut self, now: i64) -> Result<(String, After), Refusal> {
         let nothing = || Refusal("nothing to undo".into());
-        let Undo { key, before } = self.undo.take().ok_or_else(nothing)?;
+        let Undo {
+            key,
+            before,
+            after,
+            closed,
+        } = self.undo.take().ok_or_else(nothing)?;
         let record = self.records.get_mut(&key).ok_or_else(nothing)?;
-        let was_parked = record.park.is_some();
-        before.restore(record);
+        before.restore(&after, record);
         record.touch(now);
-        let after = if !record.live && was_parked && record.park.is_none() {
+        let after = if closed && !record.live {
             reopen_plan(&key, record, now)?
         } else {
             After::Nothing
@@ -680,9 +711,7 @@ impl State {
                 return Err(Refusal("only closed threads can be forgotten".into()));
             }
             self.records.remove(key);
-            if self.undo.as_ref().is_some_and(|undo| undo.key == key) {
-                self.undo = None;
-            }
+            self.drop_orphaned_undo();
             return Ok(After::Nothing);
         }
         let record = match live_agent {
@@ -1808,6 +1837,58 @@ mod tests {
         state.session_closed("s1");
         state.apply("s1", None, Action::Forget, NOW + 3).unwrap();
         assert_eq!(state.undo(NOW + 4), Err(Refusal("nothing to undo".into())));
+    }
+
+    #[test]
+    fn undo_takes_back_only_what_its_change_did() {
+        let working = resumable("a", Status::Working, 4);
+        let mut state = State::default();
+        state.reconcile(GEN, std::slice::from_ref(&working), NOW);
+        act(&mut state, &working, Action::Snooze(NOW + 3_600)).unwrap();
+        state.rename("a", Some("checkout flow".into()), NOW + 1);
+        let blocked = resumable("a", Status::Blocked, 5);
+        state.reconcile(GEN, std::slice::from_ref(&blocked), NOW + 2);
+        state.undo(NOW + 3).unwrap();
+        assert_eq!(state.records["a"].title, None);
+        assert_eq!(shown(&state, &blocked), (Display::Blocked, None));
+    }
+
+    #[test]
+    fn undo_reopens_a_session_its_change_closed_even_after_the_snooze_ran_out() {
+        let idle = resumable("a", Status::Idle, 4);
+        let mut state = State::default();
+        state.reconcile(GEN, std::slice::from_ref(&idle), NOW);
+        assert_eq!(
+            act(&mut state, &idle, Action::Snooze(NOW + 60)),
+            Ok(After::ClosePane)
+        );
+        state.session_closed("a");
+        state.reconcile(GEN, &[], NOW + 120);
+        assert!(matches!(state.undo(NOW + 121), Ok((_, After::Reopen(_)))));
+    }
+
+    #[test]
+    fn undoing_a_rename_never_reopens_a_thread_that_ended_since() {
+        let idle = resumable("a", Status::Idle, 4);
+        let mut state = State::default();
+        state.reconcile(GEN, std::slice::from_ref(&idle), NOW);
+        state.rename("a", Some("checkout flow".into()), NOW);
+        state.reconcile(GEN, &[], NOW + 1);
+        state.reconcile(GEN, &[], NOW + 60);
+        assert_eq!(state.undo(NOW + 61), Ok(("a".into(), After::Nothing)));
+        assert_eq!(closed(&state, "a").park, Some(Park::Settled));
+    }
+
+    #[test]
+    fn a_thread_forgotten_on_exit_takes_its_undo_with_it() {
+        let plain = agent("terminal:t1", Status::Idle, 4);
+        let mut state = State::default();
+        state.reconcile(GEN, std::slice::from_ref(&plain), NOW);
+        act(&mut state, &plain, Action::TogglePin).unwrap();
+        state.reconcile(GEN, &[], NOW + 1);
+        state.reconcile(GEN, &[], NOW + 60);
+        assert!(!state.records.contains_key("terminal:t1"));
+        assert_eq!(state.undo, None);
     }
 
     fn act_closed_pin(state: &mut State, key: &str) {

@@ -60,7 +60,7 @@ rows = [
 | `1`–`9`, `0` | open row 1–10 on screen | typed |
 | `/` | search (edits the kept search) | — |
 | `s` | settle / unsettle | typed |
-| `z` | snooze (`1` 1h, `2` 3h, `3` today 18:00, `4` tomorrow 09:00, `5` next Mon 09:00) / wake | typed |
+| `z` | snooze (1h, 3h, today 18:00, tomorrow 09:00, next Mon 09:00; press the digit shown beside one) / wake | typed |
 | `u` | mark read / unread | typed |
 | `p` | pin / unpin | typed |
 | `r` | rename the thread (`enter` saves; an empty title restores the automatic one) | typed |
@@ -75,8 +75,8 @@ The picker opens on the agent you invoked it from. Agents busy working (unless p
 `▸ snoozed · N` and `▸ settled · N` sections at the bottom. Sections stay collapsed until you open
 them, and the picker remembers which are open. A search looks inside them too. After you settle or
 snooze a thread, the cursor moves on to the next one that needs you: blocked first, then done or
-unread. `z` swaps the footer for a snooze prompt; pick a time with its digit (`today 18:00` is
-offered until 30 minutes before):
+unread. `z` swaps the footer for a snooze prompt; pick a time with the digit beside it. `today 18:00`
+is offered until 30 minutes before, so later in the day the digits after it shift down:
 
 ![The snooze prompt in the picker footer: 1 1h, 2 3h, 3 today 18:00, 4 tomorrow 09:00, 5 next Mon 09:00, esc cancel](docs/snooze.png)
 

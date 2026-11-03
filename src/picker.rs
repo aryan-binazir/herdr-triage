@@ -54,10 +54,21 @@ pub enum Mode {
     Search,
 }
 
+fn without_last_word(text: &str) -> &str {
+    let kept = text.trim_end();
+    let cut = kept
+        .char_indices()
+        .rev()
+        .find(|(_, c)| c.is_whitespace())
+        .map_or(0, |(at, c)| at + c.len_utf8());
+    &kept[..cut]
+}
+
 /// Edits a thread's title in the footer, bound to that thread across refreshes.
 #[derive(Debug, Clone)]
 pub struct RenamePrompt {
     pub key: String,
+    pane_id: Option<String>,
     pub text: String,
 }
 
@@ -164,6 +175,16 @@ impl Picker {
             Entry::Section { section, .. } => Err(section),
         });
         self.items = items;
+        // Herdr rekeys a thread once it learns its session; the pane stays the same.
+        if let Some(prompt) = &mut self.rename
+            && !self.items.iter().any(|item| item.key == prompt.key)
+            && let Some(item) = self
+                .items
+                .iter()
+                .find(|item| item.pane_id.is_some() && item.pane_id == prompt.pane_id)
+        {
+            prompt.key.clone_from(&item.key);
+        }
         self.open_sections.clone_from(open_sections);
         self.refilter();
         let at = match selected {
@@ -274,6 +295,7 @@ impl Picker {
                 if let Some(item) = self.selected() {
                     self.rename = Some(RenamePrompt {
                         key: item.key.clone(),
+                        pane_id: item.pane_id.clone(),
                         text: item.label.clone(),
                     });
                 }
@@ -322,9 +344,7 @@ impl Picker {
             KeyCode::Char('n' | 'j') if ctrl => self.step(1),
             KeyCode::Char('u') if ctrl => self.set_filter(String::new()),
             KeyCode::Char('w') if ctrl => {
-                let kept = self.filter.trim_end();
-                let cut = kept.rfind(char::is_whitespace).map_or(0, |at| at + 1);
-                self.set_filter(kept[..cut].to_owned());
+                self.set_filter(without_last_word(&self.filter).to_owned());
             }
             KeyCode::Backspace => {
                 let mut filter = self.filter.clone();
@@ -518,9 +538,8 @@ impl Picker {
             }
             KeyCode::Char('u') if ctrl => prompt.text.clear(),
             KeyCode::Char('w') if ctrl => {
-                let kept = prompt.text.trim_end();
-                let cut = kept.rfind(char::is_whitespace).map_or(0, |at| at + 1);
-                prompt.text.truncate(cut);
+                let kept = without_last_word(&prompt.text).len();
+                prompt.text.truncate(kept);
             }
             KeyCode::Char(c) if !ctrl => prompt.text.push(c),
             _ => {}
@@ -1090,6 +1109,46 @@ mod tests {
             press(&mut picker, KeyCode::Char('j'));
         }
         assert_eq!(press(&mut picker, KeyCode::Enter), Effect::None);
+    }
+
+    #[test]
+    fn ctrl_w_deletes_a_word_after_wide_whitespace() {
+        let mut picker = Picker::new(items(), Some("p2"), &closed_sections());
+        press(&mut picker, KeyCode::Char('r'));
+        let ctrl = |c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL);
+        picker.key(ctrl('u'), NOW, &chrono::Utc);
+        for c in "foo\u{3000}bar".chars() {
+            press(&mut picker, KeyCode::Char(c));
+        }
+        picker.key(ctrl('w'), NOW, &chrono::Utc);
+        assert_eq!(
+            picker.rename_prompt().map(|p| p.text.as_str()),
+            Some("foo\u{3000}")
+        );
+
+        press(&mut picker, KeyCode::Esc);
+        press(&mut picker, KeyCode::Char('/'));
+        for c in "foo\u{3000}bar".chars() {
+            press(&mut picker, KeyCode::Char(c));
+        }
+        picker.key(ctrl('w'), NOW, &chrono::Utc);
+        assert_eq!(picker.filter(), "foo\u{3000}");
+    }
+
+    #[test]
+    fn a_rename_keeps_its_thread_when_herdr_learns_the_session() {
+        let mut picker = Picker::new(items(), Some("p2"), &closed_sections());
+        press(&mut picker, KeyCode::Char('r'));
+        let mut rekeyed = items();
+        rekeyed[1].key = "session:claude:id:abc".into();
+        picker.refresh(rekeyed, &closed_sections());
+        assert_eq!(
+            press(&mut picker, KeyCode::Enter),
+            Effect::Rename {
+                key: "session:claude:id:abc".into(),
+                title: Some("fix flaky test".into())
+            }
+        );
     }
 
     #[test]

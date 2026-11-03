@@ -293,13 +293,23 @@ fn enter_hint(picker: &Picker) -> Option<(&'static str, &'static str)> {
     }
 }
 
+/// The end of `text`, so what is being typed stays in view.
+fn tail(text: &str, width: usize) -> String {
+    let count = text.chars().count();
+    if count <= width {
+        return text.to_owned();
+    }
+    let kept: String = text.chars().skip(count - width + 1).collect();
+    format!("…{kept}")
+}
+
 /// The footer while a rename, forget or snooze prompt waits for an answer.
 fn prompt_line(picker: &Picker) -> Option<Line<'static>> {
     if let Some(prompt) = picker.rename_prompt() {
         return Some(Line::from(vec![
             Span::raw(" "),
             Span::from("rename").cyan().bold(),
-            Span::raw(format!(": {}", prompt.text)),
+            Span::raw(format!(": {}", tail(&prompt.text, 40))),
             Span::raw("  enter"),
             Span::from(" save").dim(),
             Span::raw("  esc"),
@@ -812,6 +822,21 @@ mod tests {
         picker.set_undoable(true);
         let (lines, _) = render(&mut picker, 160, 14);
         assert!(lines[13].contains("r rename  U undo"), "{}", lines[13]);
+    }
+
+    #[test]
+    fn a_long_rename_keeps_its_end_in_view() {
+        let mut picker = picker();
+        press(&mut picker, KeyCode::Char('r'));
+        for c in " and also the payment retries that keep timing out".chars() {
+            press(&mut picker, KeyCode::Char(c));
+        }
+        let (lines, _) = render(&mut picker, 80, 14);
+        assert!(
+            lines[13].contains("keep timing out") && lines[13].contains("esc cancel"),
+            "{}",
+            lines[13]
+        );
     }
 
     #[test]
