@@ -7,7 +7,7 @@ Settling or snoozing an agent whose session Herdr can resume (Claude, Pi, or Cod
 when you unsettle, wake or open it. Herdr's native Agents sidebar
 follows the same order and hides parked threads.
 
-![The triage picker: a pinned agent first, then agents by most recent change, with snoozed and settled agents dimmed at the bottom](docs/picker.png)
+![The triage picker: a pinned agent first, then the blocked, done, idle and unread threads that need you, with working, snoozed and settled agents in collapsed sections below](docs/picker.png)
 
 ## Install
 
@@ -78,7 +78,7 @@ snooze a thread, the cursor moves on to the next one that needs you: blocked fir
 unread. `z` swaps the footer for a snooze prompt; pick a time with its digit (`today 18:00` is
 offered until 30 minutes before):
 
-![The snooze prompt in the picker footer: 1 30m, 2 1h, 3 3h, 4 tomorrow 09:00, esc cancel](docs/snooze.png)
+![The snooze prompt in the picker footer: 1 1h, 2 3h, 3 today 18:00, 4 tomorrow 09:00, 5 next Mon 09:00, esc cancel](docs/snooze.png)
 
 ## Triage rules
 
