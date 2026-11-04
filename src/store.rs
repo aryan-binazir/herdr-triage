@@ -532,6 +532,10 @@ mod tests {
 
     #[test]
     fn migration_version_is_set_and_newer_versions_are_preserved() {
+        assert_eq!(
+            usize::try_from(SCHEMA_VERSION).unwrap(),
+            LATER_COLUMNS.len() + 1
+        );
         let dir = tempfile::tempdir().unwrap();
         let store = Store::at(dir.path().to_owned());
         store.transact(|_| ()).unwrap();
