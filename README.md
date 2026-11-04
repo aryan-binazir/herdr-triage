@@ -158,7 +158,7 @@ first agent event or the first time you open the picker.
 ```sh
 mise install    # pinned Rust and lefthook
 make check      # fmt, clippy, tests
-make bench      # release performance table + target/bench/latest.json (~2 min after build)
+make bench      # release performance table + target/bench/latest.json (under 2 min after build)
 ```
 
 Optional pre-push checks use the same gate:
