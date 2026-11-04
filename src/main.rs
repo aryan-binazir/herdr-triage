@@ -315,6 +315,7 @@ fn wake_at(until: Option<i64>) -> io::Result<()> {
 
 #[derive(Debug, Default, PartialEq, Eq)]
 struct Performed {
+    key: String,
     refusal: Option<String>,
     notice: Option<String>,
     reopened: bool,
@@ -322,10 +323,19 @@ struct Performed {
 
 fn perform(herdr: &mut Herdr, store: &Store, key: &str, action: Action) -> io::Result<Performed> {
     carry_out(herdr, store, |state, observed| {
+        let key = current_key(observed, key);
         let agent = observed.iter().find(|agent| agent.key == key);
         let after = state.apply(key, agent, action, now())?;
         Ok((key.to_owned(), after))
     })
+}
+
+/// Herdr rekeys a thread once it learns its session, possibly after the picker last looked.
+fn current_key<'a>(observed: &'a [Observed], key: &'a str) -> &'a str {
+    observed
+        .iter()
+        .find(|agent| agent.pre_session_key.as_deref() == Some(key))
+        .map_or(key, |agent| agent.key.as_str())
 }
 
 fn carry_out(
@@ -340,12 +350,16 @@ fn carry_out(
             performed.refusal = Some(refusal.0);
             Ok(())
         }
-        Ok((_, After::Nothing)) => Ok(()),
-        Ok((key, After::ClosePane)) => {
-            close_session(herdr, store, &snapshot, &key).map(|notice| performed.notice = notice)
-        }
-        Ok((_, After::Reopen(plan))) => {
-            reopen(herdr, store, &snapshot, &plan).map(|()| performed.reopened = true)
+        Ok((key, after)) => {
+            performed.key.clone_from(&key);
+            match after {
+                After::Nothing => Ok(()),
+                After::ClosePane => close_session(herdr, store, &snapshot, &key)
+                    .map(|notice| performed.notice = notice),
+                After::Reopen(plan) => {
+                    reopen(herdr, store, &snapshot, &plan).map(|()| performed.reopened = true)
+                }
+            }
         }
     };
     let served = serve_sync_requests(herdr, store);
@@ -373,7 +387,11 @@ fn close_session(
             "kept open: it is the last pane in its workspace".into(),
         ));
     }
-    herdr.close_pane(&agent.pane_id)?;
+    store.transact(|state| state.closing(key, true))?;
+    if let Err(error) = herdr.close_pane(&agent.pane_id) {
+        store.transact(|state| state.closing(key, false))?;
+        return Err(error);
+    }
     store.transact(|state| state.session_closed(key))?;
     Ok(None)
 }
@@ -471,11 +489,7 @@ fn run_picker() -> io::Result<()> {
             Effect::Focus(pane) => break Ok(Some(pane)),
             Effect::Rename { key, title } => {
                 refresh(&mut herdr, &store, &mut picker, |state, observed| {
-                    let current_key = observed
-                        .iter()
-                        .find(|agent| agent.pre_session_key.as_deref() == Some(key.as_str()))
-                        .map_or(key.as_str(), |agent| agent.key.as_str());
-                    state.rename(current_key, title, now());
+                    state.rename(current_key(observed, &key), title, now());
                 });
             }
             Effect::ToggleSection(section) => {
@@ -490,11 +504,16 @@ fn run_picker() -> io::Result<()> {
                 };
                 let from = picker.selected_row().unwrap_or(0);
                 let performed = perform(&mut herdr, &store, &key, action);
-                let done = matches!(&performed, Ok(p) if p.refusal.is_none());
+                let done = match &performed {
+                    Ok(p) if p.refusal.is_none() => Some(p.key.clone()),
+                    _ => None,
+                };
                 if show_unless_reopened(&mut herdr, &store, &mut picker, performed) {
                     break Ok(None);
                 }
-                if done && matches!(action, Action::ToggleSettle | Action::Snooze(_)) {
+                if let Some(key) = done
+                    && matches!(action, Action::ToggleSettle | Action::Snooze(_))
+                {
                     picker.move_on_from(&key, from);
                 }
                 refreshed = Instant::now();
@@ -699,7 +718,13 @@ mod tests {
             Action::ToggleSettle,
         )
         .unwrap();
-        assert_eq!(performed, Performed::default());
+        assert_eq!(
+            performed,
+            Performed {
+                key: "session:claude:id:id-w1:p1".into(),
+                ..Performed::default()
+            }
+        );
         assert_eq!(fake.take("pane.close"), [json!({"pane_id": "w1:p1"})]);
         let shown = store.transact(|state| state.ordered(&[])).unwrap();
         assert_eq!(
@@ -857,6 +882,23 @@ mod tests {
         assert_eq!(thread_label(&agent(None, "π - docs pass")), "docs pass");
         assert_eq!(thread_label(&agent(Some("  "), "Codex")), "Untitled thread");
         assert_eq!(thread_label(&agent(None, "pinning bug")), "pinning bug");
+    }
+
+    #[test]
+    fn an_action_on_a_thread_herdr_has_since_rekeyed_lands_on_it() {
+        let fake = FakeHerdr::start(vec![
+            resumable_agent("w1:p1", "idle", 3),
+            resumable_agent("w1:p2", "idle", 4),
+        ]);
+        let (mut herdr, store) = connected(&fake);
+        let performed =
+            perform(&mut herdr, &store, "terminal:t-w1:p1", Action::ToggleSettle).unwrap();
+        assert_eq!(performed.refusal, None);
+        assert_eq!(performed.key, "session:claude:id:id-w1:p1");
+        let parked = store
+            .transact(|state| state.records["session:claude:id:id-w1:p1"].park)
+            .unwrap();
+        assert_eq!(parked, Some(Park::Settled));
     }
 
     #[test]
