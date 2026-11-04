@@ -8,7 +8,7 @@ use std::collections::BTreeMap;
 use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{self, Receiver};
 use std::thread;
@@ -50,11 +50,20 @@ fn command(fake: &FakeHerdr, executable: &Path) -> Command {
     cmd.env_clear()
         .env("HERDR_SOCKET_PATH", &fake.socket)
         .env("HERDR_PLUGIN_ID", "ar.triage")
-        .env("HERDR_PLUGIN_STATE_DIR", fake.state_dir())
+        .env("HERDR_PLUGIN_STATE_DIR", state_dir(fake))
         .env("HERDR_PLUGIN_CONFIG_DIR", fake.dir.path().join("config"))
         .env("TERM", "xterm-256color")
         .env("TZ", "UTC");
     cmd
+}
+
+/// SQLite's commit cost is an fsync, which is free on the tmpfs `/tmp` common on Linux; keep the
+/// store on the real disk beside `target/` so the numbers include it. The socket stays in `/tmp`
+/// because Unix socket paths are length-limited.
+fn state_dir(fake: &FakeHerdr) -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("target/bench/state")
+        .join(fake.dir.path().file_name().unwrap_or_default())
 }
 
 fn run(fake: &FakeHerdr, arg: &str) -> Result<()> {
@@ -382,11 +391,11 @@ fn fixture(live: usize, closed: usize) -> Result<FakeHerdr> {
 fn bench_size(live: usize, closed: usize) -> Result<Value> {
     let fake = fixture(live, closed)?;
     let snapshot = fake.dir.path().join("snapshot");
-    copy_tree(&fake.state_dir(), &snapshot)?;
+    copy_tree(&state_dir(&fake), &snapshot)?;
     let agents = fake.agents.lock().map_err(|_| "poisoned agents")?.clone();
     let restore = || -> Result<()> {
-        fs::remove_dir_all(fake.state_dir())?;
-        copy_tree(&snapshot, &fake.state_dir())?;
+        fs::remove_dir_all(state_dir(&fake))?;
+        copy_tree(&snapshot, &state_dir(&fake))?;
         fake.agents
             .lock()
             .map_err(|_| "poisoned agents")?
@@ -474,6 +483,7 @@ fn main() -> Result<()> {
         return Ok(());
     }
     let started = Instant::now();
+    let _ = fs::remove_dir_all(Path::new(env!("CARGO_MANIFEST_DIR")).join("target/bench/state"));
     let mut result = json!({"schema_version":1,"binary_bytes":fs::metadata(BINARY)?.len(),
         "os":std::env::consts::OS,"arch":std::env::consts::ARCH,"warmup":WARMUP,
         "fixture_statuses":["done","blocked","working","idle"],"pty_columns":120,"pty_rows":40,"sampling":"round-robin, restored per sample",
