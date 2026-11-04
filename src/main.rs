@@ -393,19 +393,19 @@ fn close_session(
             "kept open: it is the last pane in its workspace".into(),
         ));
     }
-    let still_parked = store.transact(|state| {
-        let still_parked = state.records.get(key).is_some_and(|record| {
+    let still_closable = store.transact(|state| {
+        let still_closable = state.records.get(key).is_some_and(|record| {
             record.live
                 && record.missing_since.is_none()
                 && record.park.is_some()
                 && record.last_seq == agent.state_change_seq
         });
-        if still_parked {
+        if still_closable {
             state.closing(key, true);
         }
-        still_parked
+        still_closable
     })?;
-    if !still_parked {
+    if !still_closable {
         return Ok(None);
     }
     if let Err(error) = herdr.close_pane(&agent.pane_id) {
@@ -800,7 +800,7 @@ mod tests {
     }
 
     #[test]
-    fn r2_hook_activity_between_settle_and_close_must_not_kill_working_agent() {
+    fn hook_activity_between_settle_and_close_keeps_the_working_pane_open() {
         let fake = FakeHerdr::start(vec![resumable_agent("w1:p1", "idle", 3)]);
         let (mut herdr, store) = connected(&fake);
         let key = "session:claude:id:id-w1:p1";
