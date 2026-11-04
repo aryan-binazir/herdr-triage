@@ -263,3 +263,46 @@ fn open_launches_the_picker_popup_aimed_at_the_invoking_pane() {
     assert_eq!(opened[0]["focus"], true);
     assert_eq!(opened[0]["env"]["HERDR_TRIAGE_FOCUS"], "w1:p7");
 }
+
+#[test]
+fn sync_and_next_do_not_depend_on_tabs() {
+    let herdr = FakeHerdr::start(vec![agent("w1:p1", "blocked", 3)]);
+    *herdr.fail_method.lock().unwrap() = Some("tab.list".into());
+    herdr.run(&["sync"]);
+    let requests = std::mem::take(&mut *herdr.requests.lock().unwrap());
+    let methods: Vec<_> = requests
+        .iter()
+        .map(|r| r["method"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        methods,
+        [
+            "agent.list",
+            "workspace.list",
+            "pane.report_metadata",
+            "agent.view.set"
+        ]
+    );
+    assert_eq!(
+        requests[2]["params"]["tokens"],
+        json!({"triage_rank": "1", "triage": null})
+    );
+    let view = requests[3]["params"].clone();
+    herdr.run(&["next"]);
+    let requests = std::mem::take(&mut *herdr.requests.lock().unwrap());
+    let methods: Vec<_> = requests
+        .iter()
+        .map(|r| r["method"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        methods,
+        [
+            "agent.list",
+            "workspace.list",
+            "agent.view.set",
+            "agent.focus"
+        ]
+    );
+    assert_eq!(requests[2]["params"], view);
+    assert_eq!(requests[3]["params"], json!({"target": "w1:p1"}));
+}
