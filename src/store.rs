@@ -102,6 +102,29 @@ impl Store {
         self.sync_request().exists()
     }
 
+    pub fn wake_lock_path(&self, until: i64) -> io::Result<PathBuf> {
+        fs::create_dir_all(&self.dir)?;
+        Ok(self.dir.join(format!("wake-{until}.lock")))
+    }
+
+    pub fn prune_wake_locks(&self, now: i64) {
+        let Ok(entries) = fs::read_dir(&self.dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let expired = name
+                .to_str()
+                .and_then(|name| name.strip_prefix("wake-"))
+                .and_then(|name| name.strip_suffix(".lock"))
+                .and_then(|deadline| deadline.parse::<i64>().ok())
+                .is_some_and(|deadline| deadline < now);
+            if expired {
+                let _ = fs::remove_file(entry.path());
+            }
+        }
+    }
+
     fn sync_request(&self) -> PathBuf {
         self.dir.join("sync.requested")
     }

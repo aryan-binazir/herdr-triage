@@ -251,7 +251,12 @@ fn pin_icon() -> String {
 fn startup() -> io::Result<()> {
     let mut herdr = connect()?;
     let store = store_for(&herdr);
-    for until in store.transact(|state| state.pending_wakes())? {
+    store.prune_wake_locks(now());
+    let deadlines: BTreeSet<_> = store
+        .transact(|state| state.pending_wakes())?
+        .into_iter()
+        .collect();
+    for until in deadlines {
         spawn_waker(until)?;
     }
     hook_sync(&mut herdr)
@@ -312,11 +317,38 @@ fn spawn_waker(until: i64) -> io::Result<()> {
 
 fn wake_at(until: Option<i64>) -> io::Result<()> {
     let until = until.ok_or_else(|| io::Error::other("wake-at needs a unix time"))?;
+    let socket = std::env::var_os("HERDR_SOCKET_PATH").map_or_else(
+        || {
+            let config = std::env::var_os("XDG_CONFIG_HOME")
+                .map(std::path::PathBuf::from)
+                .or_else(|| {
+                    std::env::var_os("HOME")
+                        .map(|home| std::path::PathBuf::from(home).join(".config"))
+                })
+                .unwrap_or_default();
+            config.join("herdr/herdr.sock")
+        },
+        std::path::PathBuf::from,
+    );
+    let path = Store::for_socket(&socket).wake_lock_path(until)?;
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&path)?;
+    match lock.try_lock() {
+        Ok(()) => (),
+        Err(std::fs::TryLockError::WouldBlock) => return Ok(()),
+        Err(std::fs::TryLockError::Error(error)) => return Err(error),
+    }
     while now() <= until {
         let left = u64::try_from(until - now() + 1).unwrap_or(1);
         std::thread::sleep(Duration::from_secs(left.min(WALL_CLOCK_RECHECK_SECS)));
     }
-    hook_sync(&mut connect()?)
+    let _ = std::fs::remove_file(path);
+    let result = hook_sync(&mut connect()?);
+    drop(lock);
+    result
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
