@@ -412,8 +412,9 @@ fn close_session(
             "kept open: it is the last pane in its workspace".into(),
         ));
     }
-    // Ask Herdr about the pane itself, under the lock: sibling panes on one session share a record,
-    // and the agent may have started working since the action without any hook syncing yet.
+    // Ask Herdr about the pane itself, under the lock: the agent may have started working since the
+    // action without any hook syncing yet. Sibling panes on one session share a record whose
+    // counters and restore state flip between them, so such a pane is never closed.
     let still_closable = store.transact(|state| -> io::Result<bool> {
         let Some(record) = state.records.get(key).filter(|record| {
             record.live
@@ -424,14 +425,19 @@ fn close_session(
             return Ok(false);
         };
         let restoring = record.restoring(now());
-        let quiet_since_action = herdr.agents()?.iter().any(|current| {
-            current.terminal_id == agent.terminal_id
-                && !matches!(
-                    current.agent_status,
-                    triage::Status::Working | triage::Status::Blocked
-                )
-                && (current.state_change_seq == agent.state_change_seq || restoring)
-        });
+        let current = herdr.agents()?;
+        let mut panes = current.iter().filter(|current| current.key() == key);
+        let quiet_since_action = match (panes.next(), panes.next()) {
+            (Some(pane), None) => {
+                pane.terminal_id == agent.terminal_id
+                    && !matches!(
+                        pane.agent_status,
+                        triage::Status::Working | triage::Status::Blocked
+                    )
+                    && (pane.state_change_seq == agent.state_change_seq || restoring)
+            }
+            _ => false,
+        };
         if quiet_since_action {
             state.closing(key, true);
         }
@@ -902,24 +908,29 @@ mod tests {
     }
 
     #[test]
-    fn a_second_pane_on_the_same_session_does_not_block_the_close() {
-        let a = resumable_agent("w1:p1", "idle", 3);
-        let mut b = resumable_agent("w1:p2", "idle", 4);
-        b["agent_session"] = a["agent_session"].clone();
-        let fake = FakeHerdr::start(vec![a, b]);
-        let (mut herdr, store) = connected(&fake);
-        perform(
-            &mut herdr,
-            &store,
-            "session:claude:id:id-w1:p1",
-            Action::ToggleSettle,
-        )
-        .unwrap();
-        assert_eq!(fake.take("pane.close"), [json!({"pane_id": "w1:p1"})]);
+    fn panes_sharing_a_session_stay_open_when_parked() {
+        for sibling in ["idle", "working"] {
+            let a = resumable_agent("w1:p1", "idle", 3);
+            let mut b = resumable_agent("w1:p2", sibling, 4);
+            b["agent_session"] = a["agent_session"].clone();
+            let fake = FakeHerdr::start(vec![a, b]);
+            let (mut herdr, store) = connected(&fake);
+            perform(
+                &mut herdr,
+                &store,
+                "session:claude:id:id-w1:p1",
+                Action::ToggleSettle,
+            )
+            .unwrap();
+            assert!(
+                fake.take("pane.close").is_empty(),
+                "closed beside a {sibling} sibling"
+            );
+        }
     }
 
-    /// Panes A and B share one session. A is parked, then starts `status` before the close, and a
-    /// hook syncs B after A, so the shared record reads idle.
+    /// Panes A and B share one session. A is parked, then turns `status` with new activity before
+    /// the close, and a hook syncs B after A, so the shared record reads idle and maybe restoring.
     fn close_after_a_sibling_hides_the_target_turning(action: Action, status: &str, restart: bool) {
         let a = resumable_agent("w1:p1", "idle", 3);
         let mut b = resumable_agent("w1:p2", "idle", 4);
@@ -962,21 +973,9 @@ mod tests {
     }
 
     #[test]
-    fn an_idle_pane_closes_even_while_a_sibling_on_its_session_works() {
-        let a = resumable_agent("w1:p1", "idle", 3);
-        let mut b = resumable_agent("w1:p2", "working", 4);
-        b["agent_session"] = a["agent_session"].clone();
-        let fake = FakeHerdr::start(vec![a, b]);
-        let (mut herdr, store) = connected(&fake);
-        let performed = perform(
-            &mut herdr,
-            &store,
-            "session:claude:id:id-w1:p1",
-            Action::ToggleSettle,
-        )
-        .unwrap();
-        assert_eq!(performed.refusal, None);
-        assert_eq!(fake.take("pane.close"), [json!({"pane_id": "w1:p1"})]);
+    fn a_pane_that_finished_new_work_beside_a_sibling_stays_open() {
+        close_after_a_sibling_hides_the_target_turning(Action::ToggleSettle, "done", true);
+        close_after_a_sibling_hides_the_target_turning(Action::Snooze(now() + 3600), "done", true);
     }
 
     #[test]
