@@ -98,7 +98,10 @@ impl FakeHerdr {
                 } else {
                     json!({"id": request["id"], "result": result})
                 };
-                writeln!(writer, "{reply}").unwrap();
+                // Herdr serializes the reply to a string and writes it whole (src/api/server.rs);
+                // formatting straight into the socket would send it in thousands of fragments.
+                writer.write_all(reply.to_string().as_bytes()).unwrap();
+                writer.write_all(b"\n").unwrap();
             }
         });
         fake
