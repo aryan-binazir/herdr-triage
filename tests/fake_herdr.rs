@@ -288,6 +288,7 @@ fn sync_and_next_do_not_depend_on_tabs() {
         json!({"triage_rank": "1", "triage": null})
     );
     let view = requests[3]["params"].clone();
+    assert_eq!(view["label"], "triage");
     herdr.run(&["next"]);
     let requests = std::mem::take(&mut *herdr.requests.lock().unwrap());
     let methods: Vec<_> = requests

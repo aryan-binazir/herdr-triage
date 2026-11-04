@@ -711,13 +711,12 @@ mod tests {
     }
 
     #[test]
-    fn picker_snapshots_fetch_tabs_and_items_search_custom_labels() {
+    fn picker_refresh_fetches_tabs_and_items_search_custom_labels() {
         use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
         let fake = FakeHerdr::start(vec![fake_herdr::agent("w1:p1", "idle", 3)]);
         let (mut herdr, store) = connected(&fake);
-        let (mut snapshot, ()) = sync(&mut herdr, &store, true, |_, _| ()).unwrap();
-        assert_eq!(fake.take("tab.list").len(), 1);
+        let (mut snapshot, ()) = sync(&mut herdr, &store, false, |_, _| ()).unwrap();
         snapshot.tabs = vec![Tab {
             tab_id: "w1:t1".into(),
             label: "Release \"候補\"".into(),
@@ -736,7 +735,6 @@ mod tests {
         assert_eq!(picker.matched(), 1);
         refresh(&mut herdr, &store, &mut picker, |_, _| ());
         assert_eq!(fake.take("tab.list").len(), 1);
-        fake.requests.lock().unwrap().clear();
         perform(&mut herdr, &store, "terminal:t-w1:p1", Action::TogglePin).unwrap();
         assert!(fake.take("tab.list").is_empty());
     }
