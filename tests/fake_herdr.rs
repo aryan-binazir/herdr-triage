@@ -306,4 +306,30 @@ fn sync_and_next_do_not_depend_on_tabs() {
     );
     assert_eq!(requests[2]["params"], view);
     assert_eq!(requests[3]["params"], json!({"target": "w1:p1"}));
+
+#[test]
+fn unchanged_sync_leaves_the_database_unwritten() {
+    let herdr = FakeHerdr::start(vec![agent("w1:p1", "idle", 3)]);
+    herdr.run(&["sync"]);
+    let server_dir = std::fs::read_dir(herdr.state_dir())
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let observer = rusqlite::Connection::open(server_dir.join("triage.sqlite3")).unwrap();
+    observer
+        .execute("UPDATE threads SET touched_at = touched_at - 1", [])
+        .unwrap();
+    let version = || {
+        observer
+            .query_row("PRAGMA data_version", [], |r| r.get::<_, i64>(0))
+            .unwrap()
+    };
+    let before = version();
+    herdr.run(&["sync"]);
+    assert_eq!(version(), before);
+    herdr.agents.lock().unwrap()[0]["state_change_seq"] = json!(4);
+    herdr.run(&["sync"]);
+    assert_ne!(version(), before);
 }
