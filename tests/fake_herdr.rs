@@ -306,6 +306,7 @@ fn sync_and_next_do_not_depend_on_tabs() {
     );
     assert_eq!(requests[2]["params"], view);
     assert_eq!(requests[3]["params"], json!({"target": "w1:p1"}));
+}
 
 #[test]
 fn unchanged_sync_leaves_the_database_unwritten() {
