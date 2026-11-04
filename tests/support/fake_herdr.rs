@@ -104,6 +104,35 @@ impl FakeHerdr {
         fake
     }
 
+    pub fn sized(count: usize, workspaces: usize) -> Self {
+        assert!(workspaces > 0);
+        let agents = (0..count).map(|i| {
+            let workspace = format!("w{}", i % workspaces + 1);
+            let pane = format!("{workspace}:p{i}");
+            let mut row = agent(&pane, ["done", "blocked", "working", "idle"][i % 4], 1);
+            row["workspace_id"] = json!(workspace);
+            row["tab_id"] = json!(format!("{workspace}:t{i}"));
+            row["agent_session"] = json!({"source":"herdr:claude", "agent":"claude", "kind":"id", "value":format!("bench-{i}")});
+            row
+        }).collect();
+        let fake = Self::start(agents);
+        *fake.workspaces.lock().unwrap() = (0..workspaces).map(|i| json!({
+            "workspace_id":format!("w{}", i+1), "label":format!("bench-{}", i+1),
+            "number":i+1, "tab_count":count.div_ceil(workspaces), "pane_count":count.div_ceil(workspaces)
+        })).collect();
+        fake
+    }
+
+    pub fn counts(&self) -> std::collections::BTreeMap<String, usize> {
+        let mut counts = std::collections::BTreeMap::new();
+        for request in self.requests.lock().unwrap().iter() {
+            *counts
+                .entry(request["method"].as_str().unwrap().to_owned())
+                .or_default() += 1;
+        }
+        counts
+    }
+
     pub fn state_dir(&self) -> PathBuf {
         self.dir.path().join("state")
     }
@@ -142,4 +171,38 @@ pub fn agent(pane: &str, status: &str, seq: u64) -> Value {
         "agent": "claude", "agent_status": status, "state_change_seq": seq,
         "focused": false, "revision": 1, "cwd": "/tmp"
     })
+}
+
+#[cfg(test)]
+mod bench_contracts {
+
+    #[test]
+    fn sized_fixture_spreads_resumable_agents_across_workspaces() {
+        let fake = super::FakeHerdr::sized(12, 3);
+        let agents = fake.agents.lock().unwrap();
+        assert_eq!(agents.len(), 12);
+        assert_eq!(fake.workspaces.lock().unwrap().len(), 3);
+        assert_eq!(
+            agents.iter().filter(|a| a["workspace_id"] == "w2").count(),
+            4
+        );
+        assert_eq!(agents[0]["agent_session"]["source"], "herdr:claude");
+    }
+
+    #[test]
+    fn request_counts_report_each_method_exactly() {
+        let fake = super::FakeHerdr::start(vec![]);
+        *fake.requests.lock().unwrap() = vec![
+            serde_json::json!({"method":"agent.list"}),
+            serde_json::json!({"method":"agent.list"}),
+            serde_json::json!({"method":"tab.list"}),
+        ];
+        assert_eq!(
+            fake.counts(),
+            std::collections::BTreeMap::from([
+                ("agent.list".to_owned(), 2),
+                ("tab.list".to_owned(), 1)
+            ])
+        );
+    }
 }
