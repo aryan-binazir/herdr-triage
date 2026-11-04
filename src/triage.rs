@@ -4,6 +4,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use chrono::{Datelike, TimeZone};
 use serde::{Deserialize, Serialize};
 
+const LIVE_TOUCH_INTERVAL_SECS: i64 = 60;
 const CLOSED_RETENTION_SECS: i64 = 30 * 86_400;
 const EXIT_GRACE_SECS: i64 = 10;
 const REOPEN_PENDING_SECS: i64 = 60;
@@ -529,7 +530,9 @@ impl State {
             if agent.focused && record.unread == Some(Unread::Woke) {
                 record.unread = None;
             }
-            record.touch(now);
+            if now.saturating_sub(record.touched_at) >= LIVE_TOUCH_INTERVAL_SECS {
+                record.touch(now);
+            }
         }
         let present: BTreeSet<&str> = agents.iter().map(|agent| agent.key.as_str()).collect();
         for (key, record) in &mut self.records {
@@ -965,6 +968,19 @@ mod tests {
             .iter()
             .map(|row| row.key.clone())
             .collect()
+    }
+
+    #[test]
+    fn live_retention_timestamp_refreshes_only_every_minute() {
+        let mut state = State::default();
+        let agents = [agent("k", Status::Idle, 1)];
+        state.reconcile("g", &agents, 1_000);
+        state.reconcile("g", &agents, 1_059);
+        assert_eq!(state.records["k"].touched_at, 1_000);
+        state.reconcile("g", &agents, 1_060);
+        assert_eq!(state.records["k"].touched_at, 1_060);
+        state.rename("k", Some("title".into()), 1_061);
+        assert_eq!(state.records["k"].touched_at, 1_061);
     }
 
     #[test]
