@@ -1,4 +1,4 @@
-.PHONY: check fmt lint test
+.PHONY: check fmt lint test bench
 
 check: fmt lint test
 
@@ -10,3 +10,6 @@ lint:
 
 test:
 	cargo test --all-targets --locked
+
+bench:
+	cargo bench --bench perf --locked
