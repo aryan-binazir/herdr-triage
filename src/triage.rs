@@ -152,6 +152,12 @@ impl Record {
         self.touched_at = self.touched_at.max(now);
     }
 
+    /// Herdr relaunches restored agents after a restart; their churn then is not new activity.
+    pub fn restoring(&self, now: i64) -> bool {
+        self.restored_at
+            .is_some_and(|at| now - at < RESTORE_SETTLE_SECS)
+    }
+
     fn resumable(&self) -> bool {
         self.thread.resume_argv().is_some()
     }
@@ -498,9 +504,7 @@ impl State {
             if existed && record.ended {
                 record.park = None;
             }
-            let restoring = record
-                .restored_at
-                .is_some_and(|at| now - at < RESTORE_SETTLE_SECS);
+            let restoring = record.restoring(now);
             if record.generation != generation || agent.seq < record.last_seq {
                 generation.clone_into(&mut record.generation);
                 record.ack_seq = None;
@@ -559,10 +563,11 @@ impl State {
                 record.unread = Some(Unread::Woke);
             }
         }
+        // Live threads are touched at most once a minute, so allow that minute: never forget early.
+        let retention = CLOSED_RETENTION_SECS + LIVE_TOUCH_INTERVAL_SECS;
         self.records.retain(|_, record| {
             record.live
-                || (record.resumable()
-                    && (record.pinned || now - record.touched_at <= CLOSED_RETENTION_SECS))
+                || (record.resumable() && (record.pinned || now - record.touched_at <= retention))
         });
         self.drop_orphaned_undo();
         exit_checks
@@ -1142,8 +1147,24 @@ mod tests {
         state.reconcile(GEN, &[], NOW + 20);
         state.reconcile(GEN, &[], NOW + 30 * 86_400 - 1);
         assert_eq!(state.records.len(), 2);
-        state.reconcile(GEN, &[], NOW + 30 * 86_400 + 21);
+        state.reconcile(GEN, &[], NOW + 30 * 86_400 + 61);
         assert_eq!(state.records.keys().collect::<Vec<_>>(), ["b"]);
+    }
+
+    #[test]
+    fn retention_counts_from_the_last_live_observation_at_least() {
+        let a = resumable("a", Status::Idle, 1);
+        let mut state = State::default();
+        state.reconcile(GEN, std::slice::from_ref(&a), NOW);
+        state.reconcile(GEN, std::slice::from_ref(&a), NOW + 59);
+        state.reconcile(GEN, &[], NOW + 60);
+        state.reconcile(GEN, &[], NOW + 70);
+        assert!(!state.records["a"].live);
+        state.reconcile(GEN, &[], NOW + 59 + 30 * 86_400);
+        assert!(
+            state.records.contains_key("a"),
+            "30 days have not passed since it was last seen"
+        );
     }
 
     #[test]
