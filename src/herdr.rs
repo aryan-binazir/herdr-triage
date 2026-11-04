@@ -128,7 +128,9 @@ impl Herdr {
         let mut stream = UnixStream::connect(&self.path)?;
         stream.set_read_timeout(Some(TIMEOUT))?;
         stream.set_write_timeout(Some(TIMEOUT))?;
-        writeln!(stream, "{request}")?;
+        let mut bytes = serde_json::to_vec(&request).map_err(io::Error::other)?;
+        bytes.push(b'\n');
+        stream.write_all(&bytes)?;
         let mut reader = BufReader::new(stream);
         let mut line = String::new();
         loop {

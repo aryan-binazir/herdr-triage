@@ -75,12 +75,13 @@ fn now() -> i64 {
 fn sync<R>(
     herdr: &mut Herdr,
     store: &Store,
+    fetch_tabs: bool,
     edit: impl FnOnce(&mut State, &[Observed]) -> R,
 ) -> io::Result<(Snapshot, R)> {
     let synced = store
         .transact(|state| {
             store.take_sync_request();
-            sync_locked(herdr, state, edit)
+            sync_locked(herdr, state, fetch_tabs, edit)
         })
         .and_then(|synced| synced);
     let served = serve_sync_requests(herdr, store);
@@ -95,7 +96,7 @@ fn serve_sync_requests(herdr: &mut Herdr, store: &Store) -> io::Result<()> {
     while store.sync_requested() {
         let synced = store.try_transact(|state| {
             store.take_sync_request();
-            sync_locked(herdr, state, |_, _| ())
+            sync_locked(herdr, state, false, |_, _| ())
         })?;
         match synced {
             None => break,
@@ -109,6 +110,7 @@ fn serve_sync_requests(herdr: &mut Herdr, store: &Store) -> io::Result<()> {
 fn sync_locked<R>(
     herdr: &mut Herdr,
     state: &mut State,
+    fetch_tabs: bool,
     edit: impl FnOnce(&mut State, &[Observed]) -> R,
 ) -> io::Result<(Snapshot, R)> {
     let HerdrView {
@@ -116,7 +118,7 @@ fn sync_locked<R>(
         agents,
         workspaces,
         tabs,
-    } = read_herdr(herdr)?;
+    } = read_herdr(herdr, fetch_tabs)?;
     let observed: Vec<Observed> = agents.iter().map(|a| observe(a, &workspaces)).collect();
     let now = now();
     for at in state.reconcile(&generation, &observed, now) {
@@ -147,13 +149,17 @@ struct HerdrView {
     tabs: Vec<Tab>,
 }
 
-fn read_herdr(herdr: &mut Herdr) -> io::Result<HerdrView> {
+fn read_herdr(herdr: &mut Herdr, fetch_tabs: bool) -> io::Result<HerdrView> {
     for _ in 0..2 {
         let generation = herdr.server_generation();
         let view = HerdrView {
             agents: herdr.agents()?,
             workspaces: herdr.workspaces()?,
-            tabs: herdr.tabs()?,
+            tabs: if fetch_tabs {
+                herdr.tabs()?
+            } else {
+                Vec::new()
+            },
             generation: String::new(),
         };
         if herdr.server_generation() == generation {
@@ -254,7 +260,7 @@ fn startup() -> io::Result<()> {
 fn next() -> io::Result<()> {
     let mut herdr = connect()?;
     let store = store_for(&herdr);
-    let (snapshot, ()) = sync(&mut herdr, &store, |_, _| ())?;
+    let (snapshot, ()) = sync(&mut herdr, &store, false, |_, _| ())?;
     let invoked_from = invocation_context()["focused_pane_id"]
         .as_str()
         .map(str::to_owned);
@@ -343,7 +349,7 @@ fn carry_out(
     store: &Store,
     edit: impl FnOnce(&mut State, &[Observed]) -> Result<(String, After), Refusal>,
 ) -> io::Result<Performed> {
-    let (snapshot, after) = sync(herdr, store, edit)?;
+    let (snapshot, after) = sync(herdr, store, false, edit)?;
     let mut performed = Performed::default();
     let outcome = match after {
         Err(refusal) => {
@@ -455,7 +461,7 @@ fn run_picker() -> io::Result<()> {
     let store = store_for(&herdr);
     let focus = std::env::var("HERDR_TRIAGE_FOCUS").ok();
     let pin_icon = pin_icon();
-    let (snapshot, ()) = sync(&mut herdr, &store, |_, _| ())?;
+    let (snapshot, ()) = sync(&mut herdr, &store, true, |_, _| ())?;
     let mut picker = Picker::new(items(&snapshot), focus.as_deref(), &snapshot.open_sections);
     picker.set_undoable(snapshot.undoable);
 
@@ -583,7 +589,7 @@ fn refresh(
     picker: &mut Picker,
     edit: impl FnOnce(&mut State, &[Observed]),
 ) {
-    match sync(herdr, store, edit) {
+    match sync(herdr, store, true, edit) {
         Ok((snapshot, ())) => {
             picker.refresh(items(&snapshot), &snapshot.open_sections);
             picker.set_undoable(snapshot.undoable);
@@ -702,6 +708,35 @@ mod tests {
             Herdr::at(&fake.socket).unwrap(),
             Store::at(fake.state_dir()),
         )
+    }
+
+    #[test]
+    fn picker_refresh_fetches_tabs_and_items_search_custom_labels() {
+        use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let fake = FakeHerdr::start(vec![fake_herdr::agent("w1:p1", "idle", 3)]);
+        let (mut herdr, store) = connected(&fake);
+        let (mut snapshot, ()) = sync(&mut herdr, &store, false, |_, _| ()).unwrap();
+        snapshot.tabs = vec![Tab {
+            tab_id: "w1:t1".into(),
+            label: "Release \"候補\"".into(),
+            number: 1,
+        }];
+        let shown = items(&snapshot);
+        assert_eq!(shown[0].location, "acme-api · Release \"候補\"");
+        let mut picker = Picker::new(shown, None, &snapshot.open_sections);
+        for ch in "/候補".chars() {
+            picker.key(
+                KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE),
+                now(),
+                &Local,
+            );
+        }
+        assert_eq!(picker.matched(), 1);
+        refresh(&mut herdr, &store, &mut picker, |_, _| ());
+        assert_eq!(fake.take("tab.list").len(), 1);
+        perform(&mut herdr, &store, "terminal:t-w1:p1", Action::TogglePin).unwrap();
+        assert!(fake.take("tab.list").is_empty());
     }
 
     #[test]
@@ -910,7 +945,7 @@ mod tests {
         let keys = store
             .transact(|state| state.records.keys().cloned().collect::<Vec<_>>())
             .and_then(|_| {
-                sync(&mut herdr, &store, |state, _| {
+                sync(&mut herdr, &store, false, |state, _| {
                     state.records.keys().cloned().collect::<Vec<_>>()
                 })
             })
@@ -1001,10 +1036,10 @@ mod tests {
     fn a_sync_requested_while_another_command_held_the_store_still_happens() {
         let fake = FakeHerdr::start(vec![resumable_agent("w1:p1", "idle", 3)]);
         let (mut herdr, store) = connected(&fake);
-        sync(&mut herdr, &store, |_, _| ()).unwrap();
+        sync(&mut herdr, &store, false, |_, _| ()).unwrap();
         fake.take("agent.list");
         store.request_sync().unwrap();
-        sync(&mut herdr, &store, |_, _| ()).unwrap();
+        sync(&mut herdr, &store, false, |_, _| ()).unwrap();
         assert!(!store.sync_requested(), "the request was served");
         assert_eq!(
             fake.take("agent.list").len(),
@@ -1041,7 +1076,7 @@ mod tests {
         let (mut herdr, store) = connected(&fake);
         *fake.fail_method.lock().unwrap() = Some("pane.report_metadata".into());
         store.request_sync().unwrap();
-        assert!(sync(&mut herdr, &store, |_, _| ()).is_err());
+        assert!(sync(&mut herdr, &store, false, |_, _| ()).is_err());
         assert!(
             !store.sync_requested(),
             "the waiting hook's request was served"
