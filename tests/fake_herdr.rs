@@ -30,13 +30,17 @@ impl RunBinary for FakeHerdr {
     }
 }
 
-fn park(herdr: &FakeHerdr, key: &str, park: &str, until: Option<i64>) {
-    let server_dir = std::fs::read_dir(herdr.state_dir())
+fn server_dir(herdr: &FakeHerdr) -> std::path::PathBuf {
+    std::fs::read_dir(herdr.state_dir())
         .unwrap()
         .next()
         .unwrap()
         .unwrap()
-        .path();
+        .path()
+}
+
+fn park(herdr: &FakeHerdr, key: &str, park: &str, until: Option<i64>) {
+    let server_dir = server_dir(herdr);
     let db = rusqlite::Connection::open(server_dir.join("triage.sqlite3")).unwrap();
     let changed = db
         .execute(
@@ -338,6 +342,9 @@ fn unchanged_sync_leaves_the_database_unwritten() {
 #[test]
 fn wakers_share_each_deadline_and_remove_expired_locks() {
     let herdr = FakeHerdr::start(vec![]);
+    herdr.run(&["sync"]);
+    herdr.take("agent.list");
+    let server = server_dir(&herdr);
     let now = i64::try_from(
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -357,33 +364,21 @@ fn wakers_share_each_deadline_and_remove_expired_locks() {
         })
         .collect();
     let started = std::time::Instant::now();
-    let sleepers = loop {
+    let (sleepers, locks) = loop {
         let sleepers = wakers
             .iter_mut()
             .filter_map(|waker| waker.try_wait().unwrap().is_none().then_some(()))
             .count();
-        if sleepers == 2 || started.elapsed() > std::time::Duration::from_millis(2500) {
-            break sleepers;
+        let locks = [now + 4, now + 6]
+            .into_iter()
+            .filter(|until| server.join(format!("wake-{until}.lock")).exists())
+            .count();
+        if (sleepers, locks) == (2, 2) || started.elapsed() > std::time::Duration::from_millis(2500)
+        {
+            break (sleepers, locks);
         }
         std::thread::sleep(std::time::Duration::from_millis(10));
     };
-    let server = std::fs::read_dir(herdr.state_dir())
-        .unwrap()
-        .next()
-        .unwrap()
-        .unwrap()
-        .path();
-    let locks = std::fs::read_dir(&server)
-        .unwrap()
-        .filter(|entry| {
-            entry
-                .as_ref()
-                .unwrap()
-                .file_name()
-                .to_string_lossy()
-                .starts_with("wake-")
-        })
-        .count();
     for waker in &mut wakers {
         assert!(waker.wait().unwrap().success());
     }
@@ -397,22 +392,18 @@ fn wakers_share_each_deadline_and_remove_expired_locks() {
                     .unwrap()
                     .file_name()
                     .to_string_lossy()
-                    .starts_with("wake-")
+                    .starts_with("wake-"),
+                "expired wake lock remains"
             );
         }
     }
 }
 
 #[test]
-fn startup_prunes_only_expired_waker_files() {
+fn startup_prunes_only_expired_wake_locks() {
     let herdr = FakeHerdr::start(vec![]);
     herdr.run(&["sync"]);
-    let server = std::fs::read_dir(herdr.state_dir())
-        .unwrap()
-        .next()
-        .unwrap()
-        .unwrap()
-        .path();
+    let server = server_dir(&herdr);
     let past = server.join("wake-0.lock");
     let future = server.join("wake-4102444800.lock");
     let unrelated = server.join("wake-unknown.lock");
@@ -423,4 +414,42 @@ fn startup_prunes_only_expired_waker_files() {
     assert!(!past.exists());
     assert!(future.exists());
     assert!(unrelated.exists());
+}
+
+#[test]
+fn an_overdue_waker_started_during_sync_requests_another_sync() {
+    let herdr = FakeHerdr::start(vec![]);
+    herdr.run(&["sync"]);
+    herdr.take("agent.list");
+    let state_lock = std::fs::OpenOptions::new()
+        .write(true)
+        .open(server_dir(&herdr).join("state.lock"))
+        .unwrap();
+    *herdr.list_delay.lock().unwrap() = std::time::Duration::from_secs(2);
+    let spawn = || {
+        Command::new(env!("CARGO_BIN_EXE_herdr-triage"))
+            .args(["wake-at", "0"])
+            .env("HERDR_SOCKET_PATH", &herdr.socket)
+            .env("HERDR_PLUGIN_STATE_DIR", herdr.state_dir())
+            .spawn()
+            .unwrap()
+    };
+    let mut first = spawn();
+    let started = std::time::Instant::now();
+    let syncing = loop {
+        match state_lock.try_lock() {
+            Err(std::fs::TryLockError::WouldBlock) => break true,
+            Ok(()) => state_lock.unlock().unwrap(),
+            Err(error) => panic!("{error}"),
+        }
+        if started.elapsed() > std::time::Duration::from_secs(3) {
+            break false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    };
+    let mut second = spawn();
+    assert!(first.wait().unwrap().success());
+    assert!(second.wait().unwrap().success());
+    assert!(syncing, "first waker never entered sync");
+    assert_eq!(herdr.take("agent.list").len(), 2);
 }
