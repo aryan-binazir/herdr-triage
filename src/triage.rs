@@ -152,6 +152,12 @@ impl Record {
         self.touched_at = self.touched_at.max(now);
     }
 
+    /// Herdr relaunches restored agents after a restart; their churn then is not new activity.
+    pub fn restoring(&self, now: i64) -> bool {
+        self.restored_at
+            .is_some_and(|at| now - at < RESTORE_SETTLE_SECS)
+    }
+
     fn resumable(&self) -> bool {
         self.thread.resume_argv().is_some()
     }
@@ -498,9 +504,7 @@ impl State {
             if existed && record.ended {
                 record.park = None;
             }
-            let restoring = record
-                .restored_at
-                .is_some_and(|at| now - at < RESTORE_SETTLE_SECS);
+            let restoring = record.restoring(now);
             if record.generation != generation || agent.seq < record.last_seq {
                 generation.clone_into(&mut record.generation);
                 record.ack_seq = None;
