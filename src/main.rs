@@ -412,12 +412,17 @@ fn close_session(
             "kept open: it is the last pane in its workspace".into(),
         ));
     }
+    // A hook may have synced since the action: activity it saw either unparked the thread or left
+    // it busy. Herdr's restore churn and sibling panes of the same session do neither.
     let still_closable = store.transact(|state| {
         let still_closable = state.records.get(key).is_some_and(|record| {
             record.live
                 && record.missing_since.is_none()
                 && record.park.is_some()
-                && record.last_seq == agent.state_change_seq
+                && !matches!(
+                    record.last_status,
+                    triage::Status::Working | triage::Status::Blocked
+                )
         });
         if still_closable {
             state.closing(key, true);
@@ -862,6 +867,47 @@ mod tests {
             None
         );
         assert!(fake.take("pane.close").is_empty());
+    }
+
+    #[test]
+    fn herdr_restore_churn_between_settle_and_close_still_closes_the_idle_pane() {
+        let fake = FakeHerdr::start(vec![resumable_agent("w1:p1", "idle", 3)]);
+        let (mut herdr, store) = connected(&fake);
+        let key = "session:claude:id:id-w1:p1";
+        sync(&mut herdr, &store, false, |_, _| ()).unwrap();
+        store
+            .transact(|s| s.records.get_mut(key).unwrap().generation = "previous-server".into())
+            .unwrap();
+        let (snapshot, after) = sync(&mut herdr, &store, false, |state, observed| {
+            state.apply(key, observed.first(), Action::ToggleSettle, now())
+        })
+        .unwrap();
+        assert_eq!(after.unwrap(), After::ClosePane);
+        fake.agents.lock().unwrap()[0]["state_change_seq"] = json!(4);
+        sync(&mut herdr, &store, false, |_, _| ()).unwrap();
+        assert_eq!(
+            store.transact(|s| s.records[key].park).unwrap(),
+            Some(Park::Settled)
+        );
+        close_session(&mut herdr, &store, &snapshot, key).unwrap();
+        assert_eq!(fake.take("pane.close"), [json!({"pane_id": "w1:p1"})]);
+    }
+
+    #[test]
+    fn a_second_pane_on_the_same_session_does_not_block_the_close() {
+        let a = resumable_agent("w1:p1", "idle", 3);
+        let mut b = resumable_agent("w1:p2", "idle", 4);
+        b["agent_session"] = a["agent_session"].clone();
+        let fake = FakeHerdr::start(vec![a, b]);
+        let (mut herdr, store) = connected(&fake);
+        perform(
+            &mut herdr,
+            &store,
+            "session:claude:id:id-w1:p1",
+            Action::ToggleSettle,
+        )
+        .unwrap();
+        assert_eq!(fake.take("pane.close"), [json!({"pane_id": "w1:p1"})]);
     }
 
     #[test]
