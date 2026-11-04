@@ -262,7 +262,7 @@ fn source() -> String {
     format!("plugin:{}", plugin_id())
 }
 
-fn socket_path() -> PathBuf {
+pub fn socket_path() -> PathBuf {
     if let Some(path) = std::env::var_os("HERDR_SOCKET_PATH") {
         return path.into();
     }
