@@ -804,14 +804,14 @@ mod tests {
         let fake = FakeHerdr::start(vec![resumable_agent("w1:p1", "idle", 3)]);
         let (mut herdr, store) = connected(&fake);
         let key = "session:claude:id:id-w1:p1";
-        let (snapshot, after) = sync(&mut herdr, &store, |state, observed| {
+        let (snapshot, after) = sync(&mut herdr, &store, false, |state, observed| {
             state.apply(key, observed.first(), Action::ToggleSettle, now())
         })
         .unwrap();
         assert_eq!(after.unwrap(), After::ClosePane);
         fake.agents.lock().unwrap()[0]["agent_status"] = json!("working");
         fake.agents.lock().unwrap()[0]["state_change_seq"] = json!(4);
-        sync(&mut herdr, &store, |_, _| ()).unwrap();
+        sync(&mut herdr, &store, false, |_, _| ()).unwrap();
         assert_eq!(store.transact(|s| s.records[key].park).unwrap(), None);
         assert_eq!(
             close_session(&mut herdr, &store, &snapshot, key).unwrap(),
@@ -826,14 +826,14 @@ mod tests {
         let (mut herdr, store) = connected(&fake);
         let key = "session:claude:id:id-w1:p1";
         let until = now() + 3600;
-        let (snapshot, after) = sync(&mut herdr, &store, |state, observed| {
+        let (snapshot, after) = sync(&mut herdr, &store, false, |state, observed| {
             state.apply(key, observed.first(), Action::Snooze(until), now())
         })
         .unwrap();
         assert_eq!(after.unwrap(), After::ClosePane);
         fake.agents.lock().unwrap()[0]["agent_status"] = json!("working");
         fake.agents.lock().unwrap()[0]["state_change_seq"] = json!(4);
-        sync(&mut herdr, &store, |_, _| ()).unwrap();
+        sync(&mut herdr, &store, false, |_, _| ()).unwrap();
         assert_eq!(
             store.transact(|s| s.records[key].park).unwrap(),
             Some(Park::Snoozed { until })
