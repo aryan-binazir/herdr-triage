@@ -393,7 +393,21 @@ fn close_session(
             "kept open: it is the last pane in its workspace".into(),
         ));
     }
-    store.transact(|state| state.closing(key, true))?;
+    let still_parked = store.transact(|state| {
+        let still_parked = state.records.get(key).is_some_and(|record| {
+            record.live
+                && record.missing_since.is_none()
+                && record.park.is_some()
+                && record.last_seq == agent.state_change_seq
+        });
+        if still_parked {
+            state.closing(key, true);
+        }
+        still_parked
+    })?;
+    if !still_parked {
+        return Ok(None);
+    }
     if let Err(error) = herdr.close_pane(&agent.pane_id) {
         store.transact(|state| state.closing(key, false))?;
         return Err(error);
@@ -768,6 +782,67 @@ mod tests {
             "the settled thread is listed as closed right away"
         );
         assert_eq!(shown[0].park, Some(Park::Settled));
+    }
+
+    #[test]
+    fn snoozing_an_idle_resumable_agent_closes_its_pane_once() {
+        let fake = FakeHerdr::start(vec![resumable_agent("w1:p1", "idle", 3)]);
+        let (mut herdr, store) = connected(&fake);
+        let until = now() + 3600;
+        perform(
+            &mut herdr,
+            &store,
+            "session:claude:id:id-w1:p1",
+            Action::Snooze(until),
+        )
+        .unwrap();
+        assert_eq!(fake.take("pane.close"), [json!({"pane_id": "w1:p1"})]);
+    }
+
+    #[test]
+    fn r2_hook_activity_between_settle_and_close_must_not_kill_working_agent() {
+        let fake = FakeHerdr::start(vec![resumable_agent("w1:p1", "idle", 3)]);
+        let (mut herdr, store) = connected(&fake);
+        let key = "session:claude:id:id-w1:p1";
+        let (snapshot, after) = sync(&mut herdr, &store, |state, observed| {
+            state.apply(key, observed.first(), Action::ToggleSettle, now())
+        })
+        .unwrap();
+        assert_eq!(after.unwrap(), After::ClosePane);
+        fake.agents.lock().unwrap()[0]["agent_status"] = json!("working");
+        fake.agents.lock().unwrap()[0]["state_change_seq"] = json!(4);
+        sync(&mut herdr, &store, |_, _| ()).unwrap();
+        assert_eq!(store.transact(|s| s.records[key].park).unwrap(), None);
+        assert_eq!(
+            close_session(&mut herdr, &store, &snapshot, key).unwrap(),
+            None
+        );
+        assert!(fake.take("pane.close").is_empty());
+    }
+
+    #[test]
+    fn hook_activity_between_snooze_and_close_keeps_the_working_pane_open() {
+        let fake = FakeHerdr::start(vec![resumable_agent("w1:p1", "idle", 3)]);
+        let (mut herdr, store) = connected(&fake);
+        let key = "session:claude:id:id-w1:p1";
+        let until = now() + 3600;
+        let (snapshot, after) = sync(&mut herdr, &store, |state, observed| {
+            state.apply(key, observed.first(), Action::Snooze(until), now())
+        })
+        .unwrap();
+        assert_eq!(after.unwrap(), After::ClosePane);
+        fake.agents.lock().unwrap()[0]["agent_status"] = json!("working");
+        fake.agents.lock().unwrap()[0]["state_change_seq"] = json!(4);
+        sync(&mut herdr, &store, |_, _| ()).unwrap();
+        assert_eq!(
+            store.transact(|s| s.records[key].park).unwrap(),
+            Some(Park::Snoozed { until })
+        );
+        assert_eq!(
+            close_session(&mut herdr, &store, &snapshot, key).unwrap(),
+            None
+        );
+        assert!(fake.take("pane.close").is_empty());
     }
 
     #[test]
