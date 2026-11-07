@@ -16,9 +16,11 @@ pub struct FakeHerdr {
     pub requests: Arc<Mutex<Vec<Value>>>,
     pub fail_method: Arc<Mutex<Option<String>>>,
     pub list_delay: Arc<Mutex<std::time::Duration>>,
-    /// Creates a file when a method is called, standing in for a hook that fires meanwhile.
-    pub touch_on: Arc<Mutex<Option<(String, PathBuf)>>>,
+    pub tabs: Arc<Mutex<Vec<Value>>>,
+    hooks: Arc<Mutex<Vec<(String, Hook)>>>,
 }
+
+type Hook = Box<dyn FnMut(&mut Vec<Value>) + Send>;
 
 impl FakeHerdr {
     pub fn start(agents: Vec<Value>) -> Self {
@@ -35,15 +37,17 @@ impl FakeHerdr {
             requests: Arc::new(Mutex::new(Vec::new())),
             fail_method: Arc::new(Mutex::new(None)),
             list_delay: Arc::new(Mutex::new(std::time::Duration::ZERO)),
-            touch_on: Arc::new(Mutex::new(None)),
+            tabs: Arc::new(Mutex::new(Vec::new())),
+            hooks: Arc::new(Mutex::new(Vec::new())),
         };
-        let (agents, workspaces, requests, fail, list_delay, touch_on) = (
+        let (agents, workspaces, tabs, requests, fail, list_delay, hooks) = (
             fake.agents.clone(),
             fake.workspaces.clone(),
+            fake.tabs.clone(),
             fake.requests.clone(),
             fake.fail_method.clone(),
             fake.list_delay.clone(),
-            fake.touch_on.clone(),
+            fake.hooks.clone(),
         );
         thread::spawn(move || {
             let mut opened = 0;
@@ -71,7 +75,7 @@ impl FakeHerdr {
                     "workspace.list" => {
                         json!({"type": "workspace_list", "workspaces": *workspaces.lock().unwrap()})
                     }
-                    "tab.list" => json!({"type": "tab_list", "tabs": []}),
+                    "tab.list" => json!({"type": "tab_list", "tabs": *tabs.lock().unwrap()}),
                     "pane.report_metadata" => {
                         store_tokens(&mut agents.lock().unwrap(), params);
                         json!({"type": "ok"})
@@ -94,10 +98,10 @@ impl FakeHerdr {
                     "agent.view.set" => json!({"type": "agent_view", "active": true}),
                     _ => json!({"type": "ok"}),
                 };
-                if let Some((method, path)) = &*touch_on.lock().unwrap()
-                    && request["method"] == method.as_str()
-                {
-                    std::fs::write(path, b"").unwrap();
+                for (method, hook) in hooks.lock().unwrap().iter_mut() {
+                    if request["method"] == method.as_str() {
+                        hook(&mut agents.lock().unwrap());
+                    }
                 }
                 requests.lock().unwrap().push(request.clone());
                 let reply = if failing {
@@ -131,6 +135,19 @@ impl FakeHerdr {
             "number":i+1, "tab_count":count.div_ceil(workspaces), "pane_count":count.div_ceil(workspaces)
         })).collect();
         fake
+    }
+
+    /// Runs `hook` on Herdr's agents each time `method` is called, after answering it: something
+    /// that happens in Herdr, or a hook that fires, while a command is midway.
+    #[allow(
+        dead_code,
+        reason = "only the unit tests stage changes midway through a command"
+    )]
+    pub fn on(&self, method: &str, hook: impl FnMut(&mut Vec<Value>) + Send + 'static) {
+        self.hooks
+            .lock()
+            .unwrap()
+            .push((method.to_owned(), Box::new(hook)));
     }
 
     pub fn counts(&self) -> std::collections::BTreeMap<String, usize> {
