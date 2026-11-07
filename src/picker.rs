@@ -3,37 +3,18 @@ use std::collections::BTreeSet;
 use chrono::TimeZone;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-use crate::triage::{Action, Display, Park, Section, SnoozePreset, snooze_presets};
+use crate::triage::{Action, Park, Refusal, Row, Section, SnoozePreset, snooze_presets};
 
 #[derive(Debug, Clone)]
 pub struct Item {
+    pub row: Row,
+    /// The pane a live thread runs in; `None` exactly when the row is not live.
     pub pane_id: Option<String>,
-    pub key: String,
-    pub label: String,
     pub location: String,
     pub kind: String,
     pub search: String,
-    pub display: Display,
-    pub park: Option<Park>,
-    pub pinned: bool,
     pub status: String,
     pub focused: bool,
-}
-
-impl Item {
-    pub fn section(&self) -> Option<Section> {
-        match self.park {
-            Some(park) => Some(park.section()),
-            None if self.display == Display::Working && !self.pinned && !self.closed() => {
-                Some(Section::Working)
-            }
-            None => None,
-        }
-    }
-
-    pub fn closed(&self) -> bool {
-        self.pane_id.is_none()
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -159,7 +140,7 @@ impl Picker {
             .iter()
             .position(|&entry| entry == Entry::Agent(index))
             .or_else(|| {
-                let section = self.items[index].section()?;
+                let section = self.items[index].row.section()?;
                 self.entries.iter().position(
                     |entry| matches!(entry, Entry::Section { section: s, .. } if *s == section),
                 )
@@ -168,19 +149,19 @@ impl Picker {
 
     pub fn refresh(&mut self, items: Vec<Item>, open_sections: &BTreeSet<Section>) {
         let selected = self.entries.get(self.selected).map(|&entry| match entry {
-            Entry::Agent(i) => Ok(self.items[i].key.clone()),
+            Entry::Agent(i) => Ok(self.items[i].row.key.clone()),
             Entry::Section { section, .. } => Err(section),
         });
         self.items = items;
         // Herdr rekeys a thread once it learns its session; the pane stays the same.
         if let Some(prompt) = &mut self.rename
-            && !self.items.iter().any(|item| item.key == prompt.key)
+            && !self.items.iter().any(|item| item.row.key == prompt.key)
             && let Some(item) = self
                 .items
                 .iter()
                 .find(|item| item.pane_id.is_some() && item.pane_id == prompt.pane_id)
         {
-            prompt.key.clone_from(&item.key);
+            prompt.key.clone_from(&item.row.key);
         }
         self.open_sections.clone_from(open_sections);
         self.refilter();
@@ -188,7 +169,7 @@ impl Picker {
             Some(Ok(key)) => self
                 .items
                 .iter()
-                .position(|item| item.key == key)
+                .position(|item| item.row.key == key)
                 .and_then(|i| self.entry_showing(i)),
             Some(Err(section)) => self.entries.iter().position(
                 |entry| matches!(entry, Entry::Section { section: s, .. } if *s == section),
@@ -265,7 +246,7 @@ impl Picker {
             picker
                 .selected()
                 .map_or(Effect::None, |item| Effect::Apply {
-                    key: item.key.clone(),
+                    key: item.row.key.clone(),
                     action,
                 })
         };
@@ -291,9 +272,9 @@ impl Picker {
             KeyCode::Char('r') => {
                 if let Some(item) = self.selected() {
                     self.rename = Some(RenamePrompt {
-                        key: item.key.clone(),
+                        key: item.row.key.clone(),
                         pane_id: item.pane_id.clone(),
-                        text: item.label.clone(),
+                        text: item.row.label().to_owned(),
                     });
                 }
             }
@@ -301,29 +282,30 @@ impl Picker {
                 let Some(item) = self.selected() else {
                     return Effect::None;
                 };
-                if item.closed() {
-                    self.forget = Some(ForgetPrompt {
-                        key: item.key.clone(),
-                        label: item.label.clone(),
-                    });
-                } else {
-                    self.notify("only closed threads can be forgotten".into());
+                match item.row.refusal(Action::Forget) {
+                    Some(Refusal(why)) => self.notify(why),
+                    None => {
+                        self.forget = Some(ForgetPrompt {
+                            key: item.row.key.clone(),
+                            label: item.row.label().to_owned(),
+                        });
+                    }
                 }
             }
             KeyCode::Char('z') => {
                 let Some(item) = self.selected() else {
                     return Effect::None;
                 };
-                if matches!(item.park, Some(Park::Snoozed { .. })) {
+                if matches!(item.row.park, Some(Park::Snoozed { .. })) {
                     return apply(self, Action::Wake);
                 }
-                if item.display == Display::Blocked {
-                    self.notify("can't snooze a blocked agent".into());
+                if let Some(Refusal(why)) = item.row.refusal(Action::Snooze(now)) {
+                    self.notify(why);
                     return Effect::None;
                 }
                 self.snooze = Some(SnoozePrompt {
-                    key: item.key.clone(),
-                    label: item.label.clone(),
+                    key: item.row.key.clone(),
+                    label: item.row.label().to_owned(),
                     presets: snooze_presets(now, tz),
                 });
             }
@@ -361,7 +343,7 @@ impl Picker {
         match &item.pane_id {
             Some(pane) => Effect::Focus(pane.clone()),
             None => Effect::Apply {
-                key: item.key.clone(),
+                key: item.row.key.clone(),
                 action: Action::Reopen,
             },
         }
@@ -406,7 +388,7 @@ impl Picker {
             matches
                 .iter()
                 .copied()
-                .filter(|&i| items[i].section() == section)
+                .filter(|&i| items[i].row.section() == section)
                 .collect()
         };
         let mut entries: Vec<Entry> = in_section(None).into_iter().map(Entry::Agent).collect();
@@ -465,25 +447,31 @@ impl Picker {
         self.offset
     }
 
+    /// After `key` was parked, selects the first live row that needs you most, else stays at
+    /// the row it left, `from`.
     pub fn move_on_from(&mut self, key: &str, from: usize) {
         if !self
             .items
             .iter()
-            .any(|item| item.key == key && item.park.is_some())
+            .any(|item| item.row.key == key && item.row.park.is_some())
         {
             return;
         }
-        let waiting = |wanted: fn(Display) -> bool| {
-            self.entries.iter().position(|&entry| {
-                matches!(entry, Entry::Agent(i) if {
-                    let item = &self.items[i];
-                    item.park.is_none() && !item.closed() && wanted(item.display)
-                })
+        let needs_you = self
+            .entries
+            .iter()
+            .enumerate()
+            .filter_map(|(at, &entry)| match entry {
+                Entry::Agent(i) if self.items[i].row.live() => {
+                    Some((self.items[i].row.attention()?, at))
+                }
+                _ => None,
             })
-        };
-        self.selected = waiting(|d| d == Display::Blocked)
-            .or_else(|| waiting(|d| matches!(d, Display::Done | Display::Unread(_))))
-            .unwrap_or_else(|| from.min(self.entries.len().saturating_sub(1)));
+            .min();
+        self.selected = needs_you.map_or_else(
+            || from.min(self.entries.len().saturating_sub(1)),
+            |(_, at)| at,
+        );
     }
 
     pub fn selected_row(&self) -> Option<usize> {
@@ -579,6 +567,25 @@ impl Picker {
     }
 }
 
+#[cfg(test)]
+impl Item {
+    pub(crate) fn projected(fixture: &crate::triage::Fixture, now: i64) -> Vec<Item> {
+        fixture
+            .rows()
+            .into_iter()
+            .map(|(row, pane_id)| Item {
+                pane_id,
+                location: "acme-api".into(),
+                kind: "claude".into(),
+                search: row.label().to_owned(),
+                status: row.status_text(now),
+                focused: false,
+                row,
+            })
+            .collect()
+    }
+}
+
 pub fn fuzzy_score(needle: &str, haystack: &str) -> Option<i64> {
     let hay: Vec<char> = haystack.to_lowercase().chars().collect();
     let mut score = 0i64;
@@ -604,60 +611,64 @@ mod tests {
     use super::*;
     use std::collections::BTreeSet;
 
-    use crate::triage::{Action, Display, Park, Section};
+    use crate::triage::{Action, Fixture, Section, Status};
     use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
     const NOW: i64 = 1_793_710_800;
 
-    fn item(pane: &str, label: &str, display: Display) -> Item {
-        Item {
-            pane_id: Some(pane.into()),
-            key: format!("k-{pane}"),
-            label: label.into(),
-            location: "ws".into(),
-            kind: "claude".into(),
-            search: format!("claude {label} ws"),
-            display,
-            park: None,
-            pinned: false,
-            status: String::new(),
-            focused: false,
-        }
+    fn listed(fixture: &Fixture) -> Vec<Item> {
+        Item::projected(fixture, NOW)
+    }
+
+    fn three(first: Status) -> Fixture {
+        Fixture::new(
+            NOW,
+            &[
+                ("p1", "api refactor", first),
+                ("p2", "fix flaky test", Status::Done),
+                ("p3", "terraform plan", Status::Idle),
+            ],
+        )
+        .act("p1", Action::TogglePin)
     }
 
     fn items() -> Vec<Item> {
-        vec![
-            pinned_working(),
-            item("p2", "fix flaky test", Display::Done),
-            item("p3", "terraform plan", Display::Idle),
-        ]
+        listed(&three(Status::Working))
     }
 
     fn closed_sections() -> BTreeSet<Section> {
         BTreeSet::new()
     }
 
-    fn parked(pane: &str, label: &str, park: Park) -> Item {
-        Item {
-            park: Some(park),
-            ..item(pane, label, Display::Idle)
-        }
-    }
-
-    fn pinned_working() -> Item {
-        Item {
-            pinned: true,
-            ..item("p1", "api refactor", Display::Working)
-        }
-    }
-
     fn shelf() -> Vec<Item> {
-        vec![
-            pinned_working(),
-            parked("p2", "bench run", Park::Snoozed { until: NOW + 60 }),
-            parked("p3", "release notes", Park::Settled),
-            parked("p4", "old spike", Park::Settled),
-        ]
+        let fixture = Fixture::new(
+            NOW,
+            &[
+                ("p1", "api refactor", Status::Working),
+                ("p2", "bench run", Status::Idle),
+                ("p3", "release notes", Status::Idle),
+                ("p4", "old spike", Status::Idle),
+            ],
+        )
+        .act("p1", Action::TogglePin)
+        .act("p2", Action::Snooze(NOW + 60))
+        .act("p3", Action::ToggleSettle)
+        .act("p4", Action::ToggleSettle);
+        listed(&fixture)
+    }
+
+    fn with_closed() -> Vec<Item> {
+        let fixture = Fixture::new(
+            NOW,
+            &[
+                ("p1", "api refactor", Status::Working),
+                ("p2", "old spike", Status::Done),
+            ],
+        )
+        .act("p1", Action::TogglePin)
+        .close("p2")
+        .act("p2", Action::ToggleUnread);
+        listed(&fixture)
     }
 
     fn layout(picker: &Picker) -> Vec<String> {
@@ -767,8 +778,7 @@ mod tests {
 
     #[test]
     fn snooze_on_a_snoozed_agent_wakes_it_and_on_a_busy_one_explains_why_not() {
-        let mut list = items();
-        list[2].park = Some(Park::Snoozed { until: NOW + 60 });
+        let list = listed(&three(Status::Working).act("p3", Action::Snooze(NOW + 60)));
         let mut picker = Picker::new(list, Some("p3"), &BTreeSet::from([Section::Snoozed]));
         assert_eq!(
             press(&mut picker, KeyCode::Char('z')),
@@ -778,8 +788,7 @@ mod tests {
             }
         );
 
-        let mut blocked = items();
-        blocked[0].display = Display::Blocked;
+        let blocked = listed(&three(Status::Blocked));
         let mut picker = Picker::new(blocked, Some("p1"), &closed_sections());
         assert_eq!(press(&mut picker, KeyCode::Char('z')), Effect::None);
         assert!(picker.snooze_prompt().is_none());
@@ -831,7 +840,7 @@ mod tests {
         moved[1].pane_id = Some("p9".into());
         moved.swap(0, 1);
         picker.refresh(moved, &closed_sections());
-        assert_eq!(picker.selected().map(|i| i.key.as_str()), Some("k-p2"));
+        assert_eq!(picker.selected().map(|i| i.row.key.as_str()), Some("k-p2"));
     }
 
     #[test]
@@ -924,18 +933,22 @@ mod tests {
 
     #[test]
     fn working_agents_wait_in_their_own_section_unless_pinned() {
-        let mut pinned = item("p5", "deploy", Display::Working);
-        pinned.pinned = true;
-        let list = vec![
-            item("p1", "api refactor", Display::Working),
-            item("p2", "fix flaky test", Display::Done),
-            pinned,
-            parked("p3", "release notes", Park::Settled),
-        ];
+        let fixture = Fixture::new(
+            NOW,
+            &[
+                ("p1", "api refactor", Status::Working),
+                ("p2", "fix flaky test", Status::Done),
+                ("p5", "deploy", Status::Working),
+                ("p3", "release notes", Status::Idle),
+            ],
+        )
+        .act("p5", Action::TogglePin)
+        .act("p3", Action::ToggleSettle);
+        let list = listed(&fixture);
         let picker = Picker::new(list.clone(), Some("p1"), &closed_sections());
         assert_eq!(
             layout(&picker),
-            ["p2", "p5", "Working:1:false", "Settled:1:false"]
+            ["p5", "p2", "Working:1:false", "Settled:1:false"]
         );
         assert_eq!(
             picker.selected_row(),
@@ -946,7 +959,7 @@ mod tests {
         let picker = Picker::new(list, None, &BTreeSet::from([Section::Working]));
         assert_eq!(
             layout(&picker),
-            ["p2", "p5", "Working:1:true", "p1", "Settled:1:false"]
+            ["p5", "p2", "Working:1:true", "p1", "Settled:1:false"]
         );
     }
 
@@ -968,16 +981,19 @@ mod tests {
             press(&mut picker, KeyCode::Char(c));
         }
         assert_eq!(
-            picker.selected().map(|item| item.label.as_str()),
+            picker.selected().map(|item| item.row.label()),
             Some("release notes")
         );
 
-        let weak = Item {
-            search: "claude migrate auth sandboxes/ui/acme-api".into(),
-            ..item("p1", "migrate auth", Display::Idle)
-        };
-        let strong = item("p2", "bump postgres", Display::Working);
-        let mut picker = Picker::new(vec![weak, strong], None, &closed_sections());
+        let mut list = listed(&Fixture::new(
+            NOW,
+            &[
+                ("p1", "migrate auth", Status::Idle),
+                ("p2", "bump postgres", Status::Working),
+            ],
+        ));
+        list[0].search = "claude migrate auth sandboxes/ui/acme-api".into();
+        let mut picker = Picker::new(list, None, &closed_sections());
         press(&mut picker, KeyCode::Char('/'));
         for c in "bump".chars() {
             press(&mut picker, KeyCode::Char(c));
@@ -1024,41 +1040,44 @@ mod tests {
         );
     }
 
-    fn closed(pane: &str, label: &str) -> Item {
-        Item {
-            pane_id: None,
-            ..item(pane, label, Display::Idle)
-        }
-    }
-
     #[test]
     fn parking_moves_on_to_the_next_agent_that_needs_you() {
         let list = |first_parked: bool| {
-            let mut first = item("p1", "api refactor", Display::Idle);
+            let fixture = Fixture::new(
+                NOW,
+                &[
+                    ("p1", "api refactor", Status::Idle),
+                    ("p2", "fix flaky test", Status::Done),
+                    ("p3", "terraform plan", Status::Idle),
+                    ("p4", "bench run", Status::Blocked),
+                ],
+            );
             if first_parked {
-                first.park = Some(Park::Settled);
+                listed(&fixture.act("p1", Action::ToggleSettle))
+            } else {
+                listed(&fixture)
             }
-            vec![
-                first,
-                item("p2", "fix flaky test", Display::Done),
-                item("p3", "terraform plan", Display::Idle),
-                item("p4", "bench run", Display::Blocked),
-            ]
         };
         let mut picker = Picker::new(list(false), Some("p1"), &closed_sections());
         picker.refresh(list(true), &closed_sections());
         picker.move_on_from("k-p1", 0);
-        assert_eq!(picker.selected().map(|i| i.key.as_str()), Some("k-p4"));
+        assert_eq!(picker.selected().map(|i| i.row.key.as_str()), Some("k-p4"));
 
-        let calm = vec![
-            parked("p1", "api refactor", Park::Settled),
-            item("p3", "terraform plan", Display::Idle),
-        ];
+        let calm = listed(
+            &Fixture::new(
+                NOW,
+                &[
+                    ("p1", "api refactor", Status::Idle),
+                    ("p3", "terraform plan", Status::Idle),
+                ],
+            )
+            .act("p1", Action::ToggleSettle),
+        );
         let mut picker = Picker::new(calm.clone(), Some("p3"), &closed_sections());
         picker.refresh(calm, &closed_sections());
         picker.move_on_from("k-p1", 0);
         assert_eq!(
-            picker.selected().map(|i| i.key.as_str()),
+            picker.selected().map(|i| i.row.key.as_str()),
             Some("k-p3"),
             "with nothing waiting, the cursor stays where the parked row was"
         );
@@ -1066,7 +1085,7 @@ mod tests {
         let mut picker = Picker::new(list(false), Some("p3"), &closed_sections());
         picker.move_on_from("k-p1", 2);
         assert_eq!(
-            picker.selected().map(|i| i.key.as_str()),
+            picker.selected().map(|i| i.row.key.as_str()),
             Some("k-p3"),
             "an unparked thread keeps the selection"
         );
@@ -1074,8 +1093,7 @@ mod tests {
 
     #[test]
     fn opening_a_closed_thread_reopens_it() {
-        let list = vec![pinned_working(), closed("p2", "old spike")];
-        let mut picker = Picker::new(list, None, &closed_sections());
+        let mut picker = Picker::new(with_closed(), None, &closed_sections());
         let reopen = Effect::Apply {
             key: "k-p2".into(),
             action: Action::Reopen,
@@ -1087,8 +1105,7 @@ mod tests {
 
     #[test]
     fn shift_d_forgets_a_closed_thread_after_confirmation() {
-        let list = vec![pinned_working(), closed("p2", "old spike")];
-        let mut picker = Picker::new(list, None, &closed_sections());
+        let mut picker = Picker::new(with_closed(), None, &closed_sections());
         assert_eq!(press(&mut picker, KeyCode::Char('D')), Effect::None);
         assert_eq!(
             picker.message(),
@@ -1116,8 +1133,8 @@ mod tests {
 
     #[test]
     fn q_closes_the_picker_even_while_asking_to_forget() {
-        let list = vec![closed("p2", "old spike")];
-        let mut picker = Picker::new(list, None, &closed_sections());
+        let fixture = Fixture::new(NOW, &[("p2", "old spike", Status::Done)]).close("p2");
+        let mut picker = Picker::new(listed(&fixture), None, &closed_sections());
         press(&mut picker, KeyCode::Char('D'));
         assert_eq!(press(&mut picker, KeyCode::Char('q')), Effect::Close);
     }
@@ -1171,7 +1188,7 @@ mod tests {
         let mut picker = Picker::new(items(), Some("p2"), &closed_sections());
         press(&mut picker, KeyCode::Char('r'));
         let mut rekeyed = items();
-        rekeyed[1].key = "session:claude:id:abc".into();
+        rekeyed[1].row.key = "session:claude:id:abc".into();
         picker.refresh(rekeyed, &closed_sections());
         assert_eq!(
             press(&mut picker, KeyCode::Enter),

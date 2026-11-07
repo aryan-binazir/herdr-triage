@@ -12,6 +12,7 @@ const REOPEN_PENDING_SECS: i64 = 60;
 /// anyone using them; changes this soon after a restart are not new activity.
 const RESTORE_SETTLE_SECS: i64 = 20;
 const REOPEN_ADOPT_SECS: i64 = 300;
+pub const UNTITLED: &str = "Untitled thread";
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -255,12 +256,48 @@ pub enum Display {
 }
 
 impl Display {
-    pub fn busy(self) -> Option<&'static str> {
+    pub fn unseen(self) -> bool {
+        matches!(self, Display::Done | Display::Unread(_))
+    }
+}
+
+/// What a thread wants from you, most urgent first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Attention {
+    Blocked,
+    Unseen,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Rank {
+    Pinned,
+    Open,
+    Snoozed,
+    Settled,
+}
+
+impl Rank {
+    const ALL: [Rank; 4] = [Rank::Pinned, Rank::Open, Rank::Snoozed, Rank::Settled];
+
+    pub fn token(self) -> &'static str {
         match self {
-            Display::Working => Some("working"),
-            Display::Blocked => Some("blocked"),
-            _ => None,
+            Rank::Pinned => "0",
+            Rank::Open => "1",
+            Rank::Snoozed => "2",
+            Rank::Settled => "3",
         }
+    }
+
+    pub fn hidden(self) -> bool {
+        matches!(self, Rank::Snoozed | Rank::Settled)
+    }
+
+    pub fn hidden_tokens() -> Vec<&'static str> {
+        Rank::ALL
+            .into_iter()
+            .filter(|rank| rank.hidden())
+            .map(Rank::token)
+            .collect()
     }
 }
 
@@ -371,6 +408,39 @@ impl Row {
         self.agent_index.is_some()
     }
 
+    pub fn label(&self) -> &str {
+        match &self.title {
+            Some(title) => title,
+            None if self.thread.label.is_empty() => UNTITLED,
+            None => &self.thread.label,
+        }
+    }
+
+    pub fn section(&self) -> Option<Section> {
+        match self.park {
+            Some(park) => Some(park.section()),
+            None if self.display == Display::Working && !self.pinned && self.live() => {
+                Some(Section::Working)
+            }
+            None => None,
+        }
+    }
+
+    pub fn attention(&self) -> Option<Attention> {
+        match self.display {
+            _ if self.park.is_some() => None,
+            Display::Blocked => Some(Attention::Blocked),
+            display if display.unseen() => Some(Attention::Unseen),
+            _ => None,
+        }
+    }
+
+    /// Why triage would refuse `action` on this thread as shown. `None` does not promise
+    /// success: a thread can still be gone, or have no session to resume.
+    pub fn refusal(&self, action: Action) -> Option<Refusal> {
+        refusal(action, self.display, self.live())
+    }
+
     pub fn status_text(&self, now: i64) -> String {
         let text = self.countdown(now).unwrap_or_else(|| {
             let word = match self.display {
@@ -412,12 +482,12 @@ impl Row {
         (!label.is_empty()).then_some(label)
     }
 
-    pub fn rank(&self) -> u8 {
+    pub fn rank(&self) -> Rank {
         match (self.park, self.pinned) {
-            (Some(Park::Settled), _) => 3,
-            (Some(Park::Snoozed { .. }), _) => 2,
-            (None, true) => 0,
-            (None, false) => 1,
+            (Some(Park::Settled), _) => Rank::Settled,
+            (Some(Park::Snoozed { .. }), _) => Rank::Snoozed,
+            (None, true) => Rank::Pinned,
+            (None, false) => Rank::Open,
         }
     }
 
@@ -522,6 +592,24 @@ pub fn snooze_presets<Tz: TimeZone>(now: i64, tz: &Tz) -> Vec<SnoozePreset> {
     .into_iter()
     .filter(|preset| *preset != SnoozePreset::ThisEvening || evening_is_half_an_hour_away)
     .collect()
+}
+
+fn refusal(action: Action, shown: Display, live: bool) -> Option<Refusal> {
+    let verb = match action {
+        Action::Forget if live => {
+            return Some(Refusal("only closed threads can be forgotten".into()));
+        }
+        Action::ToggleSettle => "settle",
+        Action::ToggleUnread => "mark unread",
+        Action::Snooze(_) if shown == Display::Blocked => "snooze",
+        _ => return None,
+    };
+    let busy = match shown {
+        Display::Working => "working",
+        Display::Blocked => "blocked",
+        _ => return None,
+    };
+    Some(Refusal(format!("can't {verb} a {busy} agent")))
 }
 
 fn display(agent: &Observed, record: Option<&Record>) -> Display {
@@ -846,9 +934,10 @@ impl State {
             Some(agent) => display(agent, self.records.get(key)),
             None => closed_display(self.records.get(key).ok_or_else(gone)?),
         };
+        let refused = refusal(action, shown, live_agent.is_some());
         if action == Action::Forget {
-            if live_agent.is_some() {
-                return Err(Refusal("only closed threads can be forgotten".into()));
+            if let Some(refusal) = refused {
+                return Err(refusal);
             }
             self.records.remove(key);
             self.drop_orphaned_undo();
@@ -868,18 +957,8 @@ impl State {
         record.touch(now);
         let before = Triage::of(record);
         let seq = live_agent.map_or(record.last_seq, |agent| agent.seq);
-        let refused = match action {
-            Action::ToggleSettle | Action::ToggleUnread => shown.busy(),
-            Action::Snooze(_) if shown == Display::Blocked => shown.busy(),
-            _ => None,
-        };
-        if let Some(busy) = refused {
-            let verb = match action {
-                Action::ToggleSettle => "settle",
-                Action::Snooze(_) => "snooze",
-                _ => "mark unread",
-            };
-            return Err(Refusal(format!("can't {verb} a {busy} agent")));
+        if let Some(refusal) = refused {
+            return Err(refusal);
         }
         let live = live_agent.is_some();
         let unpark = |record: &mut Record| {
@@ -912,7 +991,7 @@ impl State {
                 Park::Snoozed { until },
                 live_agent.filter(|_| shown != Display::Working),
             )),
-            Action::ToggleUnread if matches!(shown, Display::Done | Display::Unread(_)) => {
+            Action::ToggleUnread if shown.unseen() => {
                 record.unread = None;
                 record.ack_seq = Some(seq);
                 Ok(After::Nothing)
@@ -1003,17 +1082,11 @@ fn reopen_plan(key: &str, record: &Record, now: i64) -> Result<After, Refusal> {
 }
 
 pub fn next_attention<'a>(rows: &'a [Row], current: Option<&str>) -> Option<&'a Row> {
-    let open = |row: &&Row| row.park.is_none() && row.live();
-    let queue: Vec<&Row> = rows
+    let mut queue: Vec<&Row> = rows
         .iter()
-        .filter(open)
-        .filter(|row| row.display == Display::Blocked)
-        .chain(
-            rows.iter()
-                .filter(open)
-                .filter(|row| matches!(row.display, Display::Done | Display::Unread(_))),
-        )
+        .filter(|row| row.live() && row.attention().is_some())
         .collect();
+    queue.sort_by_key(|row| row.attention());
     let start = current
         .and_then(|key| queue.iter().position(|row| row.key == key))
         .map_or(0, |at| at + 1);
@@ -1039,6 +1112,76 @@ fn park(record: &mut Record, seq: u64, park: Park, closing: Option<&Observed>) -
             workspace_panes: agent.workspace_panes,
         }),
         _ => After::Nothing,
+    }
+}
+
+#[cfg(test)]
+pub(crate) struct Fixture {
+    state: State,
+    agents: Vec<Observed>,
+    now: i64,
+}
+
+#[cfg(test)]
+impl Fixture {
+    /// Resumable live agents as `(pane, label, status)`, keyed `k-<pane>`, newest first.
+    pub(crate) fn new(now: i64, agents: &[(&str, &str, Status)]) -> Self {
+        let newest = agents.len() as u64;
+        let agents: Vec<Observed> = agents
+            .iter()
+            .zip((1..=newest).rev())
+            .map(|(&(pane, label, status), seq)| Observed {
+                key: format!("k-{pane}"),
+                pre_session_key: None,
+                pane_id: pane.into(),
+                terminal_id: format!("t-{pane}"),
+                workspace_panes: 2,
+                status,
+                seq,
+                focused: false,
+                thread: Thread {
+                    label: label.into(),
+                    agent: Some("claude".into()),
+                    workspace_id: Some("w1".into()),
+                    session: Some(SessionRef {
+                        source: "herdr:claude".into(),
+                        kind: "id".into(),
+                        value: format!("id-{pane}"),
+                    }),
+                    ..Thread::default()
+                },
+            })
+            .collect();
+        let mut state = State::default();
+        state.reconcile("fixture", &agents, now - 60);
+        Self { state, agents, now }
+    }
+
+    pub(crate) fn act(mut self, pane: &str, action: Action) -> Self {
+        let key = format!("k-{pane}");
+        let live = self.agents.iter().find(|agent| agent.key == key);
+        self.state.apply(&key, live, action, self.now).unwrap();
+        self
+    }
+
+    pub(crate) fn close(mut self, pane: &str) -> Self {
+        self.agents.retain(|agent| agent.pane_id != pane);
+        let gone = self.now - 30;
+        self.state.reconcile("fixture", &self.agents, gone);
+        self.state
+            .reconcile("fixture", &self.agents, gone + EXIT_GRACE_SECS);
+        self
+    }
+
+    pub(crate) fn rows(&self) -> Vec<(Row, Option<String>)> {
+        self.state
+            .ordered(&self.agents)
+            .into_iter()
+            .map(|row| {
+                let pane = row.agent_index.map(|i| self.agents[i].pane_id.clone());
+                (row, pane)
+            })
+            .collect()
     }
 }
 
@@ -1142,20 +1285,197 @@ mod tests {
         );
     }
 
+    fn beside_a_closed_unread_thread(state: &mut State, agents: &[Observed]) -> Vec<Row> {
+        let gone = resumable("closed-unread", Status::Done, 1);
+        state.reconcile(GEN, std::slice::from_ref(&gone), NOW - 20);
+        state.reconcile(GEN, &[], NOW - 19);
+        state.reconcile(GEN, &[], NOW - 5);
+        state.reconcile(GEN, agents, NOW);
+        state.ordered(agents)
+    }
+
+    fn by_key<T>(rows: &[Row], read: impl Fn(&Row) -> T) -> BTreeMap<String, T> {
+        rows.iter()
+            .map(|row| (row.key.clone(), read(row)))
+            .collect()
+    }
+
     #[test]
-    fn settle_and_snooze_are_refused_while_working_or_blocked() {
+    fn working_threads_wait_in_their_own_section_unless_pinned_and_parked_ones_in_theirs() {
         let agents = [
-            agent("w", Status::Working, 1),
-            agent("b", Status::Blocked, 2),
+            agent("working", Status::Working, 6),
+            agent("pinned-working", Status::Working, 5),
+            agent("done", Status::Done, 4),
+            agent("snoozed-working", Status::Working, 3),
+            agent("settled", Status::Idle, 2),
+        ];
+        let mut state = State::default();
+        beside_a_closed_unread_thread(&mut state, &agents);
+        act(&mut state, &agents[1], Action::TogglePin).unwrap();
+        act(&mut state, &agents[3], Action::Snooze(NOW + 60)).unwrap();
+        act(&mut state, &agents[4], Action::ToggleSettle).unwrap();
+        let rows = state.ordered(&agents);
+        assert_eq!(
+            by_key(&rows, Row::section),
+            BTreeMap::from([
+                ("working".into(), Some(Section::Working)),
+                ("pinned-working".into(), None),
+                ("done".into(), None),
+                ("snoozed-working".into(), Some(Section::Snoozed)),
+                ("settled".into(), Some(Section::Settled)),
+                ("closed-unread".into(), None),
+            ])
+        );
+    }
+
+    #[test]
+    fn blocked_threads_need_you_first_then_unseen_results_unless_parked() {
+        let agents = [
+            agent("blocked", Status::Blocked, 7),
+            agent("done", Status::Done, 6),
+            agent("unread", Status::Idle, 5),
+            agent("idle", Status::Idle, 4),
+            agent("working", Status::Working, 3),
+            agent("snoozed-done", Status::Done, 2),
+        ];
+        let mut state = State::default();
+        beside_a_closed_unread_thread(&mut state, &agents);
+        act(&mut state, &agents[2], Action::ToggleUnread).unwrap();
+        act(&mut state, &agents[5], Action::Snooze(NOW + 60)).unwrap();
+        let rows = state.ordered(&agents);
+        assert_eq!(
+            by_key(&rows, Row::attention),
+            BTreeMap::from([
+                ("blocked".into(), Some(Attention::Blocked)),
+                ("done".into(), Some(Attention::Unseen)),
+                ("unread".into(), Some(Attention::Unseen)),
+                ("idle".into(), None),
+                ("working".into(), None),
+                ("snoozed-done".into(), None),
+                ("closed-unread".into(), Some(Attention::Unseen)),
+            ])
+        );
+        assert!(Attention::Blocked < Attention::Unseen);
+    }
+
+    #[test]
+    fn sidebar_ranks_put_pinned_threads_first_and_hide_parked_ones() {
+        let agents = [
+            agent("pinned", Status::Idle, 4),
+            agent("open", Status::Idle, 3),
+            agent("snoozed", Status::Idle, 2),
+            agent("settled", Status::Idle, 1),
         ];
         let mut state = State::default();
         state.reconcile(GEN, &agents, NOW);
-        for a in &agents {
-            assert!(act(&mut state, a, Action::ToggleSettle).is_err());
-            assert!(act(&mut state, a, Action::ToggleUnread).is_err());
+        act(&mut state, &agents[0], Action::TogglePin).unwrap();
+        act(&mut state, &agents[2], Action::Snooze(NOW + 60)).unwrap();
+        act(&mut state, &agents[3], Action::ToggleSettle).unwrap();
+        let ranks = by_key(&state.ordered(&agents), |row| {
+            (row.rank().token(), row.rank().hidden())
+        });
+        assert_eq!(
+            ranks,
+            BTreeMap::from([
+                ("pinned".into(), ("0", false)),
+                ("open".into(), ("1", false)),
+                ("snoozed".into(), ("2", true)),
+                ("settled".into(), ("3", true)),
+            ])
+        );
+        assert_eq!(Rank::hidden_tokens(), ["2", "3"]);
+    }
+
+    #[test]
+    fn a_thread_reads_as_its_title_else_its_automatic_label() {
+        let named = Observed {
+            thread: Thread {
+                label: "fix flaky test".into(),
+                ..Thread::default()
+            },
+            ..agent("named", Status::Idle, 3)
+        };
+        let agents = [
+            named,
+            agent("unlabelled", Status::Idle, 2),
+            agent("renamed", Status::Idle, 1),
+        ];
+        let mut state = State::default();
+        state.reconcile(GEN, &agents, NOW);
+        state.rename("renamed", Some("checkout flow".into()), NOW);
+        let rows = state.ordered(&agents);
+        assert_eq!(
+            by_key(&rows, |row| row.label().to_owned()),
+            BTreeMap::from([
+                ("named".into(), "fix flaky test".into()),
+                ("unlabelled".into(), "Untitled thread".into()),
+                ("renamed".into(), "checkout flow".into()),
+            ])
+        );
+    }
+
+    #[test]
+    fn triage_refuses_to_settle_or_mark_busy_agents_snooze_blocked_ones_or_forget_live_ones() {
+        let agents = [
+            agent("working", Status::Working, 3),
+            agent("blocked", Status::Blocked, 2),
+            agent("idle", Status::Idle, 1),
+        ];
+        let mut state = State::default();
+        let rows = beside_a_closed_unread_thread(&mut state, &agents);
+        let actions = [
+            Action::ToggleSettle,
+            Action::ToggleUnread,
+            Action::Snooze(NOW + 60),
+            Action::TogglePin,
+            Action::Forget,
+        ];
+        let refusals = by_key(&rows, |row| {
+            actions
+                .iter()
+                .filter_map(|&action| row.refusal(action).map(|Refusal(why)| why))
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(
+            refusals,
+            BTreeMap::from([
+                (
+                    "working".into(),
+                    vec![
+                        "can't settle a working agent".to_owned(),
+                        "can't mark unread a working agent".into(),
+                        "only closed threads can be forgotten".into(),
+                    ]
+                ),
+                (
+                    "blocked".into(),
+                    vec![
+                        "can't settle a blocked agent".to_owned(),
+                        "can't mark unread a blocked agent".into(),
+                        "can't snooze a blocked agent".into(),
+                        "only closed threads can be forgotten".into(),
+                    ]
+                ),
+                (
+                    "idle".into(),
+                    vec!["only closed threads can be forgotten".to_owned()]
+                ),
+                ("closed-unread".into(), vec![]),
+            ])
+        );
+        for row in &rows {
+            let live = row.agent_index.map(|index| &agents[index]);
+            for action in actions {
+                if let Some(refusal) = row.refusal(action) {
+                    assert_eq!(
+                        state.apply(&row.key, live, action, NOW),
+                        Err(refusal),
+                        "{} {action:?}",
+                        row.key
+                    );
+                }
+            }
         }
-        assert!(act(&mut state, &agents[1], Action::Snooze(NOW + 60)).is_err());
-        assert!(act(&mut state, &agents[0], Action::TogglePin).is_ok());
     }
 
     fn shown(state: &State, agent: &Observed) -> (Display, Option<Park>) {

@@ -189,12 +189,12 @@ impl Herdr {
         self.call("pane.report_metadata", &params).map(drop)
     }
 
-    pub fn set_view(&mut self, label: &str) -> io::Result<()> {
+    pub fn set_view(&mut self, label: &str, hidden_ranks: &[&str]) -> io::Result<()> {
         let params = json!({
             "source": source(),
             "label": label,
             "filter": {"op": "not", "filter": {
-                "op": "in", "field": {"token": "triage_rank"}, "values": ["2", "3"],
+                "op": "in", "field": {"token": "triage_rank"}, "values": hidden_ranks,
             }},
             "sort": [
                 {"field": {"token": "triage_rank"}, "order": "asc"},
