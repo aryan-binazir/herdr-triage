@@ -1,5 +1,7 @@
+use std::borrow::Cow;
+
 use ratatui::Frame;
-use ratatui::layout::{Alignment, Constraint, Layout, Margin, Rect};
+use ratatui::layout::{Alignment, Constraint, Flex, Layout, Margin, Rect};
 use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
@@ -11,6 +13,14 @@ use crate::triage::{Display, Section, Unread};
 
 const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const HIGHLIGHT: &str = "▎ ";
+/// Blank cells after Workspace and Agent, so the last three columns read apart.
+const GAP: u16 = 1;
+/// The fewest title cells worth quoting in a prompt.
+const MIN_PROMPT_LABEL: usize = 8;
+/// The fewest title cells worth keeping ` (focused)` for; below this the title gets the room.
+const MIN_FOCUSED_LABEL: usize = 16;
+/// Thread cells kept before Status, Workspace and Agent give up theirs.
+const MIN_THREAD: u16 = 24;
 
 pub fn draw(frame: &mut Frame, picker: &mut Picker, tick: usize, pin_icon: &str) {
     let area = frame.area().inner(Margin::new(1, 0));
@@ -26,28 +36,38 @@ pub fn draw(frame: &mut Frame, picker: &mut Picker, tick: usize, pin_icon: &str)
     .areas(area);
 
     draw_search(frame, picker, search);
-    let rule = Paragraph::new("─".repeat(usize::from(area.width))).dark_gray();
-    frame.render_widget(rule.clone(), top_rule);
-    frame.render_widget(rule, bottom_rule);
 
-    let rows = picker.rows();
-    let agents: Vec<&Item> = rows
-        .iter()
-        .filter_map(|row| match row {
-            ListRow::Agent(item) => Some(*item),
-            ListRow::Section { .. } => None,
-        })
-        .collect();
-    let (widths, status_width) = widths(&agents, area.width, pin_icon);
-    let header = Table::new(Vec::<Row>::new(), widths)
-        .header(Row::new(["#", "", "", "Thread", "Workspace", "Agent", "Status"]).dim())
+    // Widths come from every thread, not just the rows on show, so opening a section or
+    // typing a search never shifts the columns.
+    let columns = Columns::new(picker.items(), area.width, pin_icon);
+    let number_heading = if picker.mode() == Mode::Search {
+        ""
+    } else {
+        "#"
+    };
+    let header = Table::new(Vec::<Row>::new(), columns.constraints)
+        .header(
+            Row::new([
+                number_heading,
+                "",
+                "",
+                "Thread",
+                "Workspace",
+                "Agent",
+                "Status",
+            ])
+            .dim(),
+        )
         .highlight_symbol(HIGHLIGHT)
         .highlight_spacing(HighlightSpacing::Always)
         .column_spacing(1);
     frame.render_widget(header, heading);
 
-    if rows.is_empty() {
+    let rows = picker.rows();
+    let row_count = rows.len();
+    let (above, below) = if rows.is_empty() {
         draw_empty(frame, picker, list);
+        (0, 0)
     } else {
         let numbered = picker.mode() == Mode::Navigate;
         let offset = first_row_on_screen(picker.offset(), picker.selected_row(), list.height);
@@ -61,7 +81,7 @@ pub fn draw(frame: &mut Frame, picker: &mut Picker, tick: usize, pin_icon: &str)
                         agents_on_screen += 1;
                         agents_on_screen
                     });
-                    row(item, number, tick, pin_icon, status_width)
+                    row(item, number, tick, pin_icon, &columns)
                 }
                 ListRow::Section {
                     section,
@@ -70,55 +90,109 @@ pub fn draw(frame: &mut Frame, picker: &mut Picker, tick: usize, pin_icon: &str)
                 } => section_row(*section, *count, *open),
             })
             .collect();
-        let table = Table::new(table_rows, widths)
+        let table = Table::new(table_rows, columns.constraints)
             .highlight_symbol(Line::from(HIGHLIGHT).blue())
             .highlight_spacing(HighlightSpacing::Always)
-            .row_highlight_style(Style::new().bg(Color::DarkGray))
+            .row_highlight_style(
+                Style::new()
+                    .bg(Color::DarkGray)
+                    .remove_modifier(Modifier::DIM),
+            )
             .column_spacing(1);
         let mut state = TableState::default()
             .with_offset(offset)
             .with_selected(picker.selected_row());
         frame.render_stateful_widget(table, list, &mut state);
-        picker.set_viewport(state.offset(), usize::from(list.height));
-    }
+        let height = usize::from(list.height);
+        picker.set_viewport(state.offset(), height);
+        (
+            state.offset(),
+            row_count.saturating_sub(state.offset() + height),
+        )
+    };
+    frame.render_widget(Paragraph::new(rule(top_rule.width, '↑', above)), top_rule);
     frame.render_widget(
-        Paragraph::new(footer_line(picker, usize::from(footer.width))),
-        footer,
+        Paragraph::new(rule(bottom_rule.width, '↓', below)),
+        bottom_rule,
     );
+
+    let (line, cursor) = footer_line(picker, usize::from(footer.width));
+    frame.render_widget(Paragraph::new(line), footer);
+    if let Some(column) = cursor {
+        let x = footer
+            .x
+            .saturating_add(u16::try_from(column).unwrap_or(u16::MAX))
+            .min(footer.right().saturating_sub(1));
+        frame.set_cursor_position((x, footer.y));
+    }
+}
+
+/// A divider that says how many rows sit beyond it, when any do.
+fn rule(width: u16, arrow: char, hidden: usize) -> Line<'static> {
+    let width = usize::from(width);
+    if hidden == 0 {
+        return Line::from("─".repeat(width)).dark_gray();
+    }
+    let label = format!(" {arrow} {hidden} more ");
+    let tail = 2;
+    let lead = width.saturating_sub(cells(&label) + tail);
+    Line::from(vec![
+        Span::from("─".repeat(lead)).dark_gray(),
+        Span::from(label).dim(),
+        Span::from("─".repeat(tail)).dark_gray(),
+    ])
 }
 
 fn draw_search(frame: &mut Frame, picker: &Picker, area: Rect) {
+    let searching = picker.mode() == Mode::Search;
+    let border = if searching {
+        Style::new().cyan()
+    } else {
+        Style::new().dark_gray()
+    };
     let block = Block::bordered()
         .border_type(BorderType::Rounded)
-        .border_style(Style::new().dark_gray())
+        .border_style(border)
         .padding(Padding::horizontal(1));
     let inner = block.inner(area);
     frame.render_widget(block, area);
+
+    let count = if picker.filter().is_empty() {
+        picker.total().to_string()
+    } else {
+        format!("{}/{}", picker.matched(), picker.total())
+    };
+    let count_width = u16::try_from(cells(&count)).unwrap_or(u16::MAX);
+    let [query_area, _, count_area] = Layout::horizontal([
+        Constraint::Fill(1),
+        Constraint::Length(2),
+        Constraint::Length(count_width),
+    ])
+    .areas(inner);
+    frame.render_widget(Paragraph::new(count).dim(), count_area);
+
+    let prompt = "❯ ";
+    let room = usize::from(query_area.width).saturating_sub(cells(prompt) + 1);
+    let query = tail(picker.filter(), room);
     let line = match picker.mode() {
         Mode::Navigate if picker.filter().is_empty() => Line::from(vec![
-            Span::from("❯ ").dim(),
-            Span::from("/ to filter").dim().italic(),
+            Span::from(prompt).dim(),
+            Span::from("/ to search").dim().italic(),
         ]),
         Mode::Navigate => Line::from(vec![
-            Span::from("❯ ").cyan(),
-            Span::from(picker.filter().to_owned()),
+            Span::from(prompt).cyan(),
+            Span::from(query.to_string()),
         ]),
         Mode::Search => Line::from(vec![
-            Span::from("❯ ").cyan().bold(),
-            Span::from(picker.filter().to_owned()),
+            Span::from(prompt).cyan().bold(),
+            Span::from(query.to_string()),
         ]),
     };
-    frame.render_widget(Paragraph::new(line), inner);
-    let count = format!("{}/{}", picker.matched(), picker.total());
-    frame.render_widget(
-        Paragraph::new(count).dim().alignment(Alignment::Right),
-        inner,
-    );
-    if picker.mode() == Mode::Search {
-        let typed = u16::try_from(Span::raw(picker.filter()).width()).unwrap_or(u16::MAX);
-        let end = inner.right().saturating_sub(1);
-        let x = inner.x.saturating_add(2).saturating_add(typed).min(end);
-        frame.set_cursor_position((x, inner.y));
+    frame.render_widget(Paragraph::new(line), query_area);
+    if searching {
+        let typed = u16::try_from(cells(prompt) + cells(&query)).unwrap_or(u16::MAX);
+        let end = query_area.right().saturating_sub(1);
+        frame.set_cursor_position((query_area.x.saturating_add(typed).min(end), query_area.y));
     }
 }
 
@@ -131,44 +205,148 @@ fn first_row_on_screen(previous: usize, selected: Option<usize>, height: u16) ->
     }
 }
 
-fn widths(items: &[&Item], width: u16, pin_icon: &str) -> ([Constraint; 7], u16) {
-    let longest = |field: fn(&Item) -> &str, floor: usize, cap: u16| {
-        let widest = items
-            .iter()
-            .map(|item| Span::raw(field(item)).width())
-            .max()
-            .unwrap_or(0);
-        u16::try_from(widest.max(floor))
-            .unwrap_or(u16::MAX)
-            .min(cap)
-    };
-    let pin = u16::try_from(Span::raw(pin_icon).width()).unwrap_or(1);
-    let status = longest(|i| &i.status, 6, width * 2 / 5);
-    let widths = [
-        Constraint::Length(1),
-        Constraint::Length(pin),
-        Constraint::Length(1),
-        Constraint::Fill(1),
-        Constraint::Length(longest(|i| &i.location, 9, width / 4)),
-        Constraint::Length(longest(|i| &i.kind, 5, width / 5)),
-        Constraint::Length(status),
-    ];
-    (widths, status)
+/// Column constraints, and the cells each text column can show (as the table lays them out).
+struct Columns {
+    constraints: [Constraint; 7],
+    thread: usize,
+    workspace: usize,
+    agent: usize,
+    status: usize,
 }
 
-fn fit_status(text: &str, width: u16) -> String {
-    let width = usize::from(width);
-    if text.chars().count() <= width {
-        return text.to_owned();
+impl Columns {
+    fn new(items: &[Item], width: u16, pin_icon: &str) -> Self {
+        let longest = |field: fn(&Item) -> &str, floor: usize, cap: u16| {
+            let widest = items
+                .iter()
+                .map(|item| cells(field(item)))
+                .max()
+                .unwrap_or(0);
+            u16::try_from(widest.max(floor))
+                .unwrap_or(u16::MAX)
+                .min(cap)
+        };
+        let pin = u16::try_from(cells(pin_icon)).unwrap_or(1);
+        let selection = u16::try_from(cells(HIGHLIGHT)).unwrap_or(2);
+        // [workspace, agent, status]
+        let mut lengths = [
+            longest(|i| &i.location, 9, width / 4),
+            longest(|i| &i.kind, 5, width / 5),
+            longest(|i| &i.status, 6, width * 2 / 5),
+        ];
+        // Narrow popups take room from Status (whose middle details drop first), then the
+        // extra column gaps, then Agent, then Workspace, before the title goes below MIN_THREAD.
+        let mut gap = GAP;
+        let shortfall = |lengths: &[u16; 3], gap: u16| {
+            let used = selection + 1 + pin + 1 + 6 + 2 * gap + lengths.iter().sum::<u16>();
+            MIN_THREAD.saturating_sub(width.saturating_sub(used))
+        };
+        for step in [
+            Some((2, 20)),
+            None,
+            Some((1, 5)),
+            Some((0, 9)),
+            Some((2, 10)),
+        ] {
+            let short = shortfall(&lengths, gap);
+            if short == 0 {
+                break;
+            }
+            match step {
+                Some((column, floor)) => {
+                    let length = &mut lengths[column];
+                    *length = length.saturating_sub(short).max(floor.min(*length));
+                }
+                None => gap = 0,
+            }
+        }
+        let [workspace, agent, status] = lengths;
+        let constraints = [
+            Constraint::Length(1),
+            Constraint::Length(pin),
+            Constraint::Length(1),
+            Constraint::Fill(1),
+            Constraint::Length(workspace + gap),
+            Constraint::Length(agent + gap),
+            Constraint::Length(status),
+        ];
+        let split = Layout::horizontal(constraints)
+            .flex(Flex::Start)
+            .spacing(1)
+            .split(Rect::new(selection, 0, width.saturating_sub(selection), 1));
+        let room = |i: usize, gap: u16| usize::from(split[i].width.saturating_sub(gap));
+        Self {
+            constraints,
+            thread: room(3, 0),
+            workspace: room(4, gap),
+            agent: room(5, gap),
+            status: room(6, 0),
+        }
     }
-    let (head, marker) = text
-        .rsplit_once(" · ")
-        .map_or((text, String::new()), |(head, tail)| {
-            (head, format!(" · {tail}"))
-        });
-    let room = width.saturating_sub(marker.chars().count() + 1);
-    let kept: String = head.chars().take(room).collect();
-    format!("{kept}…{marker}").chars().take(width).collect()
+}
+
+/// Cuts `text` to `room` cells, ending in `…` when anything was cut.
+fn ellipsize(text: &str, room: usize) -> Cow<'_, str> {
+    if cells(text) <= room {
+        return Cow::Borrowed(text);
+    }
+    if room == 0 {
+        return Cow::Borrowed("");
+    }
+    let mut kept = String::new();
+    let mut used = 0;
+    for grapheme in Span::raw(text).styled_graphemes(Style::new()) {
+        let width = cells(grapheme.symbol);
+        if used + width + 1 > room {
+            break;
+        }
+        kept.push_str(grapheme.symbol);
+        used += width;
+    }
+    Cow::Owned(format!("{}…", kept.trim_end()))
+}
+
+/// The end of `text` that fits `room` cells, starting with `…` when the start was cut.
+fn tail(text: &str, room: usize) -> Cow<'_, str> {
+    if cells(text) <= room {
+        return Cow::Borrowed(text);
+    }
+    let starts: Vec<usize> = text.char_indices().map(|(at, _)| at).collect();
+    let fits = |at: usize| cells("…") + cells(&text[at..]) <= room;
+    let start = starts
+        .get(starts.partition_point(|&at| !fits(at)))
+        .copied()
+        .unwrap_or(text.len());
+    Cow::Owned(format!("…{}", &text[start..]))
+}
+
+/// Shortens a status, dropping middle details (like a countdown) before cutting the state
+/// word, and keeping its last part (`closed`, `stays open`) whole.
+fn fit_status(text: &str, room: usize) -> Cow<'_, str> {
+    if cells(text) <= room {
+        return Cow::Borrowed(text);
+    }
+    let parts: Vec<&str> = text.split(" · ").collect();
+    let (Some(head), Some(last)) = (parts.first(), parts.last()) else {
+        return ellipsize(text, room);
+    };
+    if parts.len() > 2 {
+        let short = format!("{head} · {last}");
+        if cells(&short) <= room {
+            return Cow::Owned(short);
+        }
+    }
+    if parts.len() == 1 {
+        return ellipsize(text, room);
+    }
+    let marker = format!(" · {last}");
+    if room < cells(&marker) + 2 {
+        return ellipsize(text, room);
+    }
+    Cow::Owned(format!(
+        "{}{marker}",
+        ellipsize(head, room - cells(&marker))
+    ))
 }
 
 fn row<'a>(
@@ -176,7 +354,7 @@ fn row<'a>(
     number: Option<usize>,
     tick: usize,
     pin_icon: &'a str,
-    status_width: u16,
+    columns: &Columns,
 ) -> Row<'a> {
     let number = match number {
         Some(n) if n <= 10 => (n % 10).to_string(),
@@ -188,18 +366,36 @@ fn row<'a>(
         Span::raw("")
     };
     let parked = item.park.is_some();
-    let (glyph, color) = match item.display {
-        _ if item.closed() => ("◌", Color::DarkGray),
-        _ if parked => ("○", Color::DarkGray),
-        Display::Working => (SPINNER[tick % SPINNER.len()], Color::Yellow),
-        Display::Blocked => ("◉", Color::Red),
-        Display::Done | Display::Unread(_) => ("●", Color::Cyan),
-        Display::Idle => ("✓", Color::Green),
-        Display::Unknown => ("○", Color::DarkGray),
+    let faint = Style::new().gray().dim();
+    let glyph = match item.display {
+        _ if item.closed() => Span::styled("◌", faint),
+        _ if parked => Span::styled("○", faint),
+        Display::Working => Span::from(SPINNER[tick % SPINNER.len()]).yellow(),
+        Display::Blocked => Span::from("◉").red(),
+        Display::Done => Span::from("●").cyan(),
+        Display::Unread(_) => Span::from("●").cyan().bold(),
+        Display::Idle => Span::from("✓").green(),
+        Display::Unknown => Span::styled("○", faint),
     };
-    let mut thread = vec![Span::from(item.label.as_str())];
-    if item.focused {
-        thread.push(Span::from(" (focused)").dim());
+    let needs_you = !parked && matches!(item.display, Display::Done | Display::Unread(_));
+    let suffix = if item.focused { " (focused)" } else { "" };
+    let (label, suffix) = if cells(&item.label) + cells(suffix) <= columns.thread {
+        (Cow::Borrowed(item.label.as_str()), suffix)
+    } else if columns.thread >= cells(suffix) + MIN_FOCUSED_LABEL {
+        (
+            ellipsize(&item.label, columns.thread - cells(suffix)),
+            suffix,
+        )
+    } else {
+        (ellipsize(&item.label, columns.thread), "")
+    };
+    let mut thread = vec![if needs_you {
+        Span::from(label).bold()
+    } else {
+        Span::from(label)
+    }];
+    if !suffix.is_empty() {
+        thread.push(Span::from(suffix).dim());
     }
     let status_style = match item.display {
         _ if parked => Style::new().dim(),
@@ -209,23 +405,19 @@ fn row<'a>(
         Display::Unread(Unread::Manual | Unread::Woke) => Style::new().cyan().bold(),
         Display::Idle | Display::Unknown => Style::new().dim(),
     };
-    let glyph_style = match item.display {
-        Display::Unread(_) if !parked => Style::new().fg(color).bold(),
-        _ => Style::new().fg(color),
-    };
-    let cells = [
+    let row_cells = [
         Cell::from(Span::from(number).blue()),
         Cell::from(pin),
-        Cell::from(Span::styled(glyph, glyph_style)),
+        Cell::from(glyph),
         Cell::from(Line::from(thread)),
-        Cell::from(Span::from(item.location.as_str()).dim()),
-        Cell::from(Span::from(item.kind.as_str()).dim()),
+        Cell::from(Span::from(ellipsize(&item.location, columns.workspace)).dim()),
+        Cell::from(Span::from(ellipsize(&item.kind, columns.agent)).dim()),
         Cell::from(Span::styled(
-            fit_status(&item.status, status_width),
+            fit_status(&item.status, columns.status),
             status_style,
         )),
     ];
-    let row = Row::new(cells);
+    let row = Row::new(row_cells);
     if parked {
         row.add_modifier(Modifier::DIM)
     } else {
@@ -260,7 +452,10 @@ fn draw_empty(frame: &mut Frame, picker: &Picker, area: Rect) {
     } else {
         (
             format!("No matches for \"{}\"", picker.filter()),
-            "esc clears the filter",
+            match picker.mode() {
+                Mode::Search => "^u clears the search",
+                Mode::Navigate => "esc clears the search",
+            },
         )
     };
     let top = area.y + area.height / 3;
@@ -285,14 +480,31 @@ fn hints(pairs: &[(&'static str, &'static str)]) -> Line<'static> {
     Line::from(spans)
 }
 
+/// Hints that fit `width`, dropping whole pairs in `droppable` order rather than cutting one.
+fn fitted_hints(
+    mut pairs: Vec<(&'static str, &'static str)>,
+    droppable: &[&str],
+    width: usize,
+) -> Line<'static> {
+    for key in droppable {
+        if hints(&pairs).width() <= width {
+            break;
+        }
+        pairs.retain(|(k, _)| k != key);
+    }
+    hints(&pairs)
+}
+
 fn enter_hint(picker: &Picker) -> Option<(&'static str, &'static str)> {
+    let row = picker.selected_row()?;
     match picker.selected() {
-        None if picker.selected_row().is_some() => picker
-            .filter()
-            .is_empty()
-            .then_some(("enter", "open/close")),
         Some(item) if item.closed() => Some(("enter", "reopen")),
-        _ => Some(("enter", "focus")),
+        Some(_) => Some(("enter", "focus")),
+        None if picker.filter().is_empty() => match picker.rows().get(row) {
+            Some(ListRow::Section { open: true, .. }) => Some(("enter", "close")),
+            _ => Some(("enter", "open")),
+        },
+        None => None,
     }
 }
 
@@ -305,10 +517,16 @@ fn cells(text: &str) -> usize {
 }
 
 fn rename_line(text: &str) -> Line<'static> {
+    let shown = if text.is_empty() {
+        Span::from("automatic title").dim().italic()
+    } else {
+        Span::raw(text.to_owned())
+    };
     Line::from(vec![
         Span::raw(" "),
         Span::from("rename").cyan().bold(),
-        Span::raw(format!(": {text}")),
+        Span::raw(": "),
+        shown,
         Span::raw("  enter"),
         Span::from(" save").dim(),
         Span::raw("  esc"),
@@ -316,69 +534,95 @@ fn rename_line(text: &str) -> Line<'static> {
     ])
 }
 
-fn prompt_line(picker: &Picker, width: usize) -> Option<Line<'static>> {
+/// `verb “label”punct options  esc cancel`, shortening the label, then dropping it, then
+/// `esc cancel`, so the options always show.
+fn labelled_prompt(
+    verb: Span<'static>,
+    label: &str,
+    punct: &'static str,
+    options: Vec<Span<'static>>,
+    width: usize,
+) -> Line<'static> {
+    let cancel = [Span::raw("  esc"), Span::from(" cancel").dim()];
+    let fixed: usize = 1
+        + verb.width()
+        + cells(punct)
+        + options.iter().map(Span::width).sum::<usize>()
+        + cancel.iter().map(Span::width).sum::<usize>();
+    let room = width.saturating_sub(fixed + cells(" “”"));
+    let quoted = if cells(label) <= room || room >= MIN_PROMPT_LABEL {
+        Some(ellipsize(label, room))
+    } else {
+        None
+    };
+    let mut spans = vec![Span::raw(" "), verb];
+    if let Some(label) = quoted {
+        spans.push(Span::raw(format!(" “{label}”")));
+    }
+    spans.push(Span::raw(punct));
+    spans.extend(options);
+    if Line::from(spans.clone()).width() + cancel.iter().map(Span::width).sum::<usize>() <= width {
+        spans.extend(cancel);
+    }
+    Line::from(spans)
+}
+
+/// The footer prompt, if one is open, and where the typing cursor sits in it.
+fn prompt_line(picker: &Picker, width: usize) -> Option<(Line<'static>, Option<usize>)> {
     if let Some(prompt) = picker.rename_prompt() {
-        let text = prompt.text.as_str();
-        let room = width.saturating_sub(rename_line("").width());
-        if cells(text) <= room {
-            return Some(rename_line(text));
-        }
-        let starts: Vec<usize> = text.char_indices().map(|(at, _)| at).collect();
-        let fits = |at: usize| cells("…") + cells(&text[at..]) <= room;
-        let start = starts
-            .get(starts.partition_point(|&at| !fits(at)))
-            .copied()
-            .unwrap_or(text.len());
-        return Some(rename_line(&format!("…{}", &text[start..])));
+        let room = width.saturating_sub(rename_line("").width() - cells("automatic title"));
+        let text = tail(&prompt.text, room);
+        let cursor = cells(" rename: ") + cells(&text);
+        return Some((rename_line(&text), Some(cursor)));
     }
     if let Some(prompt) = picker.forget_prompt() {
-        return Some(Line::from(vec![
-            Span::raw(" "),
-            Span::from("forget").red().bold(),
-            Span::raw(format!(" “{}”?  y", prompt.label)),
-            Span::from(" yes").dim(),
-            Span::raw("  esc"),
-            Span::from(" cancel").dim(),
-        ]));
+        let options = vec![Span::raw("  y"), Span::from(" yes").dim()];
+        let verb = Span::from("forget").red().bold();
+        return Some((
+            labelled_prompt(verb, &prompt.label, "?", options, width),
+            None,
+        ));
     }
     if let Some(prompt) = picker.snooze_prompt() {
-        let mut spans = vec![
-            Span::raw(" "),
-            Span::from("snooze").yellow().bold(),
-            Span::raw(format!(" “{}”", prompt.label)),
-        ];
-        for (i, label) in prompt.presets.iter().map(|p| p.label()).enumerate() {
-            spans.push(Span::raw(format!("  {}", i + 1)));
-            spans.push(Span::from(format!(" {label}")).dim());
-        }
-        spans.push(Span::raw("  esc"));
-        spans.push(Span::from(" cancel").dim());
-        return Some(Line::from(spans));
+        let options = prompt
+            .presets
+            .iter()
+            .enumerate()
+            .flat_map(|(i, preset)| {
+                [
+                    Span::raw(format!("  {}", i + 1)),
+                    Span::from(format!(" {}", preset.label())).dim(),
+                ]
+            })
+            .collect();
+        let verb = Span::from("snooze").yellow().bold();
+        return Some((
+            labelled_prompt(verb, &prompt.label, "", options, width),
+            None,
+        ));
     }
     None
 }
 
-fn footer_line(picker: &Picker, width: usize) -> Line<'static> {
+fn footer_line(picker: &Picker, width: usize) -> (Line<'static>, Option<usize>) {
     if let Some(message) = picker.message() {
-        return if picker.message_is_error() {
-            Line::from(vec![
+        let mark = if picker.message_is_error() {
+            vec![
                 Span::from(" ✗ ").red().bold(),
                 Span::from(message.to_owned()).red(),
-            ])
+            ]
         } else {
-            Line::from(vec![
-                Span::raw(" "),
-                Span::from(message.to_owned()).yellow(),
-            ])
+            vec![Span::from(" • ").blue(), Span::raw(message.to_owned())]
         };
+        return (Line::from(mark), None);
     }
-    if let Some(line) = prompt_line(picker, width) {
-        return line;
+    if let Some(prompt) = prompt_line(picker, width) {
+        return prompt;
     }
     let mut pairs: Vec<(&str, &str)> = enter_hint(picker).into_iter().collect();
-    match picker.mode() {
+    let line = match picker.mode() {
         Mode::Navigate => {
-            pairs.extend([("j/k", "move"), ("/", "filter")]);
+            pairs.extend([("j/k", "move"), ("/", "search")]);
             if let Some(item) = picker.selected() {
                 let parked = |section| item.park.is_some_and(|park| park.section() == section);
                 pairs.extend([
@@ -419,18 +663,22 @@ fn footer_line(picker: &Picker, width: usize) -> Line<'static> {
             if picker.filter().is_empty() {
                 pairs.push(("esc/q", "close"));
             } else {
-                pairs.extend([("esc", "clear filter"), ("q", "close")]);
+                pairs.extend([("esc", "clear search"), ("q", "close")]);
             }
             pairs.push(("1-9/0", "open"));
+            fitted_hints(pairs, &["1-9/0", "j/k", "/", "r", "p", "u", "U"], width)
         }
-        Mode::Search => pairs.extend([
-            ("esc", "done"),
-            ("^j/^k", "move"),
-            ("^u", "clear"),
-            ("^w", "delete word"),
-        ]),
-    }
-    hints(&pairs)
+        Mode::Search => {
+            pairs.extend([
+                ("esc", "done"),
+                ("^j/^k", "move"),
+                ("^u", "clear"),
+                ("^w", "delete word"),
+            ]);
+            fitted_hints(pairs, &["^w", "^u", "^j/^k"], width)
+        }
+    };
+    (line, None)
 }
 
 #[cfg(test)]
@@ -503,7 +751,7 @@ mod tests {
     fn navigate_layout_has_search_box_numbered_rows_and_triage_hints() {
         let (lines, _) = render(&mut picker(), 100, 14);
         assert!(lines[0].trim_start().starts_with('╭'));
-        assert!(lines[1].contains("❯ / to filter") && lines[1].contains("3/3"));
+        assert!(lines[1].contains("❯ / to search") && lines[1].trim_end().ends_with("3 │"));
         assert!(lines[2].trim_start().starts_with('╰'));
         assert!(
             ["#", "Thread", "Workspace", "Agent", "Status"]
@@ -698,7 +946,7 @@ mod tests {
             lines[1]
         );
         assert!(
-            lines[13].contains("esc clear filter  q close"),
+            lines[13].contains("esc clear search  q close"),
             "{}",
             lines[13]
         );
@@ -778,7 +1026,7 @@ mod tests {
         picker.inform("kept open: it is the last pane in its workspace".into());
         let (lines, _) = render(&mut picker, 110, 14);
         assert!(
-            lines[13].contains("kept open") && !lines[13].contains('✗'),
+            lines[13].contains("• kept open") && !lines[13].contains('✗'),
             "{}",
             lines[13]
         );
@@ -811,7 +1059,7 @@ mod tests {
         settled.park = Some(Park::Settled);
         let mut picker = Picker::new(vec![settled], None, &BTreeSet::new());
         let (lines, _) = render(&mut picker, 110, 14);
-        assert!(lines[13].contains("enter open/close"), "{}", lines[13]);
+        assert!(lines[13].contains("enter open"), "{}", lines[13]);
         assert!(
             !lines[13].contains("settle") && !lines[13].contains("pin"),
             "{}",
@@ -823,7 +1071,7 @@ mod tests {
         press(&mut picker, KeyCode::Char('k'));
         let (lines, _) = render(&mut picker, 110, 14);
         assert!(
-            !lines[13].contains("open/close"),
+            !lines[13].contains("enter open"),
             "sections stay open while filtered: {}",
             lines[13]
         );
@@ -906,7 +1154,11 @@ mod tests {
             &chrono::Utc,
         );
         let (lines, _) = render(&mut picker, 80, 14);
-        assert!(lines[13].contains("rename:   enter save"), "{}", lines[13]);
+        assert!(
+            lines[13].contains("rename: automatic title  enter save"),
+            "{}",
+            lines[13]
+        );
     }
 
     #[test]
@@ -922,6 +1174,217 @@ mod tests {
             "{}",
             lines[13]
         );
+    }
+
+    #[test]
+    fn narrow_footers_drop_whole_hints_but_keep_the_triage_keys_and_close() {
+        let mut picker = picker();
+        picker.set_undoable(true);
+        let (lines, _) = render(&mut picker, 80, 14);
+        let footer = lines[13].trim_end();
+        assert!(
+            footer.ends_with("esc/q close")
+                && footer.contains("enter focus  s settle  z snooze  u read")
+                && !footer.contains("1-9/0")
+                && !footer.contains("j/k"),
+            "{footer}"
+        );
+    }
+
+    #[test]
+    fn a_narrow_snooze_prompt_shortens_the_title_before_any_preset() {
+        let mut picker = picker();
+        press(&mut picker, KeyCode::Char('z'));
+        let (lines, _) = render(&mut picker, 100, 14);
+        assert!(
+            lines[13].contains("…”  1 1h") && lines[13].contains("5 next Mon 09:00  esc cancel"),
+            "{}",
+            lines[13]
+        );
+        let (lines, _) = render(&mut picker, 80, 14);
+        assert!(
+            lines[13].contains(" snooze  1 1h") && lines[13].contains("5 next Mon 09:00"),
+            "{}",
+            lines[13]
+        );
+    }
+
+    #[test]
+    fn a_long_forget_title_is_shortened_so_the_answer_shows() {
+        let mut gone = item(
+            "p2",
+            &"a very long thread title ".repeat(6),
+            Display::Idle,
+            "idle · closed",
+        );
+        gone.pane_id = None;
+        let mut picker = Picker::new(vec![gone], None, &BTreeSet::new());
+        press(&mut picker, KeyCode::Char('D'));
+        let (lines, _) = render(&mut picker, 80, 14);
+        assert!(
+            lines[13].contains("…”?  y yes  esc cancel"),
+            "{}",
+            lines[13]
+        );
+    }
+
+    #[test]
+    fn the_rename_prompt_puts_the_cursor_after_the_text() {
+        let mut picker = picker();
+        press(&mut picker, KeyCode::Char('r'));
+        let mut terminal = Terminal::new(TestBackend::new(100, 14)).unwrap();
+        terminal
+            .draw(|frame| draw(frame, &mut picker, 0, "P"))
+            .unwrap();
+        let cursor = terminal.get_cursor_position().unwrap();
+        assert_eq!((cursor.x, cursor.y), (1 + 9 + 14, 13));
+    }
+
+    #[test]
+    fn the_selected_row_is_never_dimmed() {
+        let mut settled = item("p3", "release notes", Display::Idle, "settled");
+        settled.park = Some(Park::Settled);
+        let mut picker = Picker::new(
+            vec![settled],
+            Some("p3"),
+            &BTreeSet::from([Section::Settled]),
+        );
+        let (lines, buffer) = render(&mut picker, 100, 14);
+        let y = lines.iter().position(|l| l.contains("release")).unwrap();
+        let x = lines[y]
+            .find("release")
+            .map(|byte| lines[y][..byte].chars().count())
+            .unwrap();
+        let cell = &buffer[(u16::try_from(x).unwrap(), u16::try_from(y).unwrap())];
+        assert!(!cell.modifier.contains(Modifier::DIM));
+    }
+
+    #[test]
+    fn opening_a_section_leaves_the_columns_where_they_were() {
+        let mut snoozed = item(
+            "p4",
+            "bench run",
+            Display::Idle,
+            "snoozed · 2h · stays open",
+        );
+        snoozed.park = Some(Park::Snoozed { until: NOW + 60 });
+        let open = item("p1", "api refactor", Display::Idle, "idle");
+        let list = vec![open, snoozed];
+        let (collapsed, _) = render(
+            &mut Picker::new(list.clone(), None, &BTreeSet::new()),
+            100,
+            14,
+        );
+        let (expanded, _) = render(
+            &mut Picker::new(list, None, &BTreeSet::from([Section::Snoozed])),
+            100,
+            14,
+        );
+        assert_eq!(collapsed[4], expanded[4]);
+        assert_eq!(collapsed[6], expanded[6]);
+    }
+
+    #[test]
+    fn the_rules_count_the_rows_beyond_the_screen() {
+        let many: Vec<Item> = (0..12)
+            .map(|i| {
+                item(
+                    &format!("p{i}"),
+                    &format!("agent {i}"),
+                    Display::Idle,
+                    "idle",
+                )
+            })
+            .collect();
+        let mut picker = Picker::new(many, None, &BTreeSet::new());
+        let (lines, _) = render(&mut picker, 100, 12);
+        assert!(lines[10].contains("↓ 8 more"), "{}", lines[10]);
+        assert!(!lines[5].contains("more"), "{}", lines[5]);
+        press(&mut picker, KeyCode::Char('k'));
+        let (lines, _) = render(&mut picker, 100, 12);
+        assert!(lines[5].contains("↑ 8 more"), "{}", lines[5]);
+        assert!(!lines[10].contains("more"), "{}", lines[10]);
+    }
+
+    #[test]
+    fn long_titles_end_in_an_ellipsis_and_keep_the_focus_mark() {
+        let mut long = item(
+            "p1",
+            &"a very long thread title that keeps going ".repeat(3),
+            Display::Idle,
+            "idle",
+        );
+        long.focused = true;
+        let mut picker = Picker::new(vec![long], None, &BTreeSet::new());
+        let (lines, _) = render(&mut picker, 80, 14);
+        assert!(lines[6].contains("… (focused)"), "{}", lines[6]);
+    }
+
+    #[test]
+    fn narrow_popups_give_the_title_room_before_hidden_statuses() {
+        let mut snoozed = item(
+            "p4",
+            "bench run",
+            Display::Idle,
+            "snoozed · 3h · stays open",
+        );
+        snoozed.park = Some(Park::Snoozed { until: NOW + 60 });
+        snoozed.location = "mobile · api".into();
+        let mut focused = item("p1", "migrate auth to OAuth", Display::Working, "working");
+        focused.focused = true;
+        focused.pinned = true;
+        let mut picker = Picker::new(vec![focused, snoozed], None, &BTreeSet::new());
+        let (lines, _) = render(&mut picker, 79, 14);
+        assert!(lines[6].contains("migrate auth to OAuth"), "{}", lines[6]);
+        let mut picker = Picker::new(
+            picker.items().to_vec(),
+            None,
+            &BTreeSet::from([Section::Snoozed]),
+        );
+        let (lines, _) = render(&mut picker, 79, 14);
+        assert!(lines[8].contains("snoozed · stays open"), "{}", lines[8]);
+    }
+
+    #[test]
+    fn statuses_drop_their_countdown_before_their_state() {
+        assert_eq!(
+            fit_status("snoozed · 2h · stays open", 20),
+            "snoozed · stays open"
+        );
+        let cut = fit_status("snoozed → tmrw 09:00 · stays open", 24);
+        assert!(
+            cut.starts_with("snoozed") && cut.ends_with("… · stays open"),
+            "{cut}"
+        );
+        assert_eq!(fit_status("blocked 3m", 20), "blocked 3m");
+    }
+
+    #[test]
+    fn the_no_match_hint_follows_the_mode() {
+        let mut picker = picker();
+        press(&mut picker, KeyCode::Char('/'));
+        press(&mut picker, KeyCode::Char('x'));
+        press(&mut picker, KeyCode::Char('q'));
+        let (lines, _) = render(&mut picker, 100, 14);
+        assert!(lines.iter().any(|l| l.contains("^u clears the search")));
+        assert!(!lines[13].contains("enter"), "{}", lines[13]);
+        press(&mut picker, KeyCode::Esc);
+        let (lines, _) = render(&mut picker, 100, 14);
+        assert!(lines.iter().any(|l| l.contains("esc clears the search")));
+    }
+
+    #[test]
+    fn threads_that_need_you_have_bold_titles() {
+        let (lines, buffer) = render(&mut picker(), 100, 14);
+        let at = |y: usize, word: &str| {
+            let x = lines[y]
+                .find(word)
+                .map(|byte| lines[y][..byte].chars().count())
+                .unwrap();
+            buffer[(u16::try_from(x).unwrap(), u16::try_from(y).unwrap())].modifier
+        };
+        assert!(at(7, "fix flaky").contains(Modifier::BOLD));
+        assert!(!at(6, "api refactor").contains(Modifier::BOLD));
     }
 
     #[test]
