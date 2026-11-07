@@ -239,8 +239,8 @@ struct Columns {
 
 impl Columns {
     /// Widths come from every thread, not just the rows on show, so opening a section or
-    /// typing a search leaves the columns where they are, unless the popup is too narrow
-    /// for the titles on show.
+    /// typing a search leaves the columns where they are. Only a popup too narrow for the
+    /// titles on show sizes Status to the statuses on show, so there those can move it.
     fn new(items: &[Item], shown: &[&Item], width: u16, pin_icon: &str) -> Self {
         let longest = |field: fn(&Item) -> &str, floor: usize, cap: u16| {
             let widest = items
@@ -267,20 +267,22 @@ impl Columns {
         };
         // First, Status gives back the room it keeps for statuses not on show, as far as the
         // titles on show need it.
-        let to_u16 = |cells: usize| u16::try_from(cells).unwrap_or(u16::MAX);
-        let shown_status = to_u16(shown.iter().map(|i| cells(&i.status)).max().unwrap_or(0));
-        let wanted = to_u16(
-            shown
-                .iter()
-                .map(|i| cells(&i.label) + if i.focused { cells(FOCUSED) } else { 0 })
-                .max()
-                .unwrap_or(0),
-        )
-        .clamp(MIN_THREAD, WIDE_THREAD);
-        let short = wanted.saturating_sub(thread_room(&lengths, gap));
-        lengths[2] = lengths[2]
-            .saturating_sub(short)
-            .max(shown_status.max(6).min(lengths[2]));
+        if !shown.is_empty() {
+            let to_u16 = |cells: usize| u16::try_from(cells).unwrap_or(u16::MAX);
+            let shown_status = to_u16(shown.iter().map(|i| cells(&i.status)).max().unwrap_or(0));
+            let wanted = to_u16(
+                shown
+                    .iter()
+                    .map(|i| cells(&i.label) + if i.focused { cells(FOCUSED) } else { 0 })
+                    .max()
+                    .unwrap_or(0),
+            )
+            .clamp(MIN_THREAD, WIDE_THREAD);
+            let short = wanted.saturating_sub(thread_room(&lengths, gap));
+            lengths[2] = lengths[2]
+                .saturating_sub(short)
+                .max(shown_status.max(6).min(lengths[2]));
+        }
         // Then narrow popups take room from Status (whose middle details drop first), the
         // extra column gaps, Agent and Workspace, before the title goes below MIN_THREAD.
         for step in [
@@ -564,9 +566,12 @@ fn cells(text: &str) -> usize {
         .sum()
 }
 
-fn rename_line(text: &str) -> Line<'static> {
+/// The rename prompt; `room` is what the title (or its placeholder) may take.
+fn rename_line(text: &str, room: usize) -> Line<'static> {
     let shown = if text.is_empty() {
-        Span::from("automatic title").dim().italic()
+        Span::from(ellipsize("automatic title", room).into_owned())
+            .dim()
+            .italic()
     } else {
         Span::raw(text.to_owned())
     };
@@ -621,7 +626,7 @@ fn prompt_line(picker: &Picker, width: usize) -> Option<(Line<'static>, Option<u
         let room = width.saturating_sub(cells(" rename: ") + cells("  enter save  esc cancel"));
         let text = tail(&prompt.text, room);
         let cursor = cells(" rename: ") + cells(&text);
-        return Some((rename_line(&text), Some(cursor)));
+        return Some((rename_line(&text, room), Some(cursor)));
     }
     if let Some(prompt) = picker.forget_prompt() {
         let options = vec![Span::raw("  y"), Span::from(" yes").dim()];
@@ -1206,6 +1211,12 @@ mod tests {
             "{}",
             lines[13]
         );
+        let (lines, _) = render(&mut picker, 40, 14);
+        assert!(
+            lines[13].contains("rename: auto…  enter save  esc cancel"),
+            "{}",
+            lines[13]
+        );
     }
 
     #[test]
@@ -1332,7 +1343,7 @@ mod tests {
     }
 
     #[test]
-    fn the_rules_count_the_rows_beyond_the_screen() {
+    fn the_rules_count_what_is_beyond_the_screen_both_ways() {
         let many: Vec<Item> = (0..12)
             .map(|i| {
                 item(
@@ -1418,6 +1429,13 @@ mod tests {
         let mut picker = Picker::new(list, Some("p1"), &BTreeSet::new());
         let (lines, _) = render(&mut picker, 100, 10);
         assert!(lines[8].contains("↓ 4 more"), "{lines:#?}");
+        press(&mut picker, KeyCode::Char('j'));
+        press(&mut picker, KeyCode::Char('j'));
+        let (lines, _) = render(&mut picker, 100, 9);
+        assert!(
+            lines[6].contains("settled · 4") && lines[5].contains("↑ 2 more"),
+            "{lines:#?}"
+        );
     }
 
     #[test]
@@ -1449,7 +1467,11 @@ mod tests {
         press(&mut picker, KeyCode::Char('q'));
         let (lines, _) = render(&mut picker, 100, 14);
         assert!(lines.iter().any(|l| l.contains("^u clears the search")));
-        assert!(!lines[13].contains("enter"), "{}", lines[13]);
+        assert!(
+            !lines[13].contains("enter") && !lines[13].contains("^j/^k"),
+            "{}",
+            lines[13]
+        );
         press(&mut picker, KeyCode::Esc);
         let (lines, _) = render(&mut picker, 100, 14);
         assert!(lines.iter().any(|l| l.contains("esc clears the search")));
