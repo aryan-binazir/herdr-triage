@@ -1,5 +1,5 @@
 //! Herdr plugins get no timers or daemons, so each wake deadline gets a detached sleeper process
-//! that syncs once the deadline has passed. One sleeper per store and deadline holds its lock file.
+//! that syncs once the deadline has passed.
 
 use std::fs;
 use std::io;

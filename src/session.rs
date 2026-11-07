@@ -29,7 +29,6 @@ pub struct Session {
     waker: Box<dyn FnMut(i64) -> io::Result<()>>,
 }
 
-/// What the picker shows.
 pub struct View {
     pub items: Vec<Item>,
     pub open_sections: BTreeSet<Section>,
@@ -57,7 +56,6 @@ struct Snapshot {
     rows: Vec<Row>,
     open_sections: BTreeSet<Section>,
     undoable: bool,
-    /// Why the sync's change left a pending snooze without a wake timer.
     wake_failed: Option<String>,
 }
 
@@ -112,7 +110,7 @@ impl Session {
 
     /// Focuses the next agent that needs you after the one in `invoked_from` (else the focused one).
     pub fn next(&mut self, invoked_from: Option<&str>) -> io::Result<()> {
-        let (snapshot, ()) = self.sync_with(false, |_, _, _| ())?;
+        let (snapshot, ()) = self.sync_and_serve(false, |_, _, _| ())?;
         let current = snapshot
             .agents
             .iter()
@@ -161,7 +159,7 @@ impl Session {
     }
 
     fn view_after(&mut self, edit: impl FnOnce(&mut State, &[Observed], i64)) -> io::Result<View> {
-        let (snapshot, ()) = self.sync_with(true, edit)?;
+        let (snapshot, ()) = self.sync_and_serve(true, edit)?;
         Ok(View {
             items: items(&snapshot, (self.clock)()),
             open_sections: snapshot.open_sections,
@@ -173,7 +171,7 @@ impl Session {
         &mut self,
         edit: impl FnOnce(&mut State, &[Observed], i64) -> Result<(String, After), Refusal>,
     ) -> io::Result<Outcome> {
-        let (snapshot, after) = self.sync_with(false, edit)?;
+        let (snapshot, after) = self.sync_and_serve(false, edit)?;
         let done = |key, notice| Outcome::Done {
             key,
             notice,
@@ -195,8 +193,7 @@ impl Session {
         Ok(outcome)
     }
 
-    /// Syncs, waiting for the store, then serves any hook requests left meanwhile.
-    fn sync_with<R>(
+    fn sync_and_serve<R>(
         &mut self,
         fetch_tabs: bool,
         edit: impl FnOnce(&mut State, &[Observed], i64) -> R,
@@ -211,7 +208,6 @@ impl Session {
         Ok(synced)
     }
 
-    /// Hooks that found the store busy left a request; whoever held it makes sure it is served.
     fn serve_sync_requests(&mut self) -> io::Result<()> {
         let mut failure = None;
         while self.store.sync_requested() {
@@ -224,8 +220,6 @@ impl Session {
         failure.map_or(Ok(()), Err)
     }
 
-    /// One sync under the store lock. A request taken here is covered by the read that follows.
-    /// The outer error is the store's; the inner one is Herdr's, after the store saved what it could.
     fn sync_once<R>(
         &mut self,
         wait: bool,
@@ -240,7 +234,6 @@ impl Session {
             return Ok(None);
         };
         for at in exit_checks {
-            // A failed waker only delays closing the thread until the next event.
             let _ = (self.waker)(at);
         }
         Ok(Some(synced.map(|(snapshot, edited)| {
@@ -262,10 +255,6 @@ impl Session {
         }
     }
 
-    /// Every transaction goes through here, so a snooze triage accepted gets its wake timer, and
-    /// nothing else does: deadlines pending more often after the change than before it are armed
-    /// once the change is saved, whatever the change returned. Also returns why arming failed.
-    /// A deadline one snooze leaves just as another takes it is not armed again; its timer runs.
     fn transact<T>(
         &mut self,
         wait: bool,
@@ -353,7 +342,6 @@ impl Session {
     }
 }
 
-/// What a transaction may use while it holds the store.
 struct Held<'a> {
     herdr: &'a mut Herdr,
     store: &'a Store,
@@ -366,7 +354,6 @@ impl Held<'_> {
     }
 }
 
-/// Deadlines pending after a change more often than before it.
 fn newly_pending(before: Vec<i64>, after: Vec<i64>) -> Vec<i64> {
     let mut counts: BTreeMap<i64, isize> = BTreeMap::new();
     for until in before {
@@ -381,7 +368,6 @@ fn newly_pending(before: Vec<i64>, after: Vec<i64>) -> Vec<i64> {
         .collect()
 }
 
-/// Returns the exit checks to arm alongside the sync, which they need even when publishing fails.
 fn sync_locked<R>(
     held: &mut Held,
     state: &mut State,
@@ -660,7 +646,6 @@ mod tests {
         ])
     }
 
-    /// A session on `fake` at a fixed time, and the wake deadlines it arms.
     fn connect(fake: &FakeHerdr) -> (Session, Rc<RefCell<Vec<i64>>>) {
         let armed = Rc::new(RefCell::new(Vec::new()));
         let record = armed.clone();
@@ -680,7 +665,6 @@ mod tests {
         Store::at(fake.state_dir())
     }
 
-    /// A hook fires once while Herdr handles `method`, finds the store busy and leaves a request.
     fn hook_fires_during(fake: &FakeHerdr, method: &str) {
         let store = store(fake);
         let mut fired = false;
