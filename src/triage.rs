@@ -694,11 +694,9 @@ impl State {
     }
 
     /// Decides, under the store lock, whether an intended close may still happen. The last pane of
-    /// a workspace stays open. Otherwise the parked thread must still be live on server
-    /// `generation`, and `look` (called only when that holds)
-    /// must show its pane alone, quiet and unchanged since the action. Sibling panes on one session
-    /// share a record whose counters and restore state flip between them, so such a pane is never
-    /// closed.
+    /// a workspace stays open. Otherwise the thread must still be parked and live on server
+    /// `generation`, and `look`, called only then, must show exactly one pane for it: the same
+    /// terminal, not working or blocked, and unchanged since the action unless Herdr is restoring it.
     pub fn confirm_close(
         &mut self,
         close: &Close,
@@ -1028,7 +1026,6 @@ pub fn next_attention<'a>(rows: &'a [Row], current: Option<&str>) -> Option<&'a 
         .copied()
 }
 
-/// Parks the thread, meaning to close the pane `closing` shows when its session can be resumed.
 fn park(record: &mut Record, seq: u64, park: Park, closing: Option<&Observed>) -> After {
     record.park = Some(park);
     record.unread = None;

@@ -402,8 +402,6 @@ fn close_session(
     snapshot: &Snapshot,
     close: &Close,
 ) -> io::Result<Option<String>> {
-    // Ask Herdr about the pane itself, under the lock: the agent may have started working since the
-    // action without any hook syncing yet.
     let closing = store.transact(|state| {
         let generation = herdr.server_generation();
         state.confirm_close(close, &generation, now(), || {
