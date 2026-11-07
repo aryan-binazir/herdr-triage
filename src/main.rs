@@ -23,7 +23,8 @@ use herdr::{Agent, Herdr, Tab, Workspace};
 use picker::{Effect, Item, Picker};
 use store::Store;
 use triage::{
-    Action, After, Observed, Park, Refusal, ReopenPlan, Row, Section, SessionRef, State, Thread,
+    Action, After, Close, Closing, Observed, Park, Refusal, ReopenPlan, Row, Section, SessionRef,
+    State, Thread,
 };
 
 const DEFAULT_PIN_ICON: &str = "\u{f435}";
@@ -171,10 +172,15 @@ fn read_herdr(herdr: &mut Herdr, fetch_tabs: bool) -> io::Result<HerdrView> {
 
 fn observe(agent: &Agent, workspaces: &[Workspace]) -> Observed {
     let session = agent.session();
+    let workspace = workspaces
+        .iter()
+        .find(|w| w.workspace_id == agent.workspace_id);
     Observed {
         key: agent.key(),
         pre_session_key: session.map(|_| agent.terminal_key()),
         pane_id: agent.pane_id.clone(),
+        terminal_id: agent.terminal_id.clone(),
+        workspace_panes: workspace.map_or(0, |w| w.pane_count),
         status: agent.agent_status,
         seq: agent.state_change_seq,
         focused: agent.focused,
@@ -185,10 +191,7 @@ fn observe(agent: &Agent, workspaces: &[Workspace]) -> Observed {
                 .or_else(|| agent.agent.clone()),
             cwd: agent.cwd.clone(),
             workspace_id: Some(agent.workspace_id.clone()),
-            workspace_label: workspaces
-                .iter()
-                .find(|w| w.workspace_id == agent.workspace_id)
-                .map(|w| w.label.clone()),
+            workspace_label: workspace.map(|w| w.label.clone()),
             session: session.map(|s| SessionRef {
                 source: s.source.clone(),
                 kind: s.kind.clone(),
@@ -379,7 +382,7 @@ fn carry_out(
             performed.key.clone_from(&key);
             match after {
                 After::Nothing => Ok(()),
-                After::ClosePane => close_session(herdr, store, &snapshot, &key)
+                After::ClosePane(close) => close_session(herdr, store, &snapshot, &close)
                     .map(|notice| performed.notice = notice),
                 After::Reopen(plan) => {
                     reopen(herdr, store, &snapshot, &plan).map(|()| performed.reopened = true)
@@ -397,61 +400,27 @@ fn close_session(
     herdr: &mut Herdr,
     store: &Store,
     snapshot: &Snapshot,
-    key: &str,
+    close: &Close,
 ) -> io::Result<Option<String>> {
-    let Some(agent) = snapshot.agents.iter().find(|agent| agent.key() == key) else {
-        return Ok(None);
-    };
-    let would_close_workspace = snapshot
-        .workspaces
-        .iter()
-        .find(|w| w.workspace_id == agent.workspace_id)
-        .is_none_or(|w| w.pane_count <= 1);
-    if would_close_workspace {
-        return Ok(Some(
-            "kept open: it is the last pane in its workspace".into(),
-        ));
-    }
-    // Ask Herdr about the pane itself, under the lock: the agent may have started working since the
-    // action without any hook syncing yet. Sibling panes on one session share a record whose
-    // counters and restore state flip between them, so such a pane is never closed.
-    let still_closable = store.transact(|state| -> io::Result<bool> {
-        let Some(record) = state.records.get(key).filter(|record| {
-            record.live
-                && record.missing_since.is_none()
-                && record.park.is_some()
-                && record.generation == herdr.server_generation()
-        }) else {
-            return Ok(false);
-        };
-        let restoring = record.restoring(now());
-        let current = herdr.agents()?;
-        let mut panes = current.iter().filter(|current| current.key() == key);
-        let quiet_since_action = match (panes.next(), panes.next()) {
-            (Some(pane), None) => {
-                pane.terminal_id == agent.terminal_id
-                    && !matches!(
-                        pane.agent_status,
-                        triage::Status::Working | triage::Status::Blocked
-                    )
-                    && (pane.state_change_seq == agent.state_change_seq || restoring)
-            }
-            _ => false,
-        };
-        if quiet_since_action {
-            state.closing(key, true);
-        }
-        Ok(quiet_since_action)
+    let closing = store.transact(|state| {
+        let generation = herdr.server_generation();
+        state.confirm_close(close, &generation, now(), || {
+            let agents = herdr.agents()?;
+            Ok(agents
+                .iter()
+                .map(|agent| observe(agent, &snapshot.workspaces))
+                .collect())
+        })
     })??;
-    if !still_closable {
-        return Ok(None);
+    match closing {
+        Closing::Close(pane) => {
+            let closed = herdr.close_pane(&pane);
+            store.transact(|state| state.report_close(close, closed.is_ok()))?;
+            closed.map(|()| None)
+        }
+        Closing::KeepOpen(notice) => Ok(Some(notice)),
+        Closing::Skip => Ok(None),
     }
-    if let Err(error) = herdr.close_pane(&agent.pane_id) {
-        store.transact(|state| state.closing(key, false))?;
-        return Err(error);
-    }
-    store.transact(|state| state.session_closed(key))?;
-    Ok(None)
 }
 
 fn reopen(
@@ -460,35 +429,30 @@ fn reopen(
     snapshot: &Snapshot,
     plan: &ReopenPlan,
 ) -> io::Result<()> {
-    if let Some(pane) = &plan.pending_pane
-        && plan.pending_generation.as_deref() == Some(herdr.server_generation().as_str())
+    let workspaces: Vec<&str> = snapshot
+        .workspaces
+        .iter()
+        .map(|w| w.workspace_id.as_str())
+        .collect();
+    let launch = plan.launch(&herdr.server_generation(), &workspaces);
+    if let Some(pane) = launch.focus
         && herdr.focus_pane(pane).is_ok()
     {
         return Ok(());
     }
-    let workspace = plan
-        .thread
-        .workspace_id
-        .as_deref()
-        .filter(|id| snapshot.workspaces.iter().any(|w| w.workspace_id == *id));
-    let cwd = plan
-        .thread
-        .cwd
-        .as_deref()
-        .filter(|dir| Path::new(dir).is_dir());
+    let cwd = launch.cwd.filter(|dir| Path::new(dir).is_dir());
     store.transact(|state| {
-        let pane = herdr.create_tab(workspace, cwd)?;
-        // Codex reports a resumed session only after its next turn; Herdr can know it now.
-        let launched = match (plan.thread.agent.as_deref(), &plan.thread.session) {
-            (Some("codex"), Some(session)) => herdr.report_codex_session(&pane, &session.value),
-            _ => Ok(()),
+        let pane = herdr.create_tab(launch.workspace, cwd)?;
+        let launched = match launch.codex_session {
+            Some(session) => herdr.report_codex_session(&pane, session),
+            None => Ok(()),
         }
-        .and_then(|()| herdr.run_command(&pane, &shell_command(&plan.argv)));
+        .and_then(|()| herdr.run_command(&pane, &shell_command(launch.argv)));
         if let Err(error) = launched {
             let _ = herdr.close_pane(&pane);
             return Err(error);
         }
-        state.reopening(&plan.key, &pane, &herdr.server_generation(), now());
+        state.report_reopen(plan, &pane, &herdr.server_generation(), now());
         Ok(())
     })?
 }
@@ -823,191 +787,26 @@ mod tests {
     }
 
     #[test]
-    fn snoozing_an_idle_resumable_agent_closes_its_pane_once() {
-        let fake = FakeHerdr::start(vec![resumable_agent("w1:p1", "idle", 3)]);
-        let (mut herdr, store) = connected(&fake);
-        let until = now() + 3600;
-        perform(
-            &mut herdr,
-            &store,
-            "session:claude:id:id-w1:p1",
-            Action::Snooze(until),
-        )
-        .unwrap();
-        assert_eq!(fake.take("pane.close"), [json!({"pane_id": "w1:p1"})]);
-    }
-
-    #[test]
-    fn hook_activity_between_settle_and_close_keeps_the_working_pane_open() {
-        let fake = FakeHerdr::start(vec![resumable_agent("w1:p1", "idle", 3)]);
+    fn a_close_herdr_refuses_leaves_the_thread_open_and_undo_does_not_reopen_it() {
+        let fake = FakeHerdr::start(vec![
+            resumable_agent("w1:p1", "idle", 3),
+            resumable_agent("w1:p2", "idle", 4),
+        ]);
         let (mut herdr, store) = connected(&fake);
         let key = "session:claude:id:id-w1:p1";
-        let (snapshot, after) = sync(&mut herdr, &store, false, |state, observed| {
-            state.apply(key, observed.first(), Action::ToggleSettle, now())
-        })
-        .unwrap();
-        assert_eq!(after.unwrap(), After::ClosePane);
-        fake.agents.lock().unwrap()[0]["agent_status"] = json!("working");
-        fake.agents.lock().unwrap()[0]["state_change_seq"] = json!(4);
-        sync(&mut herdr, &store, false, |_, _| ()).unwrap();
-        assert_eq!(store.transact(|s| s.records[key].park).unwrap(), None);
-        assert_eq!(
-            close_session(&mut herdr, &store, &snapshot, key).unwrap(),
-            None
-        );
-        assert!(fake.take("pane.close").is_empty());
-    }
+        *fake.fail_method.lock().unwrap() = Some("pane.close".into());
+        assert!(perform(&mut herdr, &store, key, Action::ToggleSettle).is_err());
+        *fake.fail_method.lock().unwrap() = None;
+        let row = store.transact(|state| state.ordered(&[])).unwrap();
+        assert!(row.is_empty(), "the thread is not listed as closed");
 
-    #[test]
-    fn hook_activity_between_snooze_and_close_keeps_the_working_pane_open() {
-        let fake = FakeHerdr::start(vec![resumable_agent("w1:p1", "idle", 3)]);
-        let (mut herdr, store) = connected(&fake);
-        let key = "session:claude:id:id-w1:p1";
-        let until = now() + 3600;
-        let (snapshot, after) = sync(&mut herdr, &store, false, |state, observed| {
-            state.apply(key, observed.first(), Action::Snooze(until), now())
-        })
-        .unwrap();
-        assert_eq!(after.unwrap(), After::ClosePane);
-        fake.agents.lock().unwrap()[0]["agent_status"] = json!("working");
-        fake.agents.lock().unwrap()[0]["state_change_seq"] = json!(4);
-        sync(&mut herdr, &store, false, |_, _| ()).unwrap();
-        assert_eq!(
-            store.transact(|s| s.records[key].park).unwrap(),
-            Some(Park::Snoozed { until })
-        );
-        assert_eq!(
-            close_session(&mut herdr, &store, &snapshot, key).unwrap(),
-            None
-        );
-        assert!(fake.take("pane.close").is_empty());
-    }
-
-    #[test]
-    fn herdr_restore_churn_between_settle_and_close_still_closes_the_idle_pane() {
-        let fake = FakeHerdr::start(vec![resumable_agent("w1:p1", "idle", 3)]);
-        let (mut herdr, store) = connected(&fake);
-        let key = "session:claude:id:id-w1:p1";
-        sync(&mut herdr, &store, false, |_, _| ()).unwrap();
-        store
-            .transact(|s| s.records.get_mut(key).unwrap().generation = "previous-server".into())
-            .unwrap();
-        let (snapshot, after) = sync(&mut herdr, &store, false, |state, observed| {
-            state.apply(key, observed.first(), Action::ToggleSettle, now())
-        })
-        .unwrap();
-        assert_eq!(after.unwrap(), After::ClosePane);
-        fake.agents.lock().unwrap()[0]["state_change_seq"] = json!(4);
-        sync(&mut herdr, &store, false, |_, _| ()).unwrap();
-        assert_eq!(
-            store.transact(|s| s.records[key].park).unwrap(),
-            Some(Park::Settled)
-        );
-        close_session(&mut herdr, &store, &snapshot, key).unwrap();
-        assert_eq!(fake.take("pane.close"), [json!({"pane_id": "w1:p1"})]);
-    }
-
-    #[test]
-    fn panes_sharing_a_session_stay_open_when_parked() {
-        for sibling in ["idle", "working"] {
-            let a = resumable_agent("w1:p1", "idle", 3);
-            let mut b = resumable_agent("w1:p2", sibling, 4);
-            b["agent_session"] = a["agent_session"].clone();
-            let fake = FakeHerdr::start(vec![a, b]);
-            let (mut herdr, store) = connected(&fake);
-            perform(
-                &mut herdr,
-                &store,
-                "session:claude:id:id-w1:p1",
-                Action::ToggleSettle,
-            )
-            .unwrap();
-            assert!(
-                fake.take("pane.close").is_empty(),
-                "closed beside a {sibling} sibling"
-            );
-        }
-    }
-
-    /// Panes A and B share one session. A is parked, then turns `status` with new activity before
-    /// the close, and a hook syncs B after A, so the shared record reads idle and maybe restoring.
-    fn close_after_a_sibling_hides_the_target_turning(action: Action, status: &str, restart: bool) {
-        let a = resumable_agent("w1:p1", "idle", 3);
-        let mut b = resumable_agent("w1:p2", "idle", 4);
-        b["agent_session"] = a["agent_session"].clone();
-        let fake = FakeHerdr::start(vec![a, b]);
-        let (mut herdr, store) = connected(&fake);
-        let key = "session:claude:id:id-w1:p1";
-        if restart {
-            sync(&mut herdr, &store, false, |_, _| ()).unwrap();
-        }
-        let (snapshot, after) = sync(&mut herdr, &store, false, |state, observed| {
-            state.apply(key, observed.first(), action, now())
-        })
-        .unwrap();
-        assert_eq!(after.unwrap(), After::ClosePane);
-        fake.agents.lock().unwrap()[0]["agent_status"] = json!(status);
-        fake.agents.lock().unwrap()[0]["state_change_seq"] = json!(5);
-        sync(&mut herdr, &store, false, |_, _| ()).unwrap();
-        close_session(&mut herdr, &store, &snapshot, key).unwrap();
-        assert!(fake.take("pane.close").is_empty(), "closed a {status} pane");
-    }
-
-    #[test]
-    fn a_snoozed_pane_that_starts_working_stays_open_whatever_its_sibling_shows() {
-        close_after_a_sibling_hides_the_target_turning(
-            Action::Snooze(now() + 3600),
-            "working",
-            false,
-        );
-    }
-
-    #[test]
-    fn a_settled_pane_that_starts_working_during_restore_stays_open_whatever_its_sibling_shows() {
-        close_after_a_sibling_hides_the_target_turning(Action::ToggleSettle, "working", true);
-    }
-
-    #[test]
-    fn a_settled_pane_that_blocks_during_restore_stays_open_whatever_its_sibling_shows() {
-        close_after_a_sibling_hides_the_target_turning(Action::ToggleSettle, "blocked", true);
-    }
-
-    #[test]
-    fn a_pane_that_finished_new_work_beside_a_sibling_stays_open() {
-        close_after_a_sibling_hides_the_target_turning(Action::ToggleSettle, "done", true);
-        close_after_a_sibling_hides_the_target_turning(Action::Snooze(now() + 3600), "done", true);
-    }
-
-    #[test]
-    fn a_pane_that_starts_working_before_any_hook_syncs_stays_open() {
-        let fake = FakeHerdr::start(vec![resumable_agent("w1:p1", "idle", 3)]);
-        let (mut herdr, store) = connected(&fake);
-        let key = "session:claude:id:id-w1:p1";
-        let (snapshot, after) = sync(&mut herdr, &store, false, |state, observed| {
-            state.apply(key, observed.first(), Action::ToggleSettle, now())
-        })
-        .unwrap();
-        assert_eq!(after.unwrap(), After::ClosePane);
-        fake.agents.lock().unwrap()[0]["agent_status"] = json!("working");
-        fake.agents.lock().unwrap()[0]["state_change_seq"] = json!(4);
-        close_session(&mut herdr, &store, &snapshot, key).unwrap();
-        assert!(fake.take("pane.close").is_empty());
-    }
-
-    #[test]
-    fn the_last_pane_of_a_workspace_stays_open_when_settled() {
-        let fake = FakeHerdr::start(vec![resumable_agent("w1:p1", "idle", 3)]);
-        fake.workspaces.lock().unwrap()[0]["pane_count"] = json!(1);
-        let (mut herdr, store) = connected(&fake);
-        let performed = perform(
-            &mut herdr,
-            &store,
-            "session:claude:id:id-w1:p1",
-            Action::ToggleSettle,
-        )
-        .unwrap();
-        assert!(performed.notice.unwrap().contains("last pane"));
-        assert!(fake.take("pane.close").is_empty());
+        fake.agents
+            .lock()
+            .unwrap()
+            .retain(|a| a["pane_id"] != "w1:p1");
+        let performed = carry_out(&mut herdr, &store, |state, _| state.undo(now())).unwrap();
+        assert!(!performed.reopened, "undo reopens only a pane it closed");
+        assert!(fake.take("tab.create").is_empty());
     }
 
     #[test]
@@ -1043,6 +842,14 @@ mod tests {
             "a pending reopen is focused, not repeated"
         );
         assert_eq!(fake.take("pane.focus"), [json!({"pane_id": "w1:p91"})]);
+
+        *fake.fail_method.lock().unwrap() = Some("pane.focus".into());
+        perform(&mut herdr, &store, key, Action::Reopen).unwrap();
+        assert_eq!(
+            fake.take("tab.create").len(),
+            1,
+            "a pending tab Herdr can no longer focus is launched again"
+        );
     }
 
     #[test]
@@ -1055,7 +862,6 @@ mod tests {
         let key = "session:claude:id:id-w1:p1";
         perform(&mut herdr, &store, key, Action::ToggleSettle).unwrap();
         assert_eq!(fake.take("pane.close"), [json!({"pane_id": "w1:p1"})]);
-        fake.agents.lock().unwrap().remove(0);
 
         let performed = carry_out(&mut herdr, &store, |state, _| state.undo(now())).unwrap();
         assert!(performed.reopened);
@@ -1207,29 +1013,6 @@ mod tests {
             1,
             "the retry opens a fresh tab"
         );
-    }
-
-    #[test]
-    fn a_pending_reopen_from_another_server_is_not_focused() {
-        let fake = FakeHerdr::start(vec![
-            resumable_agent("w1:p1", "idle", 3),
-            resumable_agent("w1:p2", "idle", 4),
-        ]);
-        let (mut herdr, store) = connected(&fake);
-        let key = "session:claude:id:id-w1:p1";
-        perform(&mut herdr, &store, key, Action::ToggleSettle).unwrap();
-        perform(&mut herdr, &store, key, Action::Reopen).unwrap();
-        store
-            .transact(|state| {
-                let record = state.records.get_mut(key).unwrap();
-                record.live = false;
-                record.reopen_generation = Some("an earlier server".into());
-            })
-            .unwrap();
-        fake.take("tab.create");
-        perform(&mut herdr, &store, key, Action::Reopen).unwrap();
-        assert!(fake.take("pane.focus").is_empty());
-        assert_eq!(fake.take("tab.create").len(), 1);
     }
 
     #[test]

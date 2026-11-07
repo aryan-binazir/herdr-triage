@@ -56,7 +56,14 @@ impl FakeHerdr {
                 }
                 let request: Value = serde_json::from_str(&line).unwrap();
                 let params = &request["params"];
-                let result = match request["method"].as_str().unwrap() {
+                // A refused request leaves Herdr as it was.
+                let failing = fail.lock().unwrap().as_deref() == request["method"].as_str();
+                let method = if failing {
+                    ""
+                } else {
+                    request["method"].as_str().unwrap()
+                };
+                let result = match method {
                     "agent.list" => {
                         std::thread::sleep(*list_delay.lock().unwrap());
                         json!({"type": "agent_list", "agents": *agents.lock().unwrap()})
@@ -93,7 +100,7 @@ impl FakeHerdr {
                     std::fs::write(path, b"").unwrap();
                 }
                 requests.lock().unwrap().push(request.clone());
-                let reply = if fail.lock().unwrap().as_deref() == request["method"].as_str() {
+                let reply = if failing {
                     json!({"id": request["id"], "error": {"code": "failed", "message": "injected"}})
                 } else {
                     json!({"id": request["id"], "result": result})
