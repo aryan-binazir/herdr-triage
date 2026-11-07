@@ -214,11 +214,16 @@ impl Herdr {
             .map(drop)
     }
 
-    pub fn report_codex_session(&mut self, pane_id: &str, session_id: &str) -> io::Result<()> {
+    pub fn report_session(
+        &mut self,
+        pane_id: &str,
+        agent: &str,
+        session_id: &str,
+    ) -> io::Result<()> {
         let params = json!({
             "pane_id": pane_id,
-            "source": "herdr:codex",
-            "agent": "codex",
+            "source": format!("herdr:{agent}"),
+            "agent": agent,
             "agent_session_id": session_id,
             "session_start_source": "resume",
         });
