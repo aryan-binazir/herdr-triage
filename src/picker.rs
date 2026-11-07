@@ -425,9 +425,7 @@ impl Picker {
         }
         self.entries = entries;
         self.selected = self.selected.min(self.entries.len().saturating_sub(1));
-        (!self.filter.is_empty())
-            .then(|| matches.first().copied())
-            .flatten()
+        matches.first().copied().filter(|_| !self.filter.is_empty())
     }
 
     fn agents_on_screen(&self) -> Vec<usize> {

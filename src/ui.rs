@@ -15,12 +15,13 @@ const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "�
 const HIGHLIGHT: &str = "▎ ";
 /// Blank cells after Workspace and Agent, so the last three columns read apart.
 const GAP: u16 = 1;
-/// The fewest title cells worth quoting in a prompt.
-const MIN_PROMPT_LABEL: usize = 8;
-/// The fewest title cells worth keeping ` (focused)` for; below this the title gets the room.
-const MIN_FOCUSED_LABEL: usize = 16;
+/// The fewest title cells worth showing beside ` (focused)` or quoting in a prompt.
+const MIN_LABEL: usize = 8;
 /// Thread cells kept before Status, Workspace and Agent give up theirs.
 const MIN_THREAD: u16 = 24;
+/// The most Thread cells Status gives up from the room it keeps for rows not on show.
+const WIDE_THREAD: u16 = 40;
+const FOCUSED: &str = " (focused)";
 
 pub fn draw(frame: &mut Frame, picker: &mut Picker, tick: usize, pin_icon: &str) {
     let area = frame.area().inner(Margin::new(1, 0));
@@ -37,34 +38,17 @@ pub fn draw(frame: &mut Frame, picker: &mut Picker, tick: usize, pin_icon: &str)
 
     draw_search(frame, picker, search);
 
-    // Widths come from every thread, not just the rows on show, so opening a section or
-    // typing a search never shifts the columns.
-    let columns = Columns::new(picker.items(), area.width, pin_icon);
-    let number_heading = if picker.mode() == Mode::Search {
-        ""
-    } else {
-        "#"
-    };
-    let header = Table::new(Vec::<Row>::new(), columns.constraints)
-        .header(
-            Row::new([
-                number_heading,
-                "",
-                "",
-                "Thread",
-                "Workspace",
-                "Agent",
-                "Status",
-            ])
-            .dim(),
-        )
-        .highlight_symbol(HIGHLIGHT)
-        .highlight_spacing(HighlightSpacing::Always)
-        .column_spacing(1);
-    frame.render_widget(header, heading);
-
     let rows = picker.rows();
-    let row_count = rows.len();
+    let shown: Vec<&Item> = rows
+        .iter()
+        .filter_map(|row| match row {
+            ListRow::Agent(item) => Some(*item),
+            ListRow::Section { .. } => None,
+        })
+        .collect();
+    let columns = Columns::new(picker.items(), &shown, area.width, pin_icon);
+    draw_heading(frame, picker, &columns, heading);
+
     let (above, below) = if rows.is_empty() {
         draw_empty(frame, picker, list);
         (0, 0)
@@ -103,12 +87,13 @@ pub fn draw(frame: &mut Frame, picker: &mut Picker, tick: usize, pin_icon: &str)
             .with_offset(offset)
             .with_selected(picker.selected_row());
         frame.render_stateful_widget(table, list, &mut state);
-        let height = usize::from(list.height);
-        picker.set_viewport(state.offset(), height);
-        (
-            state.offset(),
-            row_count.saturating_sub(state.offset() + height),
-        )
+        let (offset, height) = (state.offset(), usize::from(list.height));
+        let hidden = (
+            threads(&rows[..offset.min(rows.len())]),
+            threads(rows.get(offset + height..).unwrap_or_default()),
+        );
+        picker.set_viewport(offset, height);
+        hidden
     };
     frame.render_widget(Paragraph::new(rule(top_rule.width, '↑', above)), top_rule);
     frame.render_widget(
@@ -127,7 +112,45 @@ pub fn draw(frame: &mut Frame, picker: &mut Picker, tick: usize, pin_icon: &str)
     }
 }
 
-/// A divider that says how many rows sit beyond it, when any do.
+fn draw_heading(frame: &mut Frame, picker: &Picker, columns: &Columns, area: Rect) {
+    let number_heading = if picker.mode() == Mode::Search {
+        ""
+    } else {
+        "#"
+    };
+    let header = Table::new(Vec::<Row>::new(), columns.constraints)
+        .header(
+            Row::new([
+                number_heading,
+                "",
+                "",
+                "Thread",
+                "Workspace",
+                "Agent",
+                "Status",
+            ])
+            .dim(),
+        )
+        .highlight_symbol(HIGHLIGHT)
+        .highlight_spacing(HighlightSpacing::Always)
+        .column_spacing(1);
+    frame.render_widget(header, area);
+}
+
+/// Threads in `rows`, counting those inside collapsed sections.
+fn threads(rows: &[ListRow]) -> usize {
+    rows.iter()
+        .map(|row| match row {
+            ListRow::Agent(_) => 1,
+            ListRow::Section {
+                count, open: false, ..
+            } => *count,
+            ListRow::Section { .. } => 0,
+        })
+        .sum()
+}
+
+/// A divider that says how many threads sit beyond it, when any do.
 fn rule(width: u16, arrow: char, hidden: usize) -> Line<'static> {
     let width = usize::from(width);
     if hidden == 0 {
@@ -215,7 +238,10 @@ struct Columns {
 }
 
 impl Columns {
-    fn new(items: &[Item], width: u16, pin_icon: &str) -> Self {
+    /// Widths come from every thread, not just the rows on show, so opening a section or
+    /// typing a search leaves the columns where they are, unless the popup is too narrow
+    /// for the titles on show.
+    fn new(items: &[Item], shown: &[&Item], width: u16, pin_icon: &str) -> Self {
         let longest = |field: fn(&Item) -> &str, floor: usize, cap: u16| {
             let widest = items
                 .iter()
@@ -234,13 +260,29 @@ impl Columns {
             longest(|i| &i.kind, 5, width / 5),
             longest(|i| &i.status, 6, width * 2 / 5),
         ];
-        // Narrow popups take room from Status (whose middle details drop first), then the
-        // extra column gaps, then Agent, then Workspace, before the title goes below MIN_THREAD.
         let mut gap = GAP;
-        let shortfall = |lengths: &[u16; 3], gap: u16| {
+        let thread_room = |lengths: &[u16; 3], gap: u16| {
             let used = selection + 1 + pin + 1 + 6 + 2 * gap + lengths.iter().sum::<u16>();
-            MIN_THREAD.saturating_sub(width.saturating_sub(used))
+            width.saturating_sub(used)
         };
+        // First, Status gives back the room it keeps for statuses not on show, as far as the
+        // titles on show need it.
+        let to_u16 = |cells: usize| u16::try_from(cells).unwrap_or(u16::MAX);
+        let shown_status = to_u16(shown.iter().map(|i| cells(&i.status)).max().unwrap_or(0));
+        let wanted = to_u16(
+            shown
+                .iter()
+                .map(|i| cells(&i.label) + if i.focused { cells(FOCUSED) } else { 0 })
+                .max()
+                .unwrap_or(0),
+        )
+        .clamp(MIN_THREAD, WIDE_THREAD);
+        let short = wanted.saturating_sub(thread_room(&lengths, gap));
+        lengths[2] = lengths[2]
+            .saturating_sub(short)
+            .max(shown_status.max(6).min(lengths[2]));
+        // Then narrow popups take room from Status (whose middle details drop first), the
+        // extra column gaps, Agent and Workspace, before the title goes below MIN_THREAD.
         for step in [
             Some((2, 20)),
             None,
@@ -248,7 +290,7 @@ impl Columns {
             Some((0, 9)),
             Some((2, 10)),
         ] {
-            let short = shortfall(&lengths, gap);
+            let short = MIN_THREAD.saturating_sub(thread_room(&lengths, gap));
             if short == 0 {
                 break;
             }
@@ -303,7 +345,8 @@ fn ellipsize(text: &str, room: usize) -> Cow<'_, str> {
         kept.push_str(grapheme.symbol);
         used += width;
     }
-    Cow::Owned(format!("{}…", kept.trim_end()))
+    let kept = kept.trim_end().trim_end_matches('·').trim_end();
+    Cow::Owned(format!("{kept}…"))
 }
 
 /// The end of `text` that fits `room` cells, starting with `…` when the start was cut.
@@ -311,13 +354,18 @@ fn tail(text: &str, room: usize) -> Cow<'_, str> {
     if cells(text) <= room {
         return Cow::Borrowed(text);
     }
-    let starts: Vec<usize> = text.char_indices().map(|(at, _)| at).collect();
-    let fits = |at: usize| cells("…") + cells(&text[at..]) <= room;
-    let start = starts
-        .get(starts.partition_point(|&at| !fits(at)))
-        .copied()
-        .unwrap_or(text.len());
-    Cow::Owned(format!("…{}", &text[start..]))
+    let span = Span::raw(text);
+    let graphemes: Vec<&str> = span
+        .styled_graphemes(Style::new())
+        .map(|grapheme| grapheme.symbol)
+        .collect();
+    let mut used = cells("…");
+    let mut start = graphemes.len();
+    while start > 0 && used + cells(graphemes[start - 1]) <= room {
+        start -= 1;
+        used += cells(graphemes[start]);
+    }
+    Cow::Owned(format!("…{}", graphemes[start..].concat()))
 }
 
 /// Shortens a status, dropping middle details (like a countdown) before cutting the state
@@ -378,10 +426,10 @@ fn row<'a>(
         Display::Unknown => Span::styled("○", faint),
     };
     let needs_you = !parked && matches!(item.display, Display::Done | Display::Unread(_));
-    let suffix = if item.focused { " (focused)" } else { "" };
+    let suffix = if item.focused { FOCUSED } else { "" };
     let (label, suffix) = if cells(&item.label) + cells(suffix) <= columns.thread {
         (Cow::Borrowed(item.label.as_str()), suffix)
-    } else if columns.thread >= cells(suffix) + MIN_FOCUSED_LABEL {
+    } else if columns.thread >= cells(suffix) + MIN_LABEL {
         (
             ellipsize(&item.label, columns.thread - cells(suffix)),
             suffix,
@@ -501,8 +549,8 @@ fn enter_hint(picker: &Picker) -> Option<(&'static str, &'static str)> {
         Some(item) if item.closed() => Some(("enter", "reopen")),
         Some(_) => Some(("enter", "focus")),
         None if picker.filter().is_empty() => match picker.rows().get(row) {
-            Some(ListRow::Section { open: true, .. }) => Some(("enter", "close")),
-            _ => Some(("enter", "open")),
+            Some(ListRow::Section { open: true, .. }) => Some(("enter", "collapse")),
+            _ => Some(("enter", "expand")),
         },
         None => None,
     }
@@ -550,7 +598,7 @@ fn labelled_prompt(
         + options.iter().map(Span::width).sum::<usize>()
         + cancel.iter().map(Span::width).sum::<usize>();
     let room = width.saturating_sub(fixed + cells(" “”"));
-    let quoted = if cells(label) <= room || room >= MIN_PROMPT_LABEL {
+    let quoted = if cells(label) <= room || room >= MIN_LABEL {
         Some(ellipsize(label, room))
     } else {
         None
@@ -570,7 +618,7 @@ fn labelled_prompt(
 /// The footer prompt, if one is open, and where the typing cursor sits in it.
 fn prompt_line(picker: &Picker, width: usize) -> Option<(Line<'static>, Option<usize>)> {
     if let Some(prompt) = picker.rename_prompt() {
-        let room = width.saturating_sub(rename_line("").width() - cells("automatic title"));
+        let room = width.saturating_sub(cells(" rename: ") + cells("  enter save  esc cancel"));
         let text = tail(&prompt.text, room);
         let cursor = cells(" rename: ") + cells(&text);
         return Some((rename_line(&text), Some(cursor)));
@@ -669,12 +717,11 @@ fn footer_line(picker: &Picker, width: usize) -> (Line<'static>, Option<usize>) 
             fitted_hints(pairs, &["1-9/0", "j/k", "/", "r", "p", "u", "U"], width)
         }
         Mode::Search => {
-            pairs.extend([
-                ("esc", "done"),
-                ("^j/^k", "move"),
-                ("^u", "clear"),
-                ("^w", "delete word"),
-            ]);
+            pairs.push(("esc", "done"));
+            if picker.selected_row().is_some() {
+                pairs.push(("^j/^k", "move"));
+            }
+            pairs.extend([("^u", "clear"), ("^w", "delete word")]);
             fitted_hints(pairs, &["^w", "^u", "^j/^k"], width)
         }
     };
@@ -1059,7 +1106,7 @@ mod tests {
         settled.park = Some(Park::Settled);
         let mut picker = Picker::new(vec![settled], None, &BTreeSet::new());
         let (lines, _) = render(&mut picker, 110, 14);
-        assert!(lines[13].contains("enter open"), "{}", lines[13]);
+        assert!(lines[13].contains("enter expand"), "{}", lines[13]);
         assert!(
             !lines[13].contains("settle") && !lines[13].contains("pin"),
             "{}",
@@ -1071,7 +1118,7 @@ mod tests {
         press(&mut picker, KeyCode::Char('k'));
         let (lines, _) = render(&mut picker, 110, 14);
         assert!(
-            !lines[13].contains("enter open"),
+            !lines[13].contains("enter"),
             "sections stay open while filtered: {}",
             lines[13]
         );
@@ -1335,7 +1382,11 @@ mod tests {
         focused.pinned = true;
         let mut picker = Picker::new(vec![focused, snoozed], None, &BTreeSet::new());
         let (lines, _) = render(&mut picker, 79, 14);
-        assert!(lines[6].contains("migrate auth to OAuth"), "{}", lines[6]);
+        assert!(
+            lines[6].contains("migrate auth to OAuth (focused)"),
+            "{}",
+            lines[6]
+        );
         let mut picker = Picker::new(
             picker.items().to_vec(),
             None,
@@ -1343,6 +1394,37 @@ mod tests {
         );
         let (lines, _) = render(&mut picker, 79, 14);
         assert!(lines[8].contains("snoozed · stays open"), "{}", lines[8]);
+    }
+
+    #[test]
+    fn the_rules_count_threads_not_rows() {
+        let mut open = item("p1", "api refactor", Display::Idle, "idle");
+        open.focused = true;
+        let parked: Vec<Item> = (2..6)
+            .map(|i| {
+                let mut settled = item(
+                    &format!("p{i}"),
+                    &format!("old {i}"),
+                    Display::Idle,
+                    "settled",
+                );
+                settled.park = Some(Park::Settled);
+                settled
+            })
+            .collect();
+        let mut snoozed = item("p9", "bench run", Display::Idle, "snoozed · 2h");
+        snoozed.park = Some(Park::Snoozed { until: NOW + 60 });
+        let list = [vec![open, snoozed], parked].concat();
+        let mut picker = Picker::new(list, Some("p1"), &BTreeSet::new());
+        let (lines, _) = render(&mut picker, 100, 10);
+        assert!(lines[8].contains("↓ 4 more"), "{lines:#?}");
+    }
+
+    #[test]
+    fn a_cut_search_keeps_whole_graphemes() {
+        assert_eq!(tail("xye\u{301}z", 3), "…e\u{301}z");
+        assert_eq!(tail("xye\u{301}z", 2), "…z");
+        assert_eq!(ellipsize("snoozed · 2h", 10), "snoozed…");
     }
 
     #[test]
