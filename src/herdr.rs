@@ -189,7 +189,6 @@ impl Herdr {
         self.call("pane.report_metadata", &params).map(drop)
     }
 
-    /// Installs the plugin's Agents view, hiding agents whose `triage_rank` is in `hidden_ranks`.
     pub fn set_view(&mut self, label: &str, hidden_ranks: &[&str]) -> io::Result<()> {
         let params = json!({
             "source": source(),

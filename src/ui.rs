@@ -769,8 +769,7 @@ mod tests {
         listed(&Fixture::new(NOW, &agents))
     }
 
-    /// Read and unparked, so it lists among the open threads.
-    fn closed(label: &str) -> Fixture {
+    fn read_closed(label: &str) -> Fixture {
         Fixture::new(NOW, &[("p2", label, Status::Done)])
             .close("p2")
             .act("p2", Action::ToggleUnread)
@@ -1040,7 +1039,7 @@ mod tests {
 
     #[test]
     fn search_hints_name_what_enter_does_for_the_selection() {
-        let mut picker = Picker::new(listed(&closed("old spike")), None, &BTreeSet::new());
+        let mut picker = Picker::new(listed(&read_closed("old spike")), None, &BTreeSet::new());
         press(&mut picker, KeyCode::Char('/'));
         let (lines, _) = render(&mut picker, 110, 14);
         assert!(lines[13].contains("enter reopen"), "{}", lines[13]);
@@ -1270,7 +1269,7 @@ mod tests {
 
     #[test]
     fn a_long_forget_title_is_shortened_so_the_answer_shows() {
-        let long = closed(&"a very long thread title ".repeat(6));
+        let long = read_closed(&"a very long thread title ".repeat(6));
         let mut picker = Picker::new(listed(&long), None, &BTreeSet::new());
         press(&mut picker, KeyCode::Char('D'));
         let (lines, _) = render(&mut picker, 80, 14);

@@ -5,7 +5,6 @@ use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::triage::{Action, Park, Refusal, Row, Section, SnoozePreset, snooze_presets};
 
-/// A thread as triage projects it, with where it runs.
 #[derive(Debug, Clone)]
 pub struct Item {
     pub row: Row,
@@ -570,7 +569,6 @@ impl Picker {
 
 #[cfg(test)]
 impl Item {
-    /// The fixture's threads as the picker lists them, statuses as of `now`.
     pub(crate) fn projected(fixture: &crate::triage::Fixture, now: i64) -> Vec<Item> {
         fixture
             .rows()
@@ -634,7 +632,6 @@ mod tests {
         .act("p1", Action::TogglePin)
     }
 
-    /// A pinned working agent, then a done and an idle one.
     fn items() -> Vec<Item> {
         listed(&three(Status::Working))
     }
@@ -643,7 +640,6 @@ mod tests {
         BTreeSet::new()
     }
 
-    /// A pinned working agent, one snoozed and two settled.
     fn shelf() -> Vec<Item> {
         let fixture = Fixture::new(
             NOW,
@@ -661,7 +657,6 @@ mod tests {
         listed(&fixture)
     }
 
-    /// A pinned working agent and the read, unparked closed thread "old spike".
     fn with_closed() -> Vec<Item> {
         let fixture = Fixture::new(
             NOW,

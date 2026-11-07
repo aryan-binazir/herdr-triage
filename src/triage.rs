@@ -256,7 +256,6 @@ pub enum Display {
 }
 
 impl Display {
-    /// Finished work you have not looked at, or a thread marked unread: `u` marks these read.
     pub fn unseen(self) -> bool {
         matches!(self, Display::Done | Display::Unread(_))
     }
@@ -269,7 +268,6 @@ pub enum Attention {
     Unseen,
 }
 
-/// Where a thread sorts, and the `triage_rank` token the sidebar sorts and hides it by.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Rank {
     Pinned,
@@ -290,7 +288,6 @@ impl Rank {
         }
     }
 
-    /// Parked threads stay out of the sidebar; the picker lists them.
     pub fn hidden(self) -> bool {
         matches!(self, Rank::Snoozed | Rank::Settled)
     }
@@ -419,7 +416,6 @@ impl Row {
         }
     }
 
-    /// The collapsed picker section the thread waits in, if any.
     pub fn section(&self) -> Option<Section> {
         match self.park {
             Some(park) => Some(park.section()),
@@ -1119,8 +1115,6 @@ fn park(record: &mut Record, seq: u64, park: Park, closing: Option<&Observed>) -
     }
 }
 
-/// Real triage state for the picker's and ui's tests, so the rows they draw are the rows triage
-/// projects.
 #[cfg(test)]
 pub(crate) struct Fixture {
     state: State,
@@ -1170,7 +1164,6 @@ impl Fixture {
         self
     }
 
-    /// Ends the agent's session, as if it exited half a minute ago.
     pub(crate) fn close(mut self, pane: &str) -> Self {
         self.agents.retain(|agent| agent.pane_id != pane);
         let gone = self.now - 30;
@@ -1180,7 +1173,6 @@ impl Fixture {
         self
     }
 
-    /// Each row with the pane it is live in.
     pub(crate) fn rows(&self) -> Vec<(Row, Option<String>)> {
         self.state
             .ordered(&self.agents)
@@ -1293,8 +1285,7 @@ mod tests {
         );
     }
 
-    /// Live rows of `agents` plus the closed thread "closed-unread", whose session ended unseen.
-    fn projected(state: &mut State, agents: &[Observed]) -> Vec<Row> {
+    fn beside_a_closed_unread_thread(state: &mut State, agents: &[Observed]) -> Vec<Row> {
         let gone = resumable("closed-unread", Status::Done, 1);
         state.reconcile(GEN, std::slice::from_ref(&gone), NOW - 20);
         state.reconcile(GEN, &[], NOW - 19);
@@ -1319,7 +1310,7 @@ mod tests {
             agent("settled", Status::Idle, 2),
         ];
         let mut state = State::default();
-        projected(&mut state, &agents);
+        beside_a_closed_unread_thread(&mut state, &agents);
         act(&mut state, &agents[1], Action::TogglePin).unwrap();
         act(&mut state, &agents[3], Action::Snooze(NOW + 60)).unwrap();
         act(&mut state, &agents[4], Action::ToggleSettle).unwrap();
@@ -1348,7 +1339,7 @@ mod tests {
             agent("snoozed-done", Status::Done, 2),
         ];
         let mut state = State::default();
-        projected(&mut state, &agents);
+        beside_a_closed_unread_thread(&mut state, &agents);
         act(&mut state, &agents[2], Action::ToggleUnread).unwrap();
         act(&mut state, &agents[5], Action::Snooze(NOW + 60)).unwrap();
         let rows = state.ordered(&agents);
@@ -1431,7 +1422,7 @@ mod tests {
             agent("idle", Status::Idle, 1),
         ];
         let mut state = State::default();
-        let rows = projected(&mut state, &agents);
+        let rows = beside_a_closed_unread_thread(&mut state, &agents);
         let actions = [
             Action::ToggleSettle,
             Action::ToggleUnread,
