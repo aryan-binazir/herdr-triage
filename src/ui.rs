@@ -9,7 +9,7 @@ use ratatui::widgets::{
 };
 
 use crate::picker::{Item, ListRow, Mode, Picker};
-use crate::triage::{Display, Section, Unread};
+use crate::triage::{Action, Attention, Display, Section, Unread};
 
 const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const HIGHLIGHT: &str = "▎ ";
@@ -273,7 +273,7 @@ impl Columns {
             let wanted = to_u16(
                 shown
                     .iter()
-                    .map(|i| cells(&i.label) + if i.focused { cells(FOCUSED) } else { 0 })
+                    .map(|i| cells(i.row.label()) + if i.focused { cells(FOCUSED) } else { 0 })
                     .max()
                     .unwrap_or(0),
             )
@@ -410,15 +410,15 @@ fn row<'a>(
         Some(n) if n <= 10 => (n % 10).to_string(),
         _ => String::new(),
     };
-    let pin = if item.pinned {
+    let pin = if item.row.pinned {
         Span::from(pin_icon).blue()
     } else {
         Span::raw("")
     };
-    let parked = item.park.is_some();
+    let parked = item.row.park.is_some();
     let faint = Style::new().gray().dim();
-    let glyph = match item.display {
-        _ if item.closed() => Span::styled("◌", faint),
+    let glyph = match item.row.display {
+        _ if !item.row.live() => Span::styled("◌", faint),
         _ if parked => Span::styled("○", faint),
         Display::Working => Span::from(SPINNER[tick % SPINNER.len()]).yellow(),
         Display::Blocked => Span::from("◉").red(),
@@ -427,19 +427,17 @@ fn row<'a>(
         Display::Idle => Span::from("✓").green(),
         Display::Unknown => Span::styled("○", faint),
     };
-    let needs_you = !parked && matches!(item.display, Display::Done | Display::Unread(_));
+    let unseen = item.row.attention() == Some(Attention::Unseen);
     let suffix = if item.focused { FOCUSED } else { "" };
-    let (label, suffix) = if cells(&item.label) + cells(suffix) <= columns.thread {
-        (Cow::Borrowed(item.label.as_str()), suffix)
+    let title = item.row.label();
+    let (label, suffix) = if cells(title) + cells(suffix) <= columns.thread {
+        (Cow::Borrowed(title), suffix)
     } else if columns.thread >= cells(suffix) + MIN_LABEL {
-        (
-            ellipsize(&item.label, columns.thread - cells(suffix)),
-            suffix,
-        )
+        (ellipsize(title, columns.thread - cells(suffix)), suffix)
     } else {
-        (ellipsize(&item.label, columns.thread), "")
+        (ellipsize(title, columns.thread), "")
     };
-    let mut thread = vec![if needs_you {
+    let mut thread = vec![if unseen {
         Span::from(label).bold()
     } else {
         Span::from(label)
@@ -447,7 +445,7 @@ fn row<'a>(
     if !suffix.is_empty() {
         thread.push(Span::from(suffix).dim());
     }
-    let status_style = match item.display {
+    let status_style = match item.row.display {
         _ if parked => Style::new().dim(),
         Display::Working => Style::new().yellow(),
         Display::Blocked => Style::new().red(),
@@ -548,7 +546,7 @@ fn fitted_hints(
 fn enter_hint(picker: &Picker) -> Option<(&'static str, &'static str)> {
     let row = picker.selected_row()?;
     match picker.selected() {
-        Some(item) if item.closed() => Some(("enter", "reopen")),
+        Some(item) if !item.row.live() => Some(("enter", "reopen")),
         Some(_) => Some(("enter", "focus")),
         None if picker.filter().is_empty() => match picker.rows().get(row) {
             Some(ListRow::Section { open: true, .. }) => Some(("enter", "collapse")),
@@ -677,7 +675,7 @@ fn footer_line(picker: &Picker, width: usize) -> (Line<'static>, Option<usize>) 
         Mode::Navigate => {
             pairs.extend([("j/k", "move"), ("/", "search")]);
             if let Some(item) = picker.selected() {
-                let parked = |section| item.park.is_some_and(|park| park.section() == section);
+                let parked = |section| item.row.park.is_some_and(|park| park.section() == section);
                 pairs.extend([
                     (
                         "s",
@@ -697,16 +695,16 @@ fn footer_line(picker: &Picker, width: usize) -> (Line<'static>, Option<usize>) 
                     ),
                     (
                         "u",
-                        if matches!(item.display, Display::Done | Display::Unread(_)) {
+                        if item.row.display.unseen() {
                             "read"
                         } else {
                             "unread"
                         },
                     ),
-                    ("p", if item.pinned { "unpin" } else { "pin" }),
+                    ("p", if item.row.pinned { "unpin" } else { "pin" }),
                     ("r", "rename"),
                 ]);
-                if item.closed() {
+                if item.row.refusal(Action::Forget).is_none() {
                     pairs.push(("D", "forget"));
                 }
             }
@@ -739,7 +737,7 @@ mod tests {
     use crate::picker::{Item, Picker};
     use std::collections::BTreeSet;
 
-    use crate::triage::{Display, Park, Section};
+    use crate::triage::{Action, Fixture, Section, Status};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -747,34 +745,51 @@ mod tests {
 
     const NOW: i64 = 1_793_710_800;
 
-    fn item(pane: &str, label: &str, display: Display, status: &str) -> Item {
-        Item {
-            pane_id: Some(pane.into()),
-            key: pane.into(),
-            label: label.into(),
-            location: "acme-api".into(),
-            kind: "claude".into(),
-            search: label.into(),
-            display,
-            park: None,
-            pinned: false,
-            status: status.into(),
-            focused: false,
+    fn listed(fixture: &Fixture) -> Vec<Item> {
+        Item::projected(fixture, NOW)
+    }
+
+    /// Pins each thread's status to the text these renders were first written against.
+    fn with_statuses(mut items: Vec<Item>, statuses: &[&str]) -> Vec<Item> {
+        assert_eq!(items.len(), statuses.len());
+        for (item, status) in items.iter_mut().zip(statuses) {
+            (*status).clone_into(&mut item.status);
         }
+        items
+    }
+
+    fn idle(count: usize) -> Vec<Item> {
+        let names: Vec<(String, String)> = (0..count)
+            .map(|i| (format!("p{i}"), format!("agent {i}")))
+            .collect();
+        let agents: Vec<(&str, &str, Status)> = names
+            .iter()
+            .map(|(pane, label)| (pane.as_str(), label.as_str(), Status::Idle))
+            .collect();
+        listed(&Fixture::new(NOW, &agents))
+    }
+
+    /// Read and unparked, so it lists among the open threads.
+    fn closed(label: &str) -> Fixture {
+        Fixture::new(NOW, &[("p2", label, Status::Done)])
+            .close("p2")
+            .act("p2", Action::ToggleUnread)
     }
 
     fn picker() -> Picker {
-        let mut pinned = item("p1", "api refactor", Display::Working, "working 4m");
-        pinned.pinned = true;
-        let mut settled = item("p3", "release notes", Display::Idle, "settled");
-        settled.park = Some(Park::Settled);
-        let mut focused = item("p2", "fix flaky test", Display::Done, "done 2m");
-        focused.focused = true;
-        Picker::new(
-            vec![pinned, focused, settled],
-            Some("p2"),
-            &BTreeSet::from([Section::Settled]),
+        let fixture = Fixture::new(
+            NOW,
+            &[
+                ("p1", "api refactor", Status::Working),
+                ("p2", "fix flaky test", Status::Done),
+                ("p3", "release notes", Status::Idle),
+            ],
         )
+        .act("p1", Action::TogglePin)
+        .act("p3", Action::ToggleSettle);
+        let mut items = with_statuses(listed(&fixture), &["working 4m", "done 2m", "settled"]);
+        items[1].focused = true;
+        Picker::new(items, Some("p2"), &BTreeSet::from([Section::Settled]))
     }
 
     fn render(
@@ -891,17 +906,7 @@ mod tests {
 
     #[test]
     fn digits_follow_the_rows_on_screen_after_scrolling() {
-        let many: Vec<Item> = (0..12)
-            .map(|i| {
-                item(
-                    &format!("p{i}"),
-                    &format!("agent {i}"),
-                    Display::Idle,
-                    "idle",
-                )
-            })
-            .collect();
-        let mut picker = Picker::new(many, None, &BTreeSet::new());
+        let mut picker = Picker::new(idle(12), None, &BTreeSet::new());
         press(&mut picker, KeyCode::Char('k'));
         let (lines, _) = render(&mut picker, 100, 12);
         let first = lines[6].clone();
@@ -945,17 +950,7 @@ mod tests {
 
     #[test]
     fn digits_past_the_rows_on_screen_do_nothing() {
-        let many: Vec<Item> = (0..12)
-            .map(|i| {
-                item(
-                    &format!("p{i}"),
-                    &format!("agent {i}"),
-                    Display::Idle,
-                    "idle",
-                )
-            })
-            .collect();
-        let mut picker = Picker::new(many, None, &BTreeSet::new());
+        let mut picker = Picker::new(idle(12), None, &BTreeSet::new());
         render(&mut picker, 100, 12);
         let five = KeyEvent::new(KeyCode::Char('5'), KeyModifiers::NONE);
         assert_eq!(
@@ -966,12 +961,18 @@ mod tests {
 
     #[test]
     fn collapsed_sections_show_a_count_and_no_number() {
-        let mut snoozed = item("p4", "bench run", Display::Idle, "snoozed → 14:30");
-        snoozed.park = Some(Park::Snoozed { until: NOW + 60 });
-        let mut settled = item("p3", "release notes", Display::Idle, "settled");
-        settled.park = Some(Park::Settled);
-        let open = item("p1", "api refactor", Display::Idle, "idle");
-        let mut picker = Picker::new(vec![open, snoozed, settled], None, &BTreeSet::new());
+        let fixture = Fixture::new(
+            NOW,
+            &[
+                ("p1", "api refactor", Status::Idle),
+                ("p4", "bench run", Status::Idle),
+                ("p3", "release notes", Status::Idle),
+            ],
+        )
+        .act("p4", Action::Snooze(NOW + 60))
+        .act("p3", Action::ToggleSettle);
+        let items = with_statuses(listed(&fixture), &["idle", "snoozed → 14:30", "settled"]);
+        let mut picker = Picker::new(items, None, &BTreeSet::new());
         let (lines, _) = render(&mut picker, 100, 14);
         assert!(
             lines[7].contains("▸ snoozed · 1") && !lines[7].contains('2'),
@@ -1006,10 +1007,16 @@ mod tests {
 
     #[test]
     fn closed_threads_are_marked_and_offer_reopen_and_forget() {
-        let mut gone = item("p2", "old spike", Display::Idle, "idle · closed");
-        gone.pane_id = None;
-        let live = item("p1", "api refactor", Display::Idle, "idle");
-        let mut picker = Picker::new(vec![live, gone], None, &BTreeSet::new());
+        let fixture = Fixture::new(
+            NOW,
+            &[
+                ("p1", "api refactor", Status::Idle),
+                ("p2", "old spike", Status::Done),
+            ],
+        )
+        .close("p2")
+        .act("p2", Action::ToggleUnread);
+        let mut picker = Picker::new(listed(&fixture), None, &BTreeSet::new());
         press(&mut picker, KeyCode::Char('j'));
         let (lines, _) = render(&mut picker, 110, 14);
         assert!(
@@ -1033,9 +1040,7 @@ mod tests {
 
     #[test]
     fn search_hints_name_what_enter_does_for_the_selection() {
-        let mut gone = item("p2", "old spike", Display::Idle, "idle · closed");
-        gone.pane_id = None;
-        let mut picker = Picker::new(vec![gone], None, &BTreeSet::new());
+        let mut picker = Picker::new(listed(&closed("old spike")), None, &BTreeSet::new());
         press(&mut picker, KeyCode::Char('/'));
         let (lines, _) = render(&mut picker, 110, 14);
         assert!(lines[13].contains("enter reopen"), "{}", lines[13]);
@@ -1043,14 +1048,10 @@ mod tests {
 
     #[test]
     fn long_status_text_keeps_its_closed_or_stays_open_marker() {
-        let mut parked = item(
-            "p1",
-            "bench run",
-            Display::Idle,
-            "snoozed → tmrw 09:00 · stays open",
-        );
-        parked.park = Some(Park::Snoozed { until: NOW + 60 });
-        let mut picker = Picker::new(vec![parked], None, &BTreeSet::from([Section::Snoozed]));
+        let fixture = Fixture::new(NOW, &[("p1", "bench run", Status::Idle)])
+            .act("p1", Action::Snooze(NOW + 60));
+        let parked = with_statuses(listed(&fixture), &["snoozed → tmrw 09:00 · stays open"]);
+        let mut picker = Picker::new(parked, None, &BTreeSet::from([Section::Snoozed]));
         let (lines, _) = render(&mut picker, 100, 14);
         assert!(
             lines.iter().any(|l| l.contains("· stays open")),
@@ -1060,14 +1061,10 @@ mod tests {
 
     #[test]
     fn narrow_popups_shorten_the_status_but_keep_its_marker() {
-        let mut parked = item(
-            "p1",
-            "bench run",
-            Display::Idle,
-            "snoozed → tmrw 09:00 · stays open",
-        );
-        parked.park = Some(Park::Snoozed { until: NOW + 60 });
-        let mut picker = Picker::new(vec![parked], None, &BTreeSet::from([Section::Snoozed]));
+        let fixture = Fixture::new(NOW, &[("p1", "bench run", Status::Idle)])
+            .act("p1", Action::Snooze(NOW + 60));
+        let parked = with_statuses(listed(&fixture), &["snoozed → tmrw 09:00 · stays open"]);
+        let mut picker = Picker::new(parked, None, &BTreeSet::from([Section::Snoozed]));
         let (lines, _) = render(&mut picker, 80, 14);
         assert!(lines[7].contains("… · stays open"), "{}", lines[7]);
     }
@@ -1086,20 +1083,24 @@ mod tests {
 
     #[test]
     fn toggle_hints_name_what_the_key_will_do() {
-        let mut settled = item("p1", "release notes", Display::Idle, "settled");
-        settled.park = Some(Park::Settled);
-        let mut snoozed = item("p2", "bench run", Display::Idle, "snoozed → 14:30");
-        snoozed.park = Some(Park::Snoozed { until: NOW + 60 });
-        let mut pinned_done = item("p3", "fix flaky test", Display::Done, "done 2m");
-        pinned_done.pinned = true;
+        let fixture = Fixture::new(
+            NOW,
+            &[
+                ("p1", "release notes", Status::Idle),
+                ("p2", "bench run", Status::Idle),
+                ("p3", "fix flaky test", Status::Done),
+            ],
+        )
+        .act("p1", Action::ToggleSettle)
+        .act("p2", Action::Snooze(NOW + 60))
+        .act("p3", Action::TogglePin);
         let open = BTreeSet::from([Section::Snoozed, Section::Settled]);
         for (focus, expected) in [
             ("p1", "s unsettle"),
             ("p2", "z wake"),
             ("p3", "u read  p unpin"),
         ] {
-            let list = vec![settled.clone(), snoozed.clone(), pinned_done.clone()];
-            let mut picker = Picker::new(list, Some(focus), &open);
+            let mut picker = Picker::new(listed(&fixture), Some(focus), &open);
             let (lines, _) = render(&mut picker, 140, 14);
             assert!(lines[13].contains(expected), "{focus}: {}", lines[13]);
         }
@@ -1107,9 +1108,9 @@ mod tests {
 
     #[test]
     fn a_selected_section_header_only_offers_what_works_on_it() {
-        let mut settled = item("p1", "release notes", Display::Idle, "settled");
-        settled.park = Some(Park::Settled);
-        let mut picker = Picker::new(vec![settled], None, &BTreeSet::new());
+        let fixture = Fixture::new(NOW, &[("p1", "release notes", Status::Idle)])
+            .act("p1", Action::ToggleSettle);
+        let mut picker = Picker::new(listed(&fixture), None, &BTreeSet::new());
         let (lines, _) = render(&mut picker, 110, 14);
         assert!(lines[13].contains("enter expand"), "{}", lines[13]);
         assert!(
@@ -1269,14 +1270,8 @@ mod tests {
 
     #[test]
     fn a_long_forget_title_is_shortened_so_the_answer_shows() {
-        let mut gone = item(
-            "p2",
-            &"a very long thread title ".repeat(6),
-            Display::Idle,
-            "idle · closed",
-        );
-        gone.pane_id = None;
-        let mut picker = Picker::new(vec![gone], None, &BTreeSet::new());
+        let long = closed(&"a very long thread title ".repeat(6));
+        let mut picker = Picker::new(listed(&long), None, &BTreeSet::new());
         press(&mut picker, KeyCode::Char('D'));
         let (lines, _) = render(&mut picker, 80, 14);
         assert!(
@@ -1300,10 +1295,10 @@ mod tests {
 
     #[test]
     fn the_selected_row_is_never_dimmed() {
-        let mut settled = item("p3", "release notes", Display::Idle, "settled");
-        settled.park = Some(Park::Settled);
+        let fixture = Fixture::new(NOW, &[("p3", "release notes", Status::Idle)])
+            .act("p3", Action::ToggleSettle);
         let mut picker = Picker::new(
-            vec![settled],
+            listed(&fixture),
             Some("p3"),
             &BTreeSet::from([Section::Settled]),
         );
@@ -1319,15 +1314,16 @@ mod tests {
 
     #[test]
     fn opening_a_section_leaves_the_columns_where_they_were() {
-        let mut snoozed = item(
-            "p4",
-            "bench run",
-            Display::Idle,
-            "snoozed · 2h · stays open",
-        );
-        snoozed.park = Some(Park::Snoozed { until: NOW + 60 });
-        let open = item("p1", "api refactor", Display::Idle, "idle");
-        let list = vec![open, snoozed];
+        let fixture = Fixture::new(
+            NOW,
+            &[
+                ("p1", "api refactor", Status::Idle),
+                ("p4", "bench run", Status::Idle),
+            ],
+        )
+        .act("p4", Action::Snooze(NOW + 2 * 3_600));
+        let list = listed(&fixture);
+        assert_eq!(list[1].status, "snoozed · 2h · stays open");
         let (collapsed, _) = render(
             &mut Picker::new(list.clone(), None, &BTreeSet::new()),
             100,
@@ -1344,17 +1340,7 @@ mod tests {
 
     #[test]
     fn the_rules_count_what_is_beyond_the_screen_both_ways() {
-        let many: Vec<Item> = (0..12)
-            .map(|i| {
-                item(
-                    &format!("p{i}"),
-                    &format!("agent {i}"),
-                    Display::Idle,
-                    "idle",
-                )
-            })
-            .collect();
-        let mut picker = Picker::new(many, None, &BTreeSet::new());
+        let mut picker = Picker::new(idle(12), None, &BTreeSet::new());
         let (lines, _) = render(&mut picker, 100, 12);
         assert!(lines[10].contains("↓ 8 more"), "{}", lines[10]);
         assert!(!lines[5].contains("more"), "{}", lines[5]);
@@ -1366,32 +1352,33 @@ mod tests {
 
     #[test]
     fn long_titles_end_in_an_ellipsis_and_keep_the_focus_mark() {
-        let mut long = item(
-            "p1",
-            &"a very long thread title that keeps going ".repeat(3),
-            Display::Idle,
-            "idle",
-        );
-        long.focused = true;
-        let mut picker = Picker::new(vec![long], None, &BTreeSet::new());
+        let title = "a very long thread title that keeps going ".repeat(3);
+        let mut long = listed(&Fixture::new(NOW, &[("p1", &title, Status::Idle)]));
+        long[0].focused = true;
+        let mut picker = Picker::new(long, None, &BTreeSet::new());
         let (lines, _) = render(&mut picker, 80, 14);
         assert!(lines[6].contains("… (focused)"), "{}", lines[6]);
     }
 
     #[test]
     fn narrow_popups_give_the_title_room_before_hidden_statuses() {
-        let mut snoozed = item(
-            "p4",
-            "bench run",
-            Display::Idle,
-            "snoozed · 3h · stays open",
+        let fixture = Fixture::new(
+            NOW,
+            &[
+                ("p1", "migrate auth to OAuth", Status::Working),
+                ("p4", "bench run", Status::Idle),
+            ],
+        )
+        .act("p1", Action::TogglePin)
+        .act("p4", Action::Snooze(NOW + 3 * 3_600));
+        let mut list = listed(&fixture);
+        assert_eq!(
+            [list[0].status.as_str(), list[1].status.as_str()],
+            ["working", "snoozed · 3h · stays open"]
         );
-        snoozed.park = Some(Park::Snoozed { until: NOW + 60 });
-        snoozed.location = "mobile · api".into();
-        let mut focused = item("p1", "migrate auth to OAuth", Display::Working, "working");
-        focused.focused = true;
-        focused.pinned = true;
-        let mut picker = Picker::new(vec![focused, snoozed], None, &BTreeSet::new());
+        list[0].focused = true;
+        "mobile · api".clone_into(&mut list[1].location);
+        let mut picker = Picker::new(list, None, &BTreeSet::new());
         let (lines, _) = render(&mut picker, 79, 14);
         assert!(
             lines[6].contains("migrate auth to OAuth (focused)"),
@@ -1409,23 +1396,33 @@ mod tests {
 
     #[test]
     fn the_rules_count_threads_not_rows() {
-        let mut open = item("p1", "api refactor", Display::Idle, "idle");
-        open.focused = true;
-        let parked: Vec<Item> = (2..6)
-            .map(|i| {
-                let mut settled = item(
-                    &format!("p{i}"),
-                    &format!("old {i}"),
-                    Display::Idle,
-                    "settled",
-                );
-                settled.park = Some(Park::Settled);
-                settled
-            })
-            .collect();
-        let mut snoozed = item("p9", "bench run", Display::Idle, "snoozed · 2h");
-        snoozed.park = Some(Park::Snoozed { until: NOW + 60 });
-        let list = [vec![open, snoozed], parked].concat();
+        let mut fixture = Fixture::new(
+            NOW,
+            &[
+                ("p1", "api refactor", Status::Idle),
+                ("p9", "bench run", Status::Idle),
+                ("p2", "old 2", Status::Idle),
+                ("p3", "old 3", Status::Idle),
+                ("p4", "old 4", Status::Idle),
+                ("p5", "old 5", Status::Idle),
+            ],
+        )
+        .act("p9", Action::Snooze(NOW + 2 * 3_600));
+        for pane in ["p2", "p3", "p4", "p5"] {
+            fixture = fixture.act(pane, Action::ToggleSettle);
+        }
+        let mut list = with_statuses(
+            listed(&fixture),
+            &[
+                "idle",
+                "snoozed · 2h",
+                "settled",
+                "settled",
+                "settled",
+                "settled",
+            ],
+        );
+        list[0].focused = true;
         let mut picker = Picker::new(list, Some("p1"), &BTreeSet::new());
         let (lines, _) = render(&mut picker, 100, 10);
         assert!(lines[8].contains("↓ 4 more"), "{lines:#?}");
@@ -1475,6 +1472,44 @@ mod tests {
         press(&mut picker, KeyCode::Esc);
         let (lines, _) = render(&mut picker, 100, 14);
         assert!(lines.iter().any(|l| l.contains("esc clears the search")));
+    }
+
+    #[test]
+    fn rows_show_the_status_triage_projects() {
+        let fixture = Fixture::new(
+            NOW,
+            &[
+                ("p1", "api refactor", Status::Blocked),
+                ("p2", "old spike", Status::Done),
+                ("p3", "release notes", Status::Idle),
+                ("p4", "bench run", Status::Idle),
+            ],
+        )
+        .close("p2")
+        .act("p3", Action::ToggleSettle)
+        .act("p4", Action::Snooze(NOW + 3_600));
+        let open = BTreeSet::from([Section::Snoozed, Section::Settled]);
+        let mut picker = Picker::new(listed(&fixture), None, &open);
+        let (lines, buffer) = render(&mut picker, 100, 14);
+        let shown = |label: &str| lines.iter().position(|l| l.contains(label)).unwrap();
+        for (label, status) in [
+            ("api refactor", "blocked"),
+            ("old spike", "unread · closed"),
+            ("bench run", "snoozed · 1h · stays open"),
+            ("release notes", "settled · stays open"),
+        ] {
+            let line = &lines[shown(label)];
+            assert!(line.trim_end().ends_with(status), "{line}");
+        }
+        let y = shown("old spike");
+        let x = lines[y].find("old spike").unwrap();
+        let x = u16::try_from(lines[y][..x].chars().count()).unwrap();
+        assert!(
+            buffer[(x, u16::try_from(y).unwrap())]
+                .modifier
+                .contains(Modifier::BOLD),
+            "a closed thread with unseen results still needs you"
+        );
     }
 
     #[test]

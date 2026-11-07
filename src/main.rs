@@ -23,8 +23,8 @@ use herdr::{Agent, Herdr, Tab, Workspace};
 use picker::{Effect, Item, Picker};
 use store::Store;
 use triage::{
-    Action, After, Close, Closing, Observed, Park, Refusal, ReopenPlan, Row, Section, SessionRef,
-    State, Thread,
+    Action, After, Close, Closing, Observed, Park, Rank, Refusal, ReopenPlan, Row, Section,
+    SessionRef, State, Thread, UNTITLED,
 };
 
 const DEFAULT_PIN_ICON: &str = "\u{f435}";
@@ -209,7 +209,7 @@ fn publish(herdr: &mut Herdr, agents: &[Agent], rows: &[Row], now: i64) -> io::R
             continue;
         };
         let agent = &agents[index];
-        let rank = row.rank().to_string();
+        let rank = row.rank().token().to_owned();
         let label = row.sidebar_label(&pin_icon, now, &Local);
         if agent.tokens.get("triage_rank") == Some(&rank)
             && agent.tokens.get("triage") == label.as_ref()
@@ -224,15 +224,13 @@ fn publish(herdr: &mut Herdr, agents: &[Agent], rows: &[Row], now: i64) -> io::R
             failure.get_or_insert(error);
         }
     }
-    let view = herdr.set_view(&view_label(rows));
+    let view = herdr.set_view(&view_label(rows), &Rank::hidden_tokens());
     failure.map_or(view, Err)
 }
 
 fn view_label(rows: &[Row]) -> String {
-    let count =
-        |want: fn(Park) -> bool| rows.iter().filter(|row| row.park.is_some_and(want)).count();
-    let snoozed = count(|park| matches!(park, Park::Snoozed { .. }));
-    let settled = count(|park| park == Park::Settled);
+    let count = |rank| rows.iter().filter(|row| row.rank() == rank).count();
+    let (snoozed, settled) = (count(Rank::Snoozed), count(Rank::Settled));
     // Herdr right-aligns the label after its own "agents" title, so it has to stay short.
     match (snoozed, settled) {
         (0, 0) => "triage".into(),
@@ -621,11 +619,6 @@ fn items(snapshot: &Snapshot) -> Vec<Item> {
         .iter()
         .map(|row| {
             let agent = row.agent_index.map(|index| &snapshot.agents[index]);
-            let label = match &row.title {
-                Some(title) => title.clone(),
-                None if row.thread.label.is_empty() => "Untitled thread".into(),
-                None => row.thread.label.clone(),
-            };
             let location = match agent {
                 Some(agent) => location(agent, &snapshot.workspaces, &snapshot.tabs),
                 None => row
@@ -641,16 +634,16 @@ fn items(snapshot: &Snapshot) -> Vec<Item> {
             let cwd = row.thread.cwd.as_deref().unwrap_or_default();
             Item {
                 pane_id: agent.map(|agent| agent.pane_id.clone()),
-                key: row.key.clone(),
-                search: format!("{kind} {label} {} {location} {cwd}", row.thread.label),
-                label,
+                search: format!(
+                    "{kind} {} {} {location} {cwd}",
+                    row.label(),
+                    row.thread.label
+                ),
                 location,
                 kind,
-                display: row.display,
-                park: row.park,
-                pinned: row.pinned,
                 status: row.status_text(now),
                 focused: agent.is_some_and(|agent| agent.focused),
+                row: row.clone(),
             }
         })
         .collect()
@@ -683,7 +676,7 @@ fn thread_label(agent: &Agent) -> String {
             rest.trim_start_matches(|c: char| c.is_whitespace() || "-—·:".contains(c))
         });
     if stripped.is_empty() || stripped == "-" {
-        "Untitled thread".into()
+        UNTITLED.into()
     } else {
         stripped.into()
     }
