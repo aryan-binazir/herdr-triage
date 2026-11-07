@@ -380,11 +380,14 @@ impl Picker {
 
     fn set_filter(&mut self, filter: String) {
         self.filter = filter;
-        self.refilter();
-        self.selected = 0;
+        let best = self.refilter();
+        self.selected = best
+            .and_then(|i| self.entries.iter().position(|&e| e == Entry::Agent(i)))
+            .unwrap_or(0);
     }
 
-    fn refilter(&mut self) {
+    /// Rebuilds the rows and returns the best match of a non-empty search.
+    fn refilter(&mut self) -> Option<usize> {
         let matches: Vec<usize> = if self.filter.is_empty() {
             (0..self.items.len()).collect()
         } else {
@@ -422,6 +425,7 @@ impl Picker {
         }
         self.entries = entries;
         self.selected = self.selected.min(self.entries.len().saturating_sub(1));
+        matches.first().copied().filter(|_| !self.filter.is_empty())
     }
 
     fn agents_on_screen(&self) -> Vec<usize> {
@@ -506,6 +510,10 @@ impl Picker {
 
     pub fn total(&self) -> usize {
         self.items.len()
+    }
+
+    pub fn items(&self) -> &[Item] {
+        &self.items
     }
 
     pub fn mode(&self) -> Mode {
@@ -950,6 +958,35 @@ mod tests {
             press(&mut picker, KeyCode::Char(c));
         }
         assert_eq!(layout(&picker), ["Settled:1:true", "p3"]);
+    }
+
+    #[test]
+    fn a_search_selects_its_best_match_even_inside_a_section() {
+        let mut picker = Picker::new(shelf(), None, &closed_sections());
+        press(&mut picker, KeyCode::Char('/'));
+        for c in "notes".chars() {
+            press(&mut picker, KeyCode::Char(c));
+        }
+        assert_eq!(
+            picker.selected().map(|item| item.label.as_str()),
+            Some("release notes")
+        );
+
+        let weak = Item {
+            search: "claude migrate auth sandboxes/ui/acme-api".into(),
+            ..item("p1", "migrate auth", Display::Idle)
+        };
+        let strong = item("p2", "bump postgres", Display::Working);
+        let mut picker = Picker::new(vec![weak, strong], None, &closed_sections());
+        press(&mut picker, KeyCode::Char('/'));
+        for c in "bump".chars() {
+            press(&mut picker, KeyCode::Char(c));
+        }
+        assert_eq!(layout(&picker), ["p1", "Working:1:true", "p2"]);
+        assert_eq!(
+            press(&mut picker, KeyCode::Enter),
+            Effect::Focus("p2".into())
+        );
     }
 
     #[test]
