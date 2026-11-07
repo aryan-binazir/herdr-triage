@@ -66,6 +66,9 @@ pub struct Observed {
     pub key: String,
     pub pre_session_key: Option<String>,
     pub pane_id: String,
+    pub terminal_id: String,
+    /// Panes in the agent's workspace; 0 when Herdr did not list the workspace.
+    pub workspace_panes: usize,
     pub status: Status,
     pub seq: u64,
     pub focused: bool,
@@ -153,7 +156,7 @@ impl Record {
     }
 
     /// Herdr relaunches restored agents after a restart; their churn then is not new activity.
-    pub fn restoring(&self, now: i64) -> bool {
+    fn restoring(&self, now: i64) -> bool {
         self.restored_at
             .is_some_and(|at| now - at < RESTORE_SETTLE_SECS)
     }
@@ -278,17 +281,76 @@ pub struct Refusal(pub String);
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum After {
     Nothing,
-    ClosePane,
+    ClosePane(Close),
     Reopen(Box<ReopenPlan>),
 }
 
+/// A settle or snooze that means to close the agent's pane, as it was when the action was taken.
+/// `State::confirm_close` decides whether it still may.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Close {
+    key: String,
+    pane_id: String,
+    terminal_id: String,
+    seq: u64,
+    workspace_panes: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Closing {
+    /// Close this pane, then report how it went with `State::report_close`.
+    Close(String),
+    KeepOpen(String),
+    Skip,
+}
+
+/// Resuming a closed thread's session. `ReopenPlan::launch` says how on the current server.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReopenPlan {
-    pub key: String,
-    pub argv: Vec<String>,
-    pub thread: Thread,
-    pub pending_pane: Option<String>,
-    pub pending_generation: Option<String>,
+    key: String,
+    argv: Vec<String>,
+    thread: Thread,
+    pending_pane: Option<String>,
+    pending_generation: Option<String>,
+}
+
+/// What the executor does to reopen a thread: focus `focus` if Herdr still has it, otherwise
+/// launch `argv` in a new tab and report the tab's pane with `State::report_reopen`.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Launch<'a> {
+    /// The tab a reopen of this thread started moments ago on this server.
+    pub focus: Option<&'a str>,
+    /// The thread's workspace, or `None` for the current one when it is gone.
+    pub workspace: Option<&'a str>,
+    pub cwd: Option<&'a str>,
+    pub argv: &'a [String],
+    /// Codex reports a resumed session only after its next turn, so the executor tells Herdr.
+    pub codex_session: Option<&'a str>,
+}
+
+impl ReopenPlan {
+    pub fn launch<'a>(&'a self, generation: &str, workspaces: &[&str]) -> Launch<'a> {
+        let focus = self
+            .pending_pane
+            .as_deref()
+            .filter(|_| self.pending_generation.as_deref() == Some(generation));
+        let workspace = self
+            .thread
+            .workspace_id
+            .as_deref()
+            .filter(|id| workspaces.contains(id));
+        let codex_session = match (self.thread.agent.as_deref(), &self.thread.session) {
+            (Some("codex"), Some(session)) => Some(session.value.as_str()),
+            _ => None,
+        };
+        Launch {
+            focus,
+            workspace,
+            cwd: self.thread.cwd.as_deref(),
+            argv: &self.argv,
+            codex_session,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -621,28 +683,78 @@ impl State {
         }
     }
 
-    pub fn reopening(&mut self, key: &str, pane_id: &str, generation: &str, now: i64) {
-        if let Some(record) = self.records.get_mut(key) {
+    /// Records the pane a reopen launched the thread's session in, so the session is adopted
+    /// into the thread and a repeated reopen focuses it instead of launching again.
+    pub fn report_reopen(&mut self, plan: &ReopenPlan, pane_id: &str, generation: &str, now: i64) {
+        if let Some(record) = self.records.get_mut(&plan.key) {
             record.reopen_pane = Some(pane_id.to_owned());
             record.reopen_at = Some(now);
             record.reopen_generation = Some(generation.to_owned());
         }
     }
 
-    pub fn session_closed(&mut self, key: &str) {
-        if let Some(record) = self.records.get_mut(key) {
+    /// Decides, under the store lock, whether an intended close may still happen. The last pane of
+    /// a workspace stays open. Otherwise the parked thread must still be live on server
+    /// `generation`, and `look` (called only when that holds)
+    /// must show its pane alone, quiet and unchanged since the action. Sibling panes on one session
+    /// share a record whose counters and restore state flip between them, so such a pane is never
+    /// closed.
+    pub fn confirm_close(
+        &mut self,
+        close: &Close,
+        generation: &str,
+        now: i64,
+        look: impl FnOnce() -> std::io::Result<Vec<Observed>>,
+    ) -> std::io::Result<Closing> {
+        if close.workspace_panes <= 1 {
+            return Ok(Closing::KeepOpen(
+                "kept open: it is the last pane in its workspace".into(),
+            ));
+        }
+        let Some(record) = self.records.get(&close.key).filter(|record| {
+            record.live
+                && record.missing_since.is_none()
+                && record.park.is_some()
+                && record.generation == generation
+        }) else {
+            return Ok(Closing::Skip);
+        };
+        let restoring = record.restoring(now);
+        let shown = look()?;
+        let mut panes = shown.iter().filter(|agent| agent.key == close.key);
+        let quiet_since_action = match (panes.next(), panes.next()) {
+            (Some(pane), None) => {
+                pane.terminal_id == close.terminal_id
+                    && !matches!(pane.status, Status::Working | Status::Blocked)
+                    && (pane.seq == close.seq || restoring)
+            }
+            _ => false,
+        };
+        if !quiet_since_action {
+            return Ok(Closing::Skip);
+        }
+        // Closing the viewed pane can end the picker before it reports the close.
+        self.mark_undo_closed(&close.key, true);
+        Ok(Closing::Close(close.pane_id.clone()))
+    }
+
+    pub fn report_close(&mut self, close: &Close, closed: bool) {
+        if !closed {
+            self.mark_undo_closed(&close.key, false);
+            return;
+        }
+        if let Some(record) = self.records.get_mut(&close.key) {
             record.live = false;
             record.ended = true;
             record.missing_since = None;
         }
     }
 
-    /// Closing the viewed pane can end the picker before it records the close.
-    pub fn closing(&mut self, key: &str, closing: bool) {
+    fn mark_undo_closed(&mut self, key: &str, closed: bool) {
         if let Some(undo) = &mut self.undo
             && undo.key == key
         {
-            undo.closed = closing;
+            undo.closed = closed;
         }
     }
 
@@ -794,13 +906,13 @@ impl State {
             Action::ToggleSettle if record.park == Some(Park::Settled) => unpark(record),
             Action::ToggleSettle => {
                 record.pinned = false;
-                Ok(park(record, seq, Park::Settled, live))
+                Ok(park(record, seq, Park::Settled, live_agent))
             }
             Action::Snooze(until) => Ok(park(
                 record,
                 seq,
                 Park::Snoozed { until },
-                live && shown != Display::Working,
+                live_agent.filter(|_| shown != Display::Working),
             )),
             Action::ToggleUnread if matches!(shown, Display::Done | Display::Unread(_)) => {
                 record.unread = None;
@@ -916,14 +1028,20 @@ pub fn next_attention<'a>(rows: &'a [Row], current: Option<&str>) -> Option<&'a 
         .copied()
 }
 
-fn park(record: &mut Record, seq: u64, park: Park, close_pane: bool) -> After {
+/// Parks the thread, meaning to close the pane `closing` shows when its session can be resumed.
+fn park(record: &mut Record, seq: u64, park: Park, closing: Option<&Observed>) -> After {
     record.park = Some(park);
     record.unread = None;
     record.ack_seq = Some(seq);
-    if close_pane && record.resumable() {
-        After::ClosePane
-    } else {
-        After::Nothing
+    match closing {
+        Some(agent) if record.resumable() => After::ClosePane(Close {
+            key: agent.key.clone(),
+            pane_id: agent.pane_id.clone(),
+            terminal_id: agent.terminal_id.clone(),
+            seq: agent.seq,
+            workspace_panes: agent.workspace_panes,
+        }),
+        _ => After::Nothing,
     }
 }
 
@@ -958,6 +1076,8 @@ mod tests {
     fn agent(key: &str, status: Status, seq: u64) -> Observed {
         Observed {
             pane_id: format!("pane-{key}"),
+            terminal_id: format!("term-{key}"),
+            workspace_panes: 2,
             thread: Thread::default(),
             key: key.into(),
             pre_session_key: None,
@@ -1492,17 +1612,16 @@ mod tests {
         let plain = agent("terminal:t1", Status::Idle, 3);
         let mut state = State::default();
         state.reconcile(GEN, &[a.clone(), b.clone(), plain.clone()], NOW);
-        assert_eq!(
-            act(&mut state, &a, Action::ToggleSettle),
-            Ok(After::ClosePane)
-        );
-        assert_eq!(
-            act(&mut state, &b, Action::Snooze(NOW + 60)),
-            Ok(After::ClosePane)
-        );
+        close_as_herdr_would(&mut state, &a, Action::ToggleSettle);
+        close_as_herdr_would(&mut state, &b, Action::Snooze(NOW + 60));
         assert_eq!(
             act(&mut state, &plain, Action::ToggleSettle),
             Ok(After::Nothing)
+        );
+        assert_eq!(closed(&state, "a").status_text(NOW), "settled · closed");
+        assert_eq!(
+            closed(&state, "b").park,
+            Some(Park::Snoozed { until: NOW + 60 })
         );
         let row = state
             .ordered(std::slice::from_ref(&plain))
@@ -1510,6 +1629,333 @@ mod tests {
             .find(|r| r.key == plain.key)
             .unwrap();
         assert_eq!(row.status_text(NOW), "settled · stays open");
+    }
+
+    fn confirm(
+        state: &mut State,
+        close: &Close,
+        shown: &[Observed],
+        generation: &str,
+        now: i64,
+    ) -> Closing {
+        let look = || Ok(shown.to_vec());
+        state.confirm_close(close, generation, now, look).unwrap()
+    }
+
+    fn intended_close(state: &mut State, agent: &Observed, action: Action) -> Close {
+        match act(state, agent, action) {
+            Ok(After::ClosePane(close)) => close,
+            other => panic!("{action:?} should mean to close the pane, got {other:?}"),
+        }
+    }
+
+    /// Parks `agent` and confirms the close with Herdr still showing it as it was, leaving the
+    /// close unreported, as when closing the viewed pane ends the picker first.
+    fn confirmed_close(state: &mut State, agent: &Observed, action: Action) -> Close {
+        let close = intended_close(state, agent, action);
+        assert_eq!(
+            confirm(state, &close, std::slice::from_ref(agent), GEN, NOW),
+            Closing::Close(agent.pane_id.clone())
+        );
+        close
+    }
+
+    fn close_as_herdr_would(state: &mut State, agent: &Observed, action: Action) {
+        let close = confirmed_close(state, agent, action);
+        state.report_close(&close, true);
+    }
+
+    #[test]
+    fn the_last_pane_of_a_workspace_stays_open_with_a_notice() {
+        for panes in [1, 0] {
+            let last = Observed {
+                workspace_panes: panes,
+                ..resumable("a", Status::Idle, 1)
+            };
+            let mut state = State::default();
+            state.reconcile(GEN, std::slice::from_ref(&last), NOW);
+            let close = intended_close(&mut state, &last, Action::ToggleSettle);
+            assert_eq!(
+                confirm(&mut state, &close, std::slice::from_ref(&last), GEN, NOW),
+                Closing::KeepOpen("kept open: it is the last pane in its workspace".into()),
+                "{panes} panes"
+            );
+            assert_eq!(state.undo(NOW + 1), Ok(("a".into(), After::Nothing)));
+        }
+    }
+
+    #[test]
+    fn a_pane_busy_or_active_again_since_the_action_stays_open() {
+        let idle = resumable("a", Status::Idle, 3);
+        for (status, seq) in [
+            (Status::Working, 3),
+            (Status::Blocked, 3),
+            (Status::Idle, 4),
+            (Status::Done, 4),
+        ] {
+            for action in [Action::ToggleSettle, Action::Snooze(NOW + 3_600)] {
+                let mut state = State::default();
+                state.reconcile(GEN, std::slice::from_ref(&idle), NOW);
+                let close = intended_close(&mut state, &idle, action);
+                let now_shown = resumable("a", status, seq);
+                assert_eq!(
+                    confirm(
+                        &mut state,
+                        &close,
+                        std::slice::from_ref(&now_shown),
+                        GEN,
+                        NOW + 1
+                    ),
+                    Closing::Skip,
+                    "{action:?} then {status:?} at seq {seq}, before any hook synced"
+                );
+                state.reconcile(GEN, std::slice::from_ref(&now_shown), NOW + 1);
+                assert_eq!(
+                    confirm(
+                        &mut state,
+                        &close,
+                        std::slice::from_ref(&now_shown),
+                        GEN,
+                        NOW + 1
+                    ),
+                    Closing::Skip,
+                    "{action:?} then {status:?} at seq {seq}, after a hook synced"
+                );
+                state.reconcile(GEN, &[], NOW + 2);
+                assert!(
+                    !matches!(state.undo(NOW + 3), Ok((_, After::Reopen(_)))),
+                    "undo never reopens a pane it did not close"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn herdr_restore_churn_since_the_action_still_closes_the_idle_pane() {
+        let mut state = State::default();
+        state.reconcile(GEN, &[resumable("a", Status::Idle, 40)], NOW);
+        let restored = resumable("a", Status::Idle, 3);
+        state.reconcile("g2", std::slice::from_ref(&restored), NOW + 1);
+        let close = intended_close(&mut state, &restored, Action::ToggleSettle);
+        let churned = resumable("a", Status::Idle, 4);
+        state.reconcile("g2", std::slice::from_ref(&churned), NOW + 2);
+        assert_eq!(
+            confirm(
+                &mut state,
+                &close,
+                std::slice::from_ref(&churned),
+                "g2",
+                NOW + RESTORE_SETTLE_SECS
+            ),
+            Closing::Close("pane-a".into()),
+            "a moved counter is restore churn for 20 seconds after the restart"
+        );
+        assert_eq!(
+            confirm(
+                &mut state,
+                &close,
+                std::slice::from_ref(&churned),
+                "g2",
+                NOW + 1 + RESTORE_SETTLE_SECS
+            ),
+            Closing::Skip,
+            "once the restore has settled, a moved counter is activity"
+        );
+    }
+
+    #[test]
+    fn panes_sharing_a_session_stay_open_whatever_either_shows() {
+        let target = resumable("a", Status::Idle, 3);
+        let sibling = |status| Observed {
+            pane_id: "pane-sibling".into(),
+            terminal_id: "term-sibling".into(),
+            ..resumable("a", status, 4)
+        };
+        for (turned, restart) in [
+            (Status::Idle, false),
+            (Status::Working, false),
+            (Status::Working, true),
+            (Status::Blocked, true),
+            (Status::Done, true),
+        ] {
+            for action in [Action::ToggleSettle, Action::Snooze(NOW + 3_600)] {
+                let mut state = State::default();
+                if restart {
+                    state.reconcile("g0", &[target.clone(), sibling(Status::Idle)], NOW - 1);
+                }
+                state.reconcile(GEN, &[target.clone(), sibling(Status::Idle)], NOW);
+                let close = intended_close(&mut state, &target, action);
+                let shown = [resumable("a", turned, 5), sibling(Status::Idle)];
+                state.reconcile(GEN, &shown, NOW + 1);
+                assert_eq!(
+                    confirm(&mut state, &close, &shown, GEN, NOW + 2),
+                    Closing::Skip,
+                    "{action:?}, then the pane turned {turned:?} (restart: {restart})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_pane_herdr_no_longer_shows_as_it_was_stays_open() {
+        let idle = resumable("a", Status::Idle, 3);
+        let other_terminal = Observed {
+            terminal_id: "term-new".into(),
+            ..idle.clone()
+        };
+        for shown in [vec![], vec![other_terminal]] {
+            let mut state = State::default();
+            state.reconcile(GEN, std::slice::from_ref(&idle), NOW);
+            let close = intended_close(&mut state, &idle, Action::ToggleSettle);
+            assert_eq!(confirm(&mut state, &close, &shown, GEN, NOW), Closing::Skip);
+        }
+    }
+
+    #[test]
+    fn herdr_is_not_asked_about_a_pane_that_would_stay_open_anyway() {
+        let last = Observed {
+            workspace_panes: 1,
+            ..resumable("a", Status::Idle, 3)
+        };
+        let mut state = State::default();
+        state.reconcile(GEN, std::slice::from_ref(&last), NOW);
+        let close = intended_close(&mut state, &last, Action::ToggleSettle);
+        let unasked = || -> std::io::Result<Vec<Observed>> { panic!("asked Herdr") };
+        assert!(matches!(
+            state.confirm_close(&close, GEN, NOW, unasked),
+            Ok(Closing::KeepOpen(_))
+        ));
+        let idle = resumable("b", Status::Idle, 3);
+        state.reconcile(GEN, std::slice::from_ref(&idle), NOW);
+        let close = intended_close(&mut state, &idle, Action::ToggleSettle);
+        assert!(matches!(
+            state.confirm_close(&close, "g2", NOW, unasked),
+            Ok(Closing::Skip)
+        ));
+    }
+
+    #[test]
+    fn closing_a_pane_leaves_the_undo_of_another_thread_alone() {
+        let (a, b) = (
+            resumable("a", Status::Idle, 1),
+            resumable("b", Status::Idle, 2),
+        );
+        let mut state = State::default();
+        state.reconcile(GEN, &[a.clone(), b.clone()], NOW);
+        let close = intended_close(&mut state, &a, Action::ToggleSettle);
+        act(&mut state, &b, Action::TogglePin).unwrap();
+        assert_eq!(
+            confirm(&mut state, &close, &[a, b], GEN, NOW),
+            Closing::Close("pane-a".into())
+        );
+        state.report_close(&close, true);
+        assert_eq!(state.undo(NOW + 1), Ok(("b".into(), After::Nothing)));
+        assert_eq!(closed(&state, "a").park, Some(Park::Settled));
+    }
+
+    #[test]
+    fn a_thread_no_longer_live_parked_or_on_this_server_is_not_closed() {
+        let idle = resumable("a", Status::Idle, 3);
+        let setup = || {
+            let mut state = State::default();
+            state.reconcile(GEN, std::slice::from_ref(&idle), NOW);
+            let close = intended_close(&mut state, &idle, Action::ToggleSettle);
+            (state, close)
+        };
+        let shown = std::slice::from_ref(&idle);
+
+        let (mut state, close) = setup();
+        assert_eq!(confirm(&mut state, &close, shown, "g2", NOW), Closing::Skip);
+
+        let (mut state, close) = setup();
+        act(&mut state, &idle, Action::ToggleSettle).unwrap();
+        assert_eq!(confirm(&mut state, &close, shown, GEN, NOW), Closing::Skip);
+
+        let (mut state, close) = setup();
+        state.reconcile(GEN, &[], NOW + 1);
+        assert_eq!(
+            confirm(&mut state, &close, shown, GEN, NOW + 1),
+            Closing::Skip
+        );
+
+        let (mut state, close) = setup();
+        state.reconcile(GEN, &[], NOW + 1);
+        state.reconcile(GEN, &[], NOW + 12);
+        assert_eq!(
+            confirm(&mut state, &close, shown, GEN, NOW + 12),
+            Closing::Skip
+        );
+    }
+
+    #[test]
+    fn a_reopen_focuses_the_tab_a_recent_reopen_started_on_this_server() {
+        let a = resumable("a", Status::Idle, 1);
+        let mut state = State::default();
+        closed_settled(&mut state, &a);
+        let first = reopen(&mut state, "a", NOW + 20);
+        assert_eq!(first.launch(GEN, &["w1"]).focus, None);
+        state.report_reopen(&first, "pane-new", GEN, NOW + 20);
+
+        let again = reopen(&mut state, "a", NOW + 30);
+        assert_eq!(again.launch(GEN, &["w1"]).focus, Some("pane-new"));
+        assert_eq!(
+            again.launch("g2", &["w1"]).focus,
+            None,
+            "pane ids are reused across servers"
+        );
+        let last = reopen(&mut state, "a", NOW + 19 + REOPEN_PENDING_SECS);
+        assert_eq!(last.launch(GEN, &["w1"]).focus, Some("pane-new"));
+        let late = reopen(&mut state, "a", NOW + 20 + REOPEN_PENDING_SECS);
+        assert_eq!(late.launch(GEN, &["w1"]).focus, None);
+    }
+
+    #[test]
+    fn a_reopen_resumes_the_session_in_its_workspace_or_the_current_one_if_gone() {
+        let a = Observed {
+            thread: Thread {
+                cwd: Some("/src/api".into()),
+                ..resumable("a", Status::Idle, 1).thread
+            },
+            ..resumable("a", Status::Idle, 1)
+        };
+        let mut state = State::default();
+        closed_settled(&mut state, &a);
+        let plan = reopen(&mut state, "a", NOW + 20);
+        let launch = plan.launch(GEN, &["w0", "w1"]);
+        assert_eq!(launch.workspace, Some("w1"));
+        assert_eq!(launch.cwd, Some("/src/api"));
+        assert_eq!(launch.argv, ["claude", "--resume", "id-a"]);
+        assert_eq!(launch.codex_session, None);
+        assert_eq!(plan.launch(GEN, &["w0"]).workspace, None);
+    }
+
+    #[test]
+    fn a_reopened_codex_session_is_reported_to_herdr_right_away() {
+        let codex = Observed {
+            thread: Thread {
+                agent: Some("codex".into()),
+                session: Some(SessionRef {
+                    source: "herdr:codex".into(),
+                    kind: "id".into(),
+                    value: "0199-abc".into(),
+                }),
+                ..resumable("c", Status::Idle, 1).thread
+            },
+            ..resumable("c", Status::Idle, 1)
+        };
+        let mut state = State::default();
+        closed_settled(&mut state, &codex);
+        let plan = reopen(&mut state, "c", NOW + 20);
+        let launch = plan.launch(GEN, &["w1"]);
+        assert_eq!(launch.codex_session, Some("0199-abc"));
+        assert_eq!(launch.argv, ["codex", "resume", "0199-abc"]);
+    }
+
+    fn reopen(state: &mut State, key: &str, now: i64) -> Box<ReopenPlan> {
+        match state.apply(key, None, Action::Reopen, now) {
+            Ok(After::Reopen(reopen)) => reopen,
+            other => panic!("reopening {key} should resume it, got {other:?}"),
+        }
     }
 
     fn closed_settled(state: &mut State, agent: &Observed) {
@@ -1527,8 +1973,10 @@ mod tests {
         let Ok(After::Reopen(plan)) = state.apply("a", None, Action::ToggleSettle, NOW + 20) else {
             panic!("unsettle should reopen");
         };
-        assert_eq!(plan.argv, ["claude", "--resume", "id-a"]);
-        assert_eq!(plan.thread.workspace_id.as_deref(), Some("w1"));
+        assert_eq!(
+            plan.launch(GEN, &["w1"]).argv,
+            ["claude", "--resume", "id-a"]
+        );
         assert_eq!(closed(&state, "a").park, None);
 
         state
@@ -1627,8 +2075,8 @@ mod tests {
         let a = resumable("a", Status::Idle, 1);
         let mut state = State::default();
         closed_settled(&mut state, &a);
-        state.apply("a", None, Action::Reopen, NOW + 20).unwrap();
-        state.reopening("a", "pane-new", GEN, NOW + 20);
+        let plan = reopen(&mut state, "a", NOW + 20);
+        state.report_reopen(&plan, "pane-new", GEN, NOW + 20);
         let resumed = Observed {
             pane_id: "pane-new".into(),
             ..resumable("a2", Status::Idle, 9)
@@ -1733,8 +2181,8 @@ mod tests {
         let a = resumable("a", Status::Idle, 1);
         let mut state = State::default();
         closed_settled(&mut state, &a);
-        state.apply("a", None, Action::Reopen, NOW + 20).unwrap();
-        state.reopening("a", "pane-new", GEN, NOW + 20);
+        let plan = reopen(&mut state, "a", NOW + 20);
+        state.report_reopen(&plan, "pane-new", GEN, NOW + 20);
         let starting = Observed {
             pane_id: "pane-new".into(),
             ..agent("terminal:t9", Status::Idle, 1)
@@ -1764,8 +2212,8 @@ mod tests {
         let a = resumable("a", Status::Idle, 1);
         let mut state = State::default();
         closed_settled(&mut state, &a);
-        state.apply("a", None, Action::Reopen, NOW + 20).unwrap();
-        state.reopening("a", "pane-new", GEN, NOW + 20);
+        let plan = reopen(&mut state, "a", NOW + 20);
+        state.report_reopen(&plan, "pane-new", GEN, NOW + 20);
         let much_later = Observed {
             pane_id: "pane-new".into(),
             ..resumable("a2", Status::Idle, 9)
@@ -1813,8 +2261,8 @@ mod tests {
         let mut state = State::default();
         closed_settled(&mut state, &a);
         act_closed_pin(&mut state, "a");
-        state.apply("a", None, Action::Reopen, NOW + 20).unwrap();
-        state.reopening("a", "pane-new", GEN, NOW + 20);
+        let plan = reopen(&mut state, "a", NOW + 20);
+        state.report_reopen(&plan, "pane-new", GEN, NOW + 20);
         let terminal_first = Observed {
             pane_id: "pane-new".into(),
             ..agent("terminal:t9", Status::Idle, 1)
@@ -1839,12 +2287,7 @@ mod tests {
         let mut state = State::default();
         state.reconcile(GEN, std::slice::from_ref(&idle), NOW);
         act(&mut state, &idle, Action::TogglePin).unwrap();
-        assert_eq!(
-            act(&mut state, &idle, Action::ToggleSettle),
-            Ok(After::ClosePane)
-        );
-        state.closing("a", true);
-        state.session_closed("a");
+        close_as_herdr_would(&mut state, &idle, Action::ToggleSettle);
 
         let (key, after) = state.undo(NOW + 5).unwrap();
         assert_eq!(key, "a");
@@ -1891,8 +2334,7 @@ mod tests {
         assert_eq!(state.undo(NOW + 2), Ok(("s1".into(), After::Nothing)));
         assert!(!state.records["s1"].pinned);
 
-        act(&mut state, &by_session, Action::ToggleSettle).unwrap();
-        state.session_closed("s1");
+        close_as_herdr_would(&mut state, &by_session, Action::ToggleSettle);
         state.apply("s1", None, Action::Forget, NOW + 3).unwrap();
         assert_eq!(state.undo(NOW + 4), Err(Refusal("nothing to undo".into())));
     }
@@ -1916,12 +2358,7 @@ mod tests {
         let idle = resumable("a", Status::Idle, 4);
         let mut state = State::default();
         state.reconcile(GEN, std::slice::from_ref(&idle), NOW);
-        assert_eq!(
-            act(&mut state, &idle, Action::Snooze(NOW + 60)),
-            Ok(After::ClosePane)
-        );
-        state.closing("a", true);
-        state.session_closed("a");
+        close_as_herdr_would(&mut state, &idle, Action::Snooze(NOW + 60));
         state.reconcile(GEN, &[], NOW + 120);
         assert!(matches!(state.undo(NOW + 121), Ok((_, After::Reopen(_)))));
     }
@@ -1973,15 +2410,12 @@ mod tests {
         act(&mut state, &working, Action::Snooze(until)).unwrap();
         let finished = resumable("a", Status::Idle, 5);
         state.reconcile(GEN, std::slice::from_ref(&finished), NOW + 1);
-        assert_eq!(
-            act(&mut state, &finished, Action::ToggleSettle),
-            Ok(After::ClosePane)
-        );
-        state.closing("a", true);
-        state.session_closed("a");
+        close_as_herdr_would(&mut state, &finished, Action::ToggleSettle);
 
-        assert!(matches!(state.undo(NOW + 2), Ok((_, After::Reopen(_)))));
-        state.reopening("a", "pane-new", GEN, NOW + 2);
+        let Ok((_, After::Reopen(plan))) = state.undo(NOW + 2) else {
+            panic!("undo should reopen the closed thread");
+        };
+        state.report_reopen(&plan, "pane-new", GEN, NOW + 2);
         let back = Observed {
             pane_id: "pane-new".into(),
             ..resumable("a", Status::Idle, 1)
@@ -2018,11 +2452,7 @@ mod tests {
         let idle = resumable("a", Status::Idle, 4);
         let mut state = State::default();
         state.reconcile(GEN, std::slice::from_ref(&idle), NOW);
-        assert_eq!(
-            act(&mut state, &idle, Action::ToggleSettle),
-            Ok(After::ClosePane)
-        );
-        state.closing("a", true);
+        confirmed_close(&mut state, &idle, Action::ToggleSettle);
         state.reconcile(GEN, &[], NOW + 1);
         state.reconcile(GEN, &[], NOW + 60);
         assert!(matches!(state.undo(NOW + 61), Ok((_, After::Reopen(_)))));
@@ -2033,8 +2463,7 @@ mod tests {
         let idle = resumable("a", Status::Idle, 4);
         let mut state = State::default();
         state.reconcile(GEN, std::slice::from_ref(&idle), NOW);
-        act(&mut state, &idle, Action::ToggleSettle).unwrap();
-        state.closing("a", true);
+        confirmed_close(&mut state, &idle, Action::ToggleSettle);
         state.reconcile(GEN, &[], NOW + 1);
         assert!(matches!(state.undo(NOW + 2), Ok((_, After::Reopen(_)))));
     }
@@ -2046,11 +2475,12 @@ mod tests {
         state.reconcile(GEN, std::slice::from_ref(&idle), NOW);
         act(&mut state, &idle, Action::TogglePin).unwrap();
         state.rename("a", Some("checkout flow".into()), NOW);
-        act(&mut state, &idle, Action::ToggleSettle).unwrap();
-        state.closing("a", true);
+        confirmed_close(&mut state, &idle, Action::ToggleSettle);
         state.reconcile(GEN, &[], NOW + 1);
-        state.undo(NOW + 2).unwrap();
-        state.reopening("a", "pane-new", GEN, NOW + 2);
+        let Ok((_, After::Reopen(plan))) = state.undo(NOW + 2) else {
+            panic!("undo should reopen the closed thread");
+        };
+        state.report_reopen(&plan, "pane-new", GEN, NOW + 2);
         let resumed = Observed {
             pane_id: "pane-new".into(),
             ..resumable("a2", Status::Idle, 1)
@@ -2065,9 +2495,8 @@ mod tests {
         let idle = resumable("a", Status::Idle, 4);
         let mut state = State::default();
         state.reconcile(GEN, std::slice::from_ref(&idle), NOW);
-        act(&mut state, &idle, Action::ToggleSettle).unwrap();
-        state.closing("a", true);
-        state.closing("a", false);
+        let close = confirmed_close(&mut state, &idle, Action::ToggleSettle);
+        state.report_close(&close, false);
         state.reconcile(GEN, &[], NOW + 1);
         state.reconcile(GEN, &[], NOW + 60);
         assert!(matches!(state.undo(NOW + 61), Ok((_, After::Nothing))));
@@ -2082,8 +2511,8 @@ mod tests {
         let a = resumable("a", Status::Idle, 1);
         let mut state = State::default();
         closed_settled(&mut state, &a);
-        state.apply("a", None, Action::Reopen, NOW + 20).unwrap();
-        state.reopening("a", "pane-new", GEN, NOW + 20);
+        let plan = reopen(&mut state, "a", NOW + 20);
+        state.report_reopen(&plan, "pane-new", GEN, NOW + 20);
         let after_restart = Observed {
             pane_id: "pane-new".into(),
             ..resumable("b", Status::Idle, 1)
