@@ -2,7 +2,7 @@
 
 An agent picker for [Herdr](https://herdr.dev) with T3 Code-style triage. Finished threads can be
 **settled** out of the way, **snoozed** until later, marked **unread**, or **pinned** to the top.
-Settling or snoozing an agent whose session Herdr can resume (Claude, Pi, or Codex run with
+Settling or snoozing an agent whose session Herdr can resume (Claude, OpenCode, Pi, or Codex run with
 `--no-daemon`) closes its session, unless it is the last pane in its workspace; the thread stays in the picker and reopens with its conversation
 when you unsettle, wake or open it. Herdr's native Agents sidebar
 follows the same order and hides parked threads.
@@ -92,15 +92,19 @@ is offered until 30 minutes before, so later in the day the digits after it shif
 - **Snooze** (`z`) parks it until the chosen time; then it returns marked *woke*. The picker shows
   the time left (`snoozed · 45m`). An agent that blocks on you wakes early; other activity, including
   a snoozed agent finishing its work, does not. Viewing the agent clears *woke*.
-- **Closing:** settling or snoozing an agent whose session Herdr can resume (Claude, Codex or Pi with
+- **Closing:** settling or snoozing an agent whose session Herdr can resume (Claude, Codex, OpenCode or Pi with
   Herdr's integration) closes its pane. Other agents, agents still working when snoozed, and the last
   pane of a workspace stay open and are marked `stays open`. Codex only reports its session to Herdr when it runs without its shared
   app-server: start it with `codex --no-daemon` (or alias `codex` to that).
 - **After a Herdr restart,** Herdr relaunches restored agents; state changes in the first 20 seconds
   are not treated as new activity, so parked threads stay parked.
 - **Reopening:** unsettling, waking or opening a closed thread starts a new tab in its workspace (or
-  the current one, if that workspace is gone) and runs `claude --resume <id>`, `codex resume <id>` or
-  `pi --session <id>`. A closed snooze that comes due shows as `woke · closed` and waits for you.
+  the current one, if that workspace is gone) and runs `claude --resume <id>`, `codex resume <id>`,
+  `opencode --session <id>` or `pi --session <id>`. A closed snooze that comes due shows as
+  `woke · closed` and waits for you. OpenCode uses its configured server and creates a session if
+  the saved ID no longer exists; reopening does not recover deleted conversation history.
+  Herdr accepting the launch command does not guarantee that the application starts successfully;
+  application errors remain visible in the new tab.
 - **Unread** (`u`) on a done or unread thread marks it read without visiting it; on any other it marks
   it unread until you press `u` again or the agent's next turn. Marking a parked thread unread brings
   it back without reopening it.

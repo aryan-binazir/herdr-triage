@@ -53,6 +53,7 @@ impl Thread {
         match (agent, session.kind.as_str()) {
             ("claude", "id") => Some(vec!["claude".into(), "--resume".into(), value]),
             ("codex", "id") => Some(vec!["codex".into(), "resume".into(), value]),
+            ("opencode", "id") => Some(vec!["opencode".into(), "--session".into(), value]),
             ("pi", "id") => Some(vec!["pi".into(), "--session".into(), value]),
             ("pi", "path") if value.starts_with('/') => {
                 Some(vec!["pi".into(), "--session".into(), value])
@@ -361,8 +362,7 @@ pub struct Launch<'a> {
     pub workspace: Option<&'a str>,
     pub cwd: Option<&'a str>,
     pub argv: &'a [String],
-    /// Codex reports a resumed session only after its next turn, so the executor tells Herdr.
-    pub codex_session: Option<&'a str>,
+    pub session_to_report: Option<(&'a str, &'a str)>,
 }
 
 impl ReopenPlan {
@@ -376,8 +376,10 @@ impl ReopenPlan {
             .workspace_id
             .as_deref()
             .filter(|id| workspaces.contains(id));
-        let codex_session = match (self.thread.agent.as_deref(), &self.thread.session) {
-            (Some("codex"), Some(session)) => Some(session.value.as_str()),
+        let session_to_report = match (self.thread.agent.as_deref(), &self.thread.session) {
+            (Some(agent @ ("codex" | "opencode")), Some(session)) => {
+                Some((agent, session.value.as_str()))
+            }
             _ => None,
         };
         Launch {
@@ -385,7 +387,7 @@ impl ReopenPlan {
             workspace,
             cwd: self.thread.cwd.as_deref(),
             argv: &self.argv,
-            codex_session,
+            session_to_report,
         }
     }
 }
@@ -2242,7 +2244,7 @@ mod tests {
         assert_eq!(launch.workspace, Some("w1"));
         assert_eq!(launch.cwd, Some("/src/api"));
         assert_eq!(launch.argv, ["claude", "--resume", "id-a"]);
-        assert_eq!(launch.codex_session, None);
+        assert_eq!(launch.session_to_report, None);
         assert_eq!(plan.launch(GEN, &["w0"]).workspace, None);
     }
 
@@ -2264,7 +2266,7 @@ mod tests {
         closed_settled(&mut state, &codex);
         let plan = reopen(&mut state, "c", NOW + 20);
         let launch = plan.launch(GEN, &["w1"]);
-        assert_eq!(launch.codex_session, Some("0199-abc"));
+        assert_eq!(launch.session_to_report, Some(("codex", "0199-abc")));
         assert_eq!(launch.argv, ["codex", "resume", "0199-abc"]);
     }
 
@@ -2404,7 +2406,7 @@ mod tests {
     }
 
     #[test]
-    fn only_official_claude_codex_and_pi_sessions_are_resumable() {
+    fn only_official_supported_sessions_are_resumable() {
         let thread = |agent: &str, source: &str, kind: &str, value: &str| Thread {
             agent: Some(agent.into()),
             session: Some(SessionRef {
@@ -2425,6 +2427,12 @@ mod tests {
                 .resume_argv()
                 .unwrap(),
             ["codex", "resume", "x"]
+        );
+        assert_eq!(
+            thread("opencode", "herdr:opencode", "id", "ses_x")
+                .resume_argv()
+                .unwrap(),
+            ["opencode", "--session", "ses_x"]
         );
         assert_eq!(
             thread("pi", "herdr:pi", "path", "/s/x.jsonl")
@@ -2452,7 +2460,7 @@ mod tests {
                 .is_none()
         );
         assert!(
-            thread("opencode", "herdr:opencode", "id", "x")
+            thread("opencode", "herdr:opencode", "path", "/x")
                 .resume_argv()
                 .is_none()
         );

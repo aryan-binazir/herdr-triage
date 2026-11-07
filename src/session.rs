@@ -326,8 +326,8 @@ impl Session {
         self.locked(|held, state| {
             let herdr = &mut *held.herdr;
             let pane = herdr.create_tab(launch.workspace, cwd)?;
-            let launched = match launch.codex_session {
-                Some(session) => herdr.report_codex_session(&pane, session),
+            let launched = match launch.session_to_report {
+                Some((agent, session)) => herdr.report_session(&pane, agent, session),
                 None => Ok(()),
             }
             .and_then(|()| herdr.run_command(&pane, &shell_command(launch.argv)));
@@ -923,6 +923,15 @@ mod tests {
         FakeHerdr::start(vec![codex, resumable_agent("w1:p2", "idle", 4)])
     }
 
+    fn opencode_and_claude() -> FakeHerdr {
+        let mut opencode = fake_herdr::agent("w1:p1", "idle", 3);
+        opencode["agent"] = json!("opencode");
+        opencode["agent_session"] = json!({
+            "source": "herdr:opencode", "agent": "opencode", "kind": "id", "value": "ses_original"
+        });
+        FakeHerdr::start(vec![opencode, resumable_agent("w1:p2", "idle", 4)])
+    }
+
     #[test]
     fn reopening_codex_tells_herdr_its_session_right_away() {
         let fake = codex_and_claude();
@@ -940,6 +949,202 @@ mod tests {
             fake.take("pane.send_input")[0]["text"],
             "codex resume 0199-abc"
         );
+    }
+
+    #[test]
+    fn settling_and_reopening_opencode_preserves_its_session_and_location() {
+        let fake = opencode_and_claude();
+        let (mut session, _) = connect(&fake);
+        let key = "session:opencode:id:ses_original";
+
+        assert_eq!(session.act(key, Action::ToggleSettle).unwrap(), done(key));
+        assert_eq!(fake.take("pane.close"), [json!({"pane_id": "w1:p1"})]);
+        assert_eq!(session.act(key, Action::Reopen).unwrap(), Outcome::Reopened);
+        assert_eq!(
+            fake.take("tab.create"),
+            [json!({"workspace_id": "w1", "cwd": "/tmp", "focus": true})]
+        );
+        assert_eq!(
+            fake.take("pane.send_input"),
+            [
+                json!({"pane_id": "w1:p91", "text": "opencode --session ses_original", "keys": ["Enter"]})
+            ]
+        );
+    }
+
+    #[test]
+    fn reopening_opencode_reports_identity_before_starting_the_tui() {
+        let fake = opencode_and_claude();
+        let (mut session, _) = connect(&fake);
+        let key = "session:opencode:id:ses_original";
+        session.act(key, Action::ToggleSettle).unwrap();
+        session.act(key, Action::Reopen).unwrap();
+
+        let requests = fake.requests.lock().unwrap();
+        let report = requests
+            .iter()
+            .position(|request| request["method"] == "pane.report_agent_session")
+            .unwrap();
+        let input = requests
+            .iter()
+            .position(|request| request["method"] == "pane.send_input")
+            .unwrap();
+        assert!(report < input);
+        assert_eq!(
+            requests[report]["params"],
+            json!({
+                "pane_id": "w1:p91", "source": "herdr:opencode", "agent": "opencode",
+                "agent_session_id": "ses_original", "session_start_source": "resume"
+            })
+        );
+        drop(requests);
+
+        fake.take("tab.create");
+        fake.take("pane.report_agent_session");
+        fake.take("pane.send_input");
+        session.act(key, Action::Reopen).unwrap();
+        assert!(fake.take("tab.create").is_empty());
+        assert!(fake.take("pane.report_agent_session").is_empty());
+        assert!(fake.take("pane.send_input").is_empty());
+        assert_eq!(fake.take("pane.focus"), [json!({"pane_id": "w1:p91"})]);
+    }
+
+    #[test]
+    fn failed_opencode_reopen_requests_clean_up_and_can_be_retried() {
+        for failing in ["pane.report_agent_session", "pane.send_input"] {
+            let fake = opencode_and_claude();
+            let (mut session, _) = connect(&fake);
+            let key = "session:opencode:id:ses_original";
+            session.act(key, Action::ToggleSettle).unwrap();
+            fake.take("pane.close");
+            *fake.fail_method.lock().unwrap() = Some(failing.into());
+
+            assert!(session.act(key, Action::Reopen).is_err());
+            assert_eq!(fake.take("pane.close"), [json!({"pane_id": "w1:p91"})]);
+            if failing == "pane.report_agent_session" {
+                assert!(fake.take("pane.send_input").is_empty());
+            }
+
+            *fake.fail_method.lock().unwrap() = None;
+            fake.take("tab.create");
+            assert_eq!(session.act(key, Action::Reopen).unwrap(), Outcome::Reopened);
+            assert_eq!(fake.take("tab.create").len(), 1);
+            assert_eq!(
+                fake.take("pane.send_input").last().unwrap()["pane_id"],
+                "w1:p92"
+            );
+        }
+    }
+
+    #[test]
+    fn waking_or_undoing_parked_opencode_resumes_the_original_session() {
+        for (park, wake) in [
+            (Action::ToggleSettle, None),
+            (Action::Snooze(NOW + 3600), None),
+            (Action::Snooze(NOW + 3600), Some(Action::Wake)),
+        ] {
+            let fake = opencode_and_claude();
+            let (mut session, _) = connect(&fake);
+            let key = "session:opencode:id:ses_original";
+            session.act(key, park).unwrap();
+            assert_eq!(fake.take("pane.close"), [json!({"pane_id": "w1:p1"})]);
+            let outcome = match wake {
+                Some(action) => session.act(key, action),
+                None => session.undo(),
+            };
+            assert_eq!(outcome.unwrap(), Outcome::Reopened);
+            assert_eq!(
+                fake.take("pane.send_input")[0]["text"],
+                "opencode --session ses_original"
+            );
+        }
+    }
+
+    #[test]
+    fn opencode_without_trusted_session_id_metadata_keeps_its_pane() {
+        for metadata in [
+            Value::Null,
+            json!({"source": "custom", "agent": "opencode", "kind": "id", "value": "ses_x"}),
+            json!({"source": "herdr:opencode", "agent": "claude", "kind": "id", "value": "ses_x"}),
+            json!({"source": "herdr:opencode", "agent": "opencode", "kind": "path", "value": "/tmp/x"}),
+            json!({"source": "herdr:opencode", "agent": "opencode", "kind": "id", "value": ""}),
+        ] {
+            let fake = opencode_and_claude();
+            fake.agents.lock().unwrap()[0]["agent_session"] = metadata;
+            let (mut session, _) = connect(&fake);
+            let view = session.view().unwrap();
+            let key = &view
+                .items
+                .iter()
+                .find(|item| item.kind == "opencode")
+                .unwrap()
+                .row
+                .key;
+            session.act(key, Action::ToggleSettle).unwrap();
+            assert!(fake.take("pane.close").is_empty());
+        }
+    }
+
+    #[test]
+    fn opencode_keeps_the_existing_busy_last_pane_and_shared_session_guards() {
+        let key = "session:opencode:id:ses_original";
+        for status in ["working", "blocked"] {
+            let fake = opencode_and_claude();
+            fake.agents.lock().unwrap()[0]["agent_status"] = json!(status);
+            let (mut session, _) = connect(&fake);
+            assert!(matches!(
+                session.act(key, Action::ToggleSettle).unwrap(),
+                Outcome::Refused(_)
+            ));
+            let outcome = session.act(key, Action::Snooze(NOW + 3600)).unwrap();
+            assert_eq!(matches!(outcome, Outcome::Refused(_)), status == "blocked");
+            assert!(fake.take("pane.close").is_empty());
+        }
+        for shared in [false, true] {
+            let fake = opencode_and_claude();
+            if shared {
+                let mut agents = fake.agents.lock().unwrap();
+                let mut duplicate = agents[0].clone();
+                duplicate["pane_id"] = json!("w1:p3");
+                duplicate["terminal_id"] = json!("t-w1:p3");
+                agents.push(duplicate);
+            } else {
+                fake.workspaces.lock().unwrap()[0]["pane_count"] = json!(1);
+            }
+            let (mut session, _) = connect(&fake);
+            session.act(key, Action::ToggleSettle).unwrap();
+            assert!(fake.take("pane.close").is_empty());
+        }
+    }
+
+    #[test]
+    fn a_resumed_opencode_session_adopts_its_provisional_pane_once() {
+        let fake = opencode_and_claude();
+        let (mut session, _) = connect(&fake);
+        let key = "session:opencode:id:ses_original";
+        session
+            .rename(key, Some("Original conversation".into()))
+            .unwrap();
+        session.act(key, Action::ToggleSettle).unwrap();
+        session.act(key, Action::Reopen).unwrap();
+
+        let mut resumed = fake_herdr::agent("w1:p91", "idle", 5);
+        resumed["agent"] = json!("opencode");
+        fake.agents.lock().unwrap().push(resumed);
+        session.view().unwrap();
+        fake.agents.lock().unwrap().last_mut().unwrap()["agent_session"] = json!({
+            "source": "herdr:opencode", "agent": "opencode", "kind": "id", "value": "ses_original"
+        });
+        let view = session.view().unwrap();
+        let rows: Vec<_> = view
+            .items
+            .iter()
+            .filter(|item| item.kind == "opencode")
+            .collect();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].row.key, key);
+        assert_eq!(rows[0].row.label(), "Original conversation");
+        assert_eq!(rows[0].pane_id.as_deref(), Some("w1:p91"));
     }
 
     #[test]
