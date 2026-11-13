@@ -770,7 +770,8 @@ mod tests {
     }
 
     fn read_closed(label: &str) -> Fixture {
-        Fixture::new(NOW, &[("p2", label, Status::Done)])
+        Fixture::new(NOW, &[("p2", label, Status::Idle)])
+            .act("p2", Action::ToggleUnread)
             .close("p2")
             .act("p2", Action::ToggleUnread)
     }
@@ -1010,9 +1011,10 @@ mod tests {
             NOW,
             &[
                 ("p1", "api refactor", Status::Idle),
-                ("p2", "old spike", Status::Done),
+                ("p2", "old spike", Status::Idle),
             ],
         )
+        .act("p2", Action::ToggleUnread)
         .close("p2")
         .act("p2", Action::ToggleUnread);
         let mut picker = Picker::new(listed(&fixture), None, &BTreeSet::new());
@@ -1479,11 +1481,12 @@ mod tests {
             NOW,
             &[
                 ("p1", "api refactor", Status::Blocked),
-                ("p2", "old spike", Status::Done),
+                ("p2", "old spike", Status::Idle),
                 ("p3", "release notes", Status::Idle),
                 ("p4", "bench run", Status::Idle),
             ],
         )
+        .act("p2", Action::ToggleUnread)
         .close("p2")
         .act("p3", Action::ToggleSettle)
         .act("p4", Action::Snooze(NOW + 3_600));

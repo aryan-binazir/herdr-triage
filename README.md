@@ -108,8 +108,9 @@ is offered until 30 minutes before, so later in the day the digits after it shif
 - **Unread** (`u`) on a done or unread thread marks it read without visiting it; on any other it marks
   it unread until you press `u` again or the agent's next turn. Marking a parked thread unread brings
   it back without reopening it.
-- A thread whose session ends some other way settles as closed, or stays open as `unread · closed`
-  if you hadn't seen its result. Settle and unread are refused while an agent is working or blocked;
+- A thread whose session ends some other way settles as closed, even if you hadn't seen its result,
+  unless you marked it unread or a snooze woke it: then it stays open as `unread · closed` or
+  `woke · closed`. Settle and unread are refused while an agent is working or blocked;
   snooze only while it is blocked.
 - **Undo** (`U`) takes back the last settle, snooze, wake, unread, pin or rename, once. It never closes
   a pane; undoing a settle or snooze that closed a session reopens it. Once the agent has done
