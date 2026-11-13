@@ -662,10 +662,11 @@ mod tests {
             NOW,
             &[
                 ("p1", "api refactor", Status::Working),
-                ("p2", "old spike", Status::Done),
+                ("p2", "old spike", Status::Idle),
             ],
         )
         .act("p1", Action::TogglePin)
+        .act("p2", Action::ToggleUnread)
         .close("p2")
         .act("p2", Action::ToggleUnread);
         listed(&fixture)
@@ -1133,9 +1134,10 @@ mod tests {
 
     #[test]
     fn q_closes_the_picker_even_while_asking_to_forget() {
-        let fixture = Fixture::new(NOW, &[("p2", "old spike", Status::Done)]).close("p2");
-        let mut picker = Picker::new(listed(&fixture), None, &closed_sections());
+        let mut picker = Picker::new(with_closed(), None, &closed_sections());
+        press(&mut picker, KeyCode::Char('j'));
         press(&mut picker, KeyCode::Char('D'));
+        assert!(picker.forget_prompt().is_some());
         assert_eq!(press(&mut picker, KeyCode::Char('q')), Effect::Close);
     }
 

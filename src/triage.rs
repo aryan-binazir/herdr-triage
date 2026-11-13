@@ -168,13 +168,8 @@ impl Record {
     }
 
     fn end_session(&mut self) {
-        let unseen_done = self.last_status == Status::Done && self.ack_seq != Some(self.last_seq);
-        if self.park.is_none() {
-            if self.unread.is_some() || unseen_done {
-                self.unread.get_or_insert(Unread::Manual);
-            } else {
-                self.park = Some(Park::Settled);
-            }
+        if self.park.is_none() && self.unread.is_none() {
+            self.park = Some(Park::Settled);
         }
         self.live = false;
         self.ended = true;
@@ -1288,8 +1283,9 @@ mod tests {
     }
 
     fn beside_a_closed_unread_thread(state: &mut State, agents: &[Observed]) -> Vec<Row> {
-        let gone = resumable("closed-unread", Status::Done, 1);
+        let gone = resumable("closed-unread", Status::Idle, 1);
         state.reconcile(GEN, std::slice::from_ref(&gone), NOW - 20);
+        act(state, &gone, Action::ToggleUnread).unwrap();
         state.reconcile(GEN, &[], NOW - 19);
         state.reconcile(GEN, &[], NOW - 5);
         state.reconcile(GEN, agents, NOW);
@@ -1848,25 +1844,32 @@ mod tests {
 
     #[test]
     fn a_finished_thread_whose_session_ends_settles_as_closed_after_a_grace_period() {
-        let idle = resumable("a", Status::Idle, 4);
-        let mut state = State::default();
-        state.reconcile(GEN, std::slice::from_ref(&idle), NOW);
-        state.reconcile(GEN, &[], NOW + 1);
-        assert!(
-            state.ordered(&[]).is_empty(),
-            "a missing agent is not closed yet"
-        );
-        state.reconcile(GEN, &[], NOW + 12);
-        let row = closed(&state, "a");
-        assert_eq!((row.agent_index, row.park), (None, Some(Park::Settled)));
-        assert_eq!(row.status_text(NOW + 12), "settled · closed");
+        for status in [Status::Idle, Status::Done] {
+            let finished = resumable("a", status, 4);
+            let mut state = State::default();
+            state.reconcile(GEN, std::slice::from_ref(&finished), NOW);
+            state.reconcile(GEN, &[], NOW + 1);
+            assert!(
+                state.ordered(&[]).is_empty(),
+                "a missing agent is not closed yet"
+            );
+            state.reconcile(GEN, &[], NOW + 12);
+            let row = closed(&state, "a");
+            assert_eq!(
+                (row.agent_index, row.park),
+                (None, Some(Park::Settled)),
+                "{status:?}"
+            );
+            assert_eq!(row.status_text(NOW + 12), "settled · closed");
+        }
     }
 
     #[test]
-    fn a_thread_with_unseen_results_stays_open_as_unread_when_its_session_ends() {
-        let done = resumable("a", Status::Done, 4);
+    fn a_thread_marked_unread_stays_open_as_unread_when_its_session_ends() {
+        let idle = resumable("a", Status::Idle, 4);
         let mut state = State::default();
-        state.reconcile(GEN, std::slice::from_ref(&done), NOW);
+        state.reconcile(GEN, std::slice::from_ref(&idle), NOW);
+        act(&mut state, &idle, Action::ToggleUnread).unwrap();
         state.reconcile(GEN, &[], NOW + 1);
         state.reconcile(GEN, &[], NOW + 12);
         let row = closed(&state, "a");
@@ -1875,6 +1878,23 @@ mod tests {
             (Display::Unread(Unread::Manual), None)
         );
         assert_eq!(row.status_text(NOW + 12), "unread · closed");
+    }
+
+    #[test]
+    fn a_thread_woken_from_snooze_stays_open_as_woke_when_its_session_ends() {
+        let idle = resumable("a", Status::Idle, 4);
+        let mut state = State::default();
+        state.reconcile(GEN, std::slice::from_ref(&idle), NOW);
+        act(&mut state, &idle, Action::Snooze(NOW + 60)).unwrap();
+        state.reconcile(GEN, std::slice::from_ref(&idle), NOW + 61);
+        state.reconcile(GEN, &[], NOW + 62);
+        state.reconcile(GEN, &[], NOW + 73);
+        let row = closed(&state, "a");
+        assert_eq!(
+            (row.display, row.park),
+            (Display::Unread(Unread::Woke), None)
+        );
+        assert_eq!(row.status_text(NOW + 73), "woke · closed");
     }
 
     #[test]
