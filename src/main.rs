@@ -70,7 +70,6 @@ fn run_picker() -> io::Result<()> {
         herdr: session.view()?,
         t3: None,
     };
-    // T3's threads arrive from their own thread, so a slow or broken T3 never holds Herdr's up.
     let t3_updates = t3::watch();
     let mut picker = Picker::new(shown.items(), focus.as_deref(), &shown.herdr.open_sections);
     picker.set_undoable(shown.herdr.undoable);
@@ -140,7 +139,6 @@ fn run_picker() -> io::Result<()> {
     }
 }
 
-/// Carries out a triage action from the picker; `Some` when the picker should close.
 fn apply(
     session: &mut Session,
     picker: &mut Picker,
@@ -176,7 +174,6 @@ fn apply(
     None
 }
 
-/// Undoes the last triage change; `Some` when the picker should close.
 fn undo(session: &mut Session, picker: &mut Picker, shown: &mut Shown) -> Option<Leave> {
     match session.undo() {
         Ok(Outcome::Reopened) => return Some(Leave::Close),
@@ -205,14 +202,12 @@ fn undo(session: &mut Session, picker: &mut Picker, shown: &mut Shown) -> Option
     None
 }
 
-/// How the picker ends, carried out once the terminal is restored.
 enum Leave {
     Close,
     Focus(String),
     OpenT3(String),
 }
 
-/// What the picker lists: Herdr's latest view and T3's latest threads.
 struct Shown {
     herdr: View,
     t3: Option<t3::Snapshot>,

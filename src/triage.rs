@@ -474,7 +474,6 @@ impl Row {
         }
     }
 
-    /// The thread's state in a word, with how long it has been so when `aged` and known.
     pub fn state_text(&self, now: i64, aged: bool) -> String {
         self.countdown(now).unwrap_or_else(|| {
             let word = match self.display {

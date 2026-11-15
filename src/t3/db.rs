@@ -1,7 +1,3 @@
-//! Reads this machine's T3 Code threads straight from T3's own database, read-only: T3 owns
-//! that data, and the picker only ever looks. A database T3 has reshaped is an error, never a
-//! guess, and costs the picker nothing but its T3 rows.
-
 use std::collections::BTreeMap;
 use std::fs;
 use std::io;
@@ -12,8 +8,6 @@ use rusqlite::{Connection, OpenFlags};
 
 use super::{Snapshot, T3Thread};
 
-/// T3's threads that are neither deleted nor archived, each with its latest run. Subagent and
-/// side-chat threads belong to their parent, as in T3's own sidebar.
 const THREADS: &str = "
     SELECT t.thread_id, t.project_id, t.title,
            COALESCE(t.provider_instance_id, t.default_provider),
@@ -47,7 +41,6 @@ pub struct Reader {
 }
 
 impl Reader {
-    /// The T3 install in `$T3CODE_HOME`, else `~/.t3`.
     pub fn from_env() -> Option<Self> {
         let set = |name| std::env::var_os(name).filter(|value| !value.is_empty());
         set("T3CODE_HOME")
@@ -60,7 +53,6 @@ impl Reader {
         Self { home }
     }
 
-    /// What T3 has now, or `None` when T3 is not installed here.
     pub fn read(&self) -> io::Result<Option<Snapshot>> {
         let userdata = self.home.join("userdata");
         let path = userdata.join("statev2.sqlite");
@@ -137,20 +129,20 @@ struct Listed {
 
 impl Listed {
     fn thread(self) -> io::Result<T3Thread> {
-        let updated_at = millis(&self.updated_at)?;
+        let updated_at_ms = millis(&self.updated_at)?;
         let status = self.status.unwrap_or_else(|| "idle".into());
-        let finished = self
+        let result_at_ms = self
             .completed_at
             .as_deref()
-            .map_or(Ok(updated_at), millis)?;
+            .map_or(Ok(updated_at_ms), millis)?;
         let unseen = FINISHED.contains(&status.as_str())
             && optional_millis(self.last_visited_at.as_deref())?
-                .is_none_or(|visited| visited < finished);
-        // T3 wakes a snoozed thread early when it waits on you or fails after the snooze.
-        let failed_since = status == "failed"
-            && optional_millis(self.snoozed_at.as_deref())?.is_none_or(|at| finished > at);
+                .is_none_or(|visited| visited < result_at_ms);
+        // T3 ends a snooze early when the thread waits on you or fails after it was snoozed.
+        let failed_after_snooze = status == "failed"
+            && optional_millis(self.snoozed_at.as_deref())?.is_none_or(|at| result_at_ms > at);
         let snoozed_until = optional_millis(self.snoozed_until.as_deref())?
-            .filter(|_| status != "waiting" && !failed_since)
+            .filter(|_| status != "waiting" && !failed_after_snooze)
             .map(|until| until / 1000);
         Ok(T3Thread {
             id: self.id,
@@ -162,12 +154,11 @@ impl Listed {
             snoozed_until,
             pinned: self.pinned,
             unseen,
-            updated_at: updated_at / 1000,
+            updated_at: updated_at_ms / 1000,
         })
     }
 }
 
-/// T3's times to the millisecond, which is how finely it orders a visit against a result.
 fn millis(at: &str) -> io::Result<i64> {
     chrono::DateTime::parse_from_rfc3339(at)
         .map(|at| at.timestamp_millis())
@@ -193,7 +184,6 @@ mod tests {
 
     const ENV: &str = "env-1";
 
-    /// The tables and columns of T3 Code 0.1.7 that the reader uses, as T3 creates them.
     const SCHEMA: &str = "
         CREATE TABLE orchestration_v2_projection_threads (
           thread_id TEXT PRIMARY KEY, project_id TEXT NOT NULL, title TEXT NOT NULL,
@@ -493,7 +483,6 @@ mod tests {
             "completed",
             Some("2026-11-14T19:30:00.900Z"),
         );
-        // T3 marks a thread unread by moving its visit to just before the result.
         t3.thread(
             "marked-unread",
             updated,

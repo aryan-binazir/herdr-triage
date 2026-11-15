@@ -6,14 +6,10 @@ use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::triage::{Action, Display, Park, Refusal, Row, Section, SnoozePreset, snooze_presets};
 
-/// Where a picker row's thread lives, and so what opening it does.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Target {
-    /// A live Herdr agent in this pane.
     Pane(String),
-    /// A Herdr thread whose session is closed; opening it reopens the session.
     Closed,
-    /// A T3 Code thread, opened in the T3 app through this link.
     T3(String),
 }
 
@@ -33,16 +29,9 @@ pub enum Effect {
     None,
     Close,
     Focus(String),
-    /// Open a T3 thread in the T3 app through this link.
     OpenT3(String),
-    Apply {
-        key: String,
-        action: Action,
-    },
-    Rename {
-        key: String,
-        title: Option<String>,
-    },
+    Apply { key: String, action: Action },
+    Rename { key: String, title: Option<String> },
     Undo,
     ToggleSection(Section),
 }
@@ -608,8 +597,6 @@ impl Item {
         }
     }
 
-    /// The section a row collapses into. A T3 thread is running wherever T3 is, so it gathers
-    /// with the working agents while it works, though Herdr has no pane for it.
     pub fn section(&self) -> Option<Section> {
         match (&self.target, self.row.park) {
             (Target::T3(_), Some(park)) => Some(park.section()),
@@ -641,8 +628,6 @@ impl Item {
     }
 }
 
-/// Herdr's rows, already in triage order, with T3's threads after the Herdr rows of each rank,
-/// newest first; snoozed threads of either kind wake in order.
 pub fn combine(herdr: Vec<Item>, mut t3: Vec<Item>) -> Vec<Item> {
     t3.sort_by_key(|item| Reverse(item.row.changed_at));
     let mut items = herdr;

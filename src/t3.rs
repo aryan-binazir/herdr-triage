@@ -1,6 +1,3 @@
-//! T3 Code threads in the picker: what the local T3 server lists, shown beside Herdr's agents.
-//! The threads stay T3's; a row only points at one, and opening it hands it to the T3 app.
-
 mod db;
 
 use std::collections::BTreeMap;
@@ -15,19 +12,15 @@ use crate::triage::{Display, Park, Row, Thread};
 
 pub use db::Reader;
 
-/// How often the picker rereads T3's threads.
-const POLL: Duration = Duration::from_secs(2);
+const THREAD_POLL_INTERVAL: Duration = Duration::from_secs(2);
 
-const OPENER_WAIT: Duration = Duration::from_secs(2);
+const OPENER_EXIT_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// Settled T3 threads untouched this long stay out of the picker, as closed Herdr threads do.
 const SETTLED_RETENTION_SECS: i64 = 30 * 86_400;
 
-/// What the T3 server listed, complete as of one fetch.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Snapshot {
     pub environment_id: String,
-    /// Project titles by project id.
     pub projects: BTreeMap<String, String>,
     pub threads: Vec<T3Thread>,
 }
@@ -37,23 +30,17 @@ pub struct T3Thread {
     pub id: String,
     pub project_id: String,
     pub title: String,
-    /// `idle`, or the status of the thread's latest run.
     pub status: String,
     pub provider: String,
     pub settled: bool,
-    /// Set only while the snooze is still to wake.
     pub snoozed_until: Option<i64>,
     pub pinned: bool,
-    /// Its latest run finished after you last opened it.
     pub unseen: bool,
     pub updated_at: i64,
 }
 
-/// T3's threads as they change, read on a thread of their own until the receiver is dropped.
-/// `None` means T3 is not installed here; a read that fails sends nothing, so the picker keeps
-/// what it last had.
 pub fn watch() -> Receiver<Option<Snapshot>> {
-    watching(Reader::from_env(), POLL)
+    watching(Reader::from_env(), THREAD_POLL_INTERVAL)
 }
 
 fn watching(reader: Option<Reader>, every: Duration) -> Receiver<Option<Snapshot>> {
@@ -128,7 +115,6 @@ fn item(snapshot: &Snapshot, thread: &T3Thread, now: i64) -> Item {
     }
 }
 
-/// The thread's latest run in Herdr's words: a finished run is done until you open the thread.
 fn display(thread: &T3Thread) -> Display {
     match thread.status.as_str() {
         "preparing" | "queued" | "starting" | "running" => Display::Working,
@@ -150,7 +136,6 @@ fn provider_name(provider: &str) -> &str {
     }
 }
 
-/// Hands `link` to the desktop's URL opener, which starts or raises the T3 app on the thread.
 pub fn open(link: &str) -> io::Result<()> {
     let opener = if cfg!(target_os = "macos") {
         "open"
@@ -160,8 +145,6 @@ pub fn open(link: &str) -> io::Result<()> {
     open_with(opener, link)
 }
 
-/// Runs `opener` on `link` and waits briefly: an opener that fails reports it, and one still
-/// running by then has handed the link on.
 fn open_with(opener: &str, link: &str) -> io::Result<()> {
     let mut child = Command::new(opener)
         .arg(link)
@@ -169,7 +152,7 @@ fn open_with(opener: &str, link: &str) -> io::Result<()> {
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()?;
-    let deadline = Instant::now() + OPENER_WAIT;
+    let deadline = Instant::now() + OPENER_EXIT_TIMEOUT;
     while Instant::now() < deadline {
         match child.try_wait()? {
             Some(status) if status.success() => return Ok(()),
@@ -180,7 +163,6 @@ fn open_with(opener: &str, link: &str) -> io::Result<()> {
     Ok(())
 }
 
-/// The desktop app's link to a thread, its ids encoded as T3 encodes them.
 fn link(environment_id: &str, thread_id: &str) -> String {
     format!(
         "t3code://threads/{}/{}",
@@ -189,6 +171,7 @@ fn link(environment_id: &str, thread_id: &str) -> String {
     )
 }
 
+/// T3's own link segment encoding: `encodeURIComponent` that also escapes `.!~*'()`.
 fn encode(segment: &str) -> String {
     segment
         .bytes()
@@ -308,7 +291,6 @@ mod tests {
     fn a_t3_row_opens_its_thread_in_the_t3_app() {
         let id = "thread:delegated-task:command%3Amcp%3A1341bff3-d5ac-419d-bfd0-1331a5ec4918%3Adelegate-task%3A3c8b7723-c838-45b5-87c6-8cfc630d83ed";
         let items = items(&snapshot(vec![thread(id, "completed", "codex", 60)]), NOW);
-        // The link T3 itself handed out for this thread, which opened it in the desktop app.
         let expected = "t3code://threads/68a0648f-f112-4d91-a9e9-9ab9b19eeeb1/thread%3Adelegated-task%3Acommand%253Amcp%253A1341bff3-d5ac-419d-bfd0-1331a5ec4918%253Adelegate-task%253A3c8b7723-c838-45b5-87c6-8cfc630d83ed";
         assert_eq!(items[0].target, Target::T3(expected.into()));
         assert_eq!(items[0].pane_id(), None);
