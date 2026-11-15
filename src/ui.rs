@@ -549,7 +549,7 @@ fn enter_hint(picker: &Picker) -> Option<(&'static str, &'static str)> {
         Some(item) => Some(match item.target {
             Target::Pane(_) => ("enter", "focus"),
             Target::Closed => ("enter", "reopen"),
-            Target::T3(_) => ("enter", "open in T3"),
+            Target::T3 { .. } => ("enter", "open in T3"),
         }),
         None if picker.filter().is_empty() => match picker.rows().get(row) {
             Some(ListRow::Section { open: true, .. }) => Some(("enter", "collapse")),
@@ -659,6 +659,9 @@ fn prompt_line(picker: &Picker, width: usize) -> Option<(Line<'static>, Option<u
 }
 
 fn footer_line(picker: &Picker, width: usize) -> (Line<'static>, Option<usize>) {
+    if let Some(prompt) = prompt_line(picker, width) {
+        return prompt;
+    }
     if let Some(message) = picker.message() {
         let mark = if picker.message_is_error() {
             vec![
@@ -670,17 +673,12 @@ fn footer_line(picker: &Picker, width: usize) -> (Line<'static>, Option<usize>) 
         };
         return (Line::from(mark), None);
     }
-    if let Some(prompt) = prompt_line(picker, width) {
-        return prompt;
-    }
     let mut pairs: Vec<(&str, &str)> = enter_hint(picker).into_iter().collect();
     let line = match picker.mode() {
         Mode::Navigate => {
             pairs.extend([("j/k", "move"), ("/", "search")]);
-            if let Some(item) = picker
-                .selected()
-                .filter(|item| !matches!(item.target, Target::T3(_)))
-            {
+            if let Some(item) = picker.selected() {
+                let t3 = matches!(item.target, Target::T3 { .. });
                 let parked = |section| item.row.park.is_some_and(|park| park.section() == section);
                 pairs.extend([
                     (
@@ -699,19 +697,18 @@ fn footer_line(picker: &Picker, width: usize) -> (Line<'static>, Option<usize>) 
                             "snooze"
                         },
                     ),
-                    (
-                        "u",
-                        if item.row.display.unseen() {
-                            "read"
-                        } else {
-                            "unread"
-                        },
-                    ),
-                    ("p", if item.row.pinned { "unpin" } else { "pin" }),
-                    ("r", "rename"),
                 ]);
-                if item.row.refusal(Action::Forget).is_none() {
-                    pairs.push(("D", "forget"));
+                match (t3, item.row.display.unseen()) {
+                    (true, true) => {}
+                    (false, true) => pairs.push(("u", "read")),
+                    (_, false) => pairs.push(("u", "unread")),
+                }
+                pairs.push(("p", if item.row.pinned { "unpin" } else { "pin" }));
+                if !t3 {
+                    pairs.push(("r", "rename"));
+                    if item.row.refusal(Action::Forget).is_none() {
+                        pairs.push(("D", "forget"));
+                    }
                 }
             }
             if picker.undoable() {
@@ -1578,9 +1575,28 @@ mod tests {
         );
         assert!(!row.contains("◌") && !row.contains("closed"), "{row}");
         let footer = &lines[9];
-        assert!(footer.contains("enter open in T3"), "{footer}");
-        for hint in ["settle", "snooze", "read", "pin", "rename", "forget"] {
+        assert!(
+            footer.contains("enter open in T3") && footer.contains("s settle  z snooze  p pin"),
+            "{footer}"
+        );
+        for hint in ["u ", "rename", "forget"] {
             assert!(!footer.contains(hint), "{hint} in {footer}");
         }
+    }
+
+    #[test]
+    fn a_notice_that_arrives_during_a_prompt_waits_for_the_prompt_to_close() {
+        let mut picker = picker();
+        press(&mut picker, KeyCode::Char('z'));
+        picker.inform("done in T3".into());
+        let (lines, _) = render(&mut picker, 120, 14);
+        assert!(
+            lines[13].contains("snooze “fix flaky test”"),
+            "{}",
+            lines[13]
+        );
+        press(&mut picker, KeyCode::Esc);
+        let (lines, _) = render(&mut picker, 120, 14);
+        assert!(lines[13].contains("done in T3"), "{}", lines[13]);
     }
 }

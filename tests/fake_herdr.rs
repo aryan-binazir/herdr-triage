@@ -33,10 +33,9 @@ impl RunBinary for FakeHerdr {
 fn server_dir(herdr: &FakeHerdr) -> std::path::PathBuf {
     std::fs::read_dir(herdr.state_dir())
         .unwrap()
-        .next()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| path.is_dir())
         .unwrap()
-        .unwrap()
-        .path()
 }
 
 fn park(herdr: &FakeHerdr, key: &str, park: &str, until: Option<i64>) {

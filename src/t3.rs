@@ -1,16 +1,37 @@
+mod client;
 mod db;
 
 use std::collections::BTreeMap;
 use std::io;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::mpsc::{self, Receiver};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::picker::{Item, Target};
 use crate::triage::{Display, Park, Row, Thread};
 
+pub use client::{Client, Done};
+
+fn home() -> Option<PathBuf> {
+    let set = |name| std::env::var_os(name).filter(|value| !value.is_empty());
+    set("T3CODE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| set("HOME").map(|home| PathBuf::from(home).join(".t3")))
+}
 pub use db::Reader;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Op {
+    Settle,
+    Unsettle,
+    Snooze { until: i64 },
+    Unsnooze,
+    Pin,
+    Unpin,
+    MarkUnread,
+}
 
 const THREAD_POLL_INTERVAL: Duration = Duration::from_secs(2);
 
@@ -39,29 +60,95 @@ pub struct T3Thread {
     pub updated_at: i64,
 }
 
-pub fn watch() -> Receiver<Option<Snapshot>> {
-    watching(Reader::from_env(), THREAD_POLL_INTERVAL)
+#[derive(Debug, PartialEq, Eq)]
+pub enum Update {
+    Threads(Option<Snapshot>),
+    Done {
+        thread: String,
+        op: Op,
+        result: Result<Done, String>,
+    },
 }
 
-fn watching(reader: Option<Reader>, every: Duration) -> Receiver<Option<Snapshot>> {
-    let (sender, updates) = mpsc::channel();
-    if let Some(reader) = reader {
+pub struct Worker {
+    requests: Option<Sender<(String, Op)>>,
+    pub updates: Receiver<Update>,
+}
+
+impl Worker {
+    pub fn start(state_root: &Path) -> Self {
+        let mut client = Client::from_env(state_root);
+        Self::spawn(
+            Reader::from_env(),
+            move |thread: &str, op: Op| match client.as_mut() {
+                Some(client) => client.organize(thread, op),
+                None => Err(io::Error::other("T3 isn't installed here")),
+            },
+            THREAD_POLL_INTERVAL,
+        )
+    }
+
+    pub(crate) fn spawn(
+        reader: Option<Reader>,
+        mut act: impl FnMut(&str, Op) -> io::Result<Done> + Send + 'static,
+        every: Duration,
+    ) -> Self {
+        let (updates_sender, updates) = mpsc::channel();
+        let Some(reader) = reader else {
+            return Self {
+                requests: None,
+                updates,
+            };
+        };
+        let (requests, commands) = mpsc::channel::<(String, Op)>();
         thread::spawn(move || {
             let mut last = None;
-            loop {
-                if let Ok(snapshot) = reader.read()
-                    && last.as_ref() != Some(&snapshot)
-                {
-                    if sender.send(snapshot.clone()).is_err() {
-                        return;
-                    }
-                    last = Some(snapshot);
+            let read = |last: &mut Option<Option<Snapshot>>| {
+                let Ok(snapshot) = reader.read() else {
+                    return true;
+                };
+                if last.as_ref() == Some(&snapshot) {
+                    return true;
                 }
-                thread::sleep(every);
+                *last = Some(snapshot.clone());
+                updates_sender.send(Update::Threads(snapshot)).is_ok()
+            };
+            let mut next_poll = Instant::now();
+            loop {
+                let wait = next_poll.saturating_duration_since(Instant::now());
+                match commands.recv_timeout(wait) {
+                    Ok((thread, op)) => {
+                        let result = act(&thread, op).map_err(|error| error.to_string());
+                        let done = Update::Done { thread, op, result };
+                        if !read(&mut last) || updates_sender.send(done).is_err() {
+                            return;
+                        }
+                    }
+                    Err(RecvTimeoutError::Timeout) => {
+                        if !read(&mut last) {
+                            return;
+                        }
+                        next_poll = Instant::now() + every;
+                    }
+                    Err(RecvTimeoutError::Disconnected) => return,
+                }
             }
         });
+        Self {
+            requests: Some(requests),
+            updates,
+        }
     }
-    updates
+
+    pub fn request(&self, thread: &str, op: Op) -> bool {
+        self.requests
+            .as_ref()
+            .is_some_and(|requests| requests.send((thread.to_owned(), op)).is_ok())
+    }
+}
+
+pub fn row_key(thread: &str) -> String {
+    format!("t3:{thread}")
 }
 
 pub fn items(snapshot: &Snapshot, now: i64) -> Vec<Item> {
@@ -80,17 +167,15 @@ fn item(snapshot: &Snapshot, thread: &T3Thread, now: i64) -> Item {
         .cloned()
         .unwrap_or_else(|| "-".into());
     let kind = format!("t3 {}", provider_name(&thread.provider));
-    let park = if thread.settled {
-        Some(Park::Settled)
-    } else {
-        thread
-            .snoozed_until
-            .filter(|&until| until > now)
-            .map(|until| Park::Snoozed { until })
+    let snoozed = thread.snoozed_until.filter(|&until| until > now);
+    let park = match (snoozed, thread.settled) {
+        (Some(until), _) => Some(Park::Snoozed { until }),
+        (None, true) => Some(Park::Settled),
+        (None, false) => None,
     };
     let row = Row {
         agent_index: None,
-        key: format!("t3:{}", thread.id),
+        key: row_key(&thread.id),
         seq: 0,
         display: display(thread),
         park,
@@ -105,7 +190,10 @@ fn item(snapshot: &Snapshot, thread: &T3Thread, now: i64) -> Item {
         title: None,
     };
     Item {
-        target: Target::T3(link(&snapshot.environment_id, &thread.id)),
+        target: Target::T3 {
+            thread: thread.id.clone(),
+            link: link(&snapshot.environment_id, &thread.id),
+        },
         search: format!("{kind} {} {location}", thread.title),
         status: row.state_text(now, true),
         location,
@@ -292,7 +380,13 @@ mod tests {
         let id = "thread:delegated-task:command%3Amcp%3A1341bff3-d5ac-419d-bfd0-1331a5ec4918%3Adelegate-task%3A3c8b7723-c838-45b5-87c6-8cfc630d83ed";
         let items = items(&snapshot(vec![thread(id, "completed", "codex", 60)]), NOW);
         let expected = "t3code://threads/68a0648f-f112-4d91-a9e9-9ab9b19eeeb1/thread%3Adelegated-task%3Acommand%253Amcp%253A1341bff3-d5ac-419d-bfd0-1331a5ec4918%253Adelegate-task%253A3c8b7723-c838-45b5-87c6-8cfc630d83ed";
-        assert_eq!(items[0].target, Target::T3(expected.into()));
+        assert_eq!(
+            items[0].target,
+            Target::T3 {
+                thread: id.into(),
+                link: expected.into()
+            }
+        );
         assert_eq!(items[0].pane_id(), None);
         assert_eq!(items[0].row.key, format!("t3:{id}"));
     }
@@ -377,5 +471,16 @@ mod tests {
         let started = std::time::Instant::now();
         assert!(open_with("sleep", "30").is_ok());
         assert!(started.elapsed() < std::time::Duration::from_secs(10));
+    }
+
+    #[test]
+    fn a_settled_thread_snoozed_since_shows_as_snoozed_as_in_t3() {
+        let both = T3Thread {
+            settled: true,
+            snoozed_until: Some(NOW + 600),
+            ..thread("both", "completed", "codex", 60)
+        };
+        let items = items(&snapshot(vec![both]), NOW);
+        assert_eq!(items[0].row.park, Some(Park::Snoozed { until: NOW + 600 }));
     }
 }

@@ -70,7 +70,8 @@ fn run_picker() -> io::Result<()> {
         herdr: session.view()?,
         t3: None,
     };
-    let t3_updates = t3::watch();
+    let t3 = t3::Worker::start(&store::state_root());
+    let mut t3_sent = Vec::new();
     let mut picker = Picker::new(shown.items(), focus.as_deref(), &shown.herdr.open_sections);
     picker.set_undoable(shown.herdr.undoable);
 
@@ -78,9 +79,17 @@ fn run_picker() -> io::Result<()> {
     let started = Instant::now();
     let mut refreshed = Instant::now();
     let outcome = loop {
-        if let Some(snapshot) = t3_updates.try_iter().last() {
-            shown.t3 = snapshot;
-            picker.refresh(shown.items(), &shown.herdr.open_sections);
+        for update in t3.updates.try_iter() {
+            match update {
+                t3::Update::Threads(snapshot) => {
+                    shown.t3 = snapshot;
+                    picker.refresh(shown.items(), &shown.herdr.open_sections);
+                }
+                t3::Update::Done { op, result, .. } => {
+                    let sent = (!t3_sent.is_empty()).then(|| t3_sent.remove(0));
+                    t3_done(&mut picker, op, result, sent.as_ref());
+                }
+            }
         }
         let tick = usize::try_from(started.elapsed().as_millis() / 125).unwrap_or(0);
         if let Err(error) = terminal.draw(|frame| ui::draw(frame, &mut picker, tick, &pin_icon)) {
@@ -107,6 +116,14 @@ fn run_picker() -> io::Result<()> {
             Effect::Close => break Ok(Leave::Close),
             Effect::Focus(pane) => break Ok(Leave::Focus(pane)),
             Effect::OpenT3(link) => break Ok(Leave::OpenT3(link)),
+            Effect::T3 { thread, op } => {
+                if t3.request(&thread, op) {
+                    t3_sent.push(picker.sent(&t3::row_key(&thread)));
+                    picker.inform("asking T3…".into());
+                } else {
+                    picker.notify("T3 isn't installed here".into());
+                }
+            }
             Effect::Rename { key, title } => {
                 show(&mut picker, &mut shown, session.rename(&key, title));
             }
@@ -136,6 +153,26 @@ fn run_picker() -> io::Result<()> {
         Leave::OpenT3(link) => {
             t3::open(&link).or_else(|error| session.notify(&format!("Could not open T3: {error}")))
         }
+    }
+}
+
+fn t3_done(
+    picker: &mut Picker,
+    op: t3::Op,
+    result: Result<t3::Done, String>,
+    sent: Option<&picker::Sent>,
+) {
+    match result {
+        Ok(t3::Done::Applied) => {
+            picker.inform("done in T3".into());
+            if let Some(sent) =
+                sent.filter(|_| matches!(op, t3::Op::Settle | t3::Op::Snooze { .. }))
+            {
+                picker.move_on_after(sent);
+            }
+        }
+        Ok(t3::Done::AtTurnEnd) => picker.inform("settles in T3 when its turn ends".into()),
+        Err(error) => picker.notify(error),
     }
 }
 
