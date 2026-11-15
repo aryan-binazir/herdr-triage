@@ -19,6 +19,7 @@ const THREADS: &str = "
            COALESCE(t.provider_instance_id, t.default_provider),
            json_extract(t.payload_json, '$.settledOverride') IS 'settled',
            json_extract(t.payload_json, '$.snoozedUntil'),
+           json_extract(t.payload_json, '$.snoozedAt'),
            json_extract(t.payload_json, '$.pinnedAt') IS NOT NULL,
            json_extract(t.payload_json, '$.lastVisitedAt'),
            t.updated_at, r.status, r.completed_at
@@ -60,7 +61,7 @@ impl Reader {
     }
 
     /// What T3 has now, or `None` when T3 is not installed here.
-    pub fn read(&self, now: i64) -> io::Result<Option<Snapshot>> {
+    pub fn read(&self) -> io::Result<Option<Snapshot>> {
         let userdata = self.home.join("userdata");
         let path = userdata.join("statev2.sqlite");
         if !path.is_file() {
@@ -96,11 +97,12 @@ impl Reader {
                             provider: row.get::<_, Option<String>>(3)?.unwrap_or_default(),
                             settled: row.get(4)?,
                             snoozed_until: row.get(5)?,
-                            pinned: row.get(6)?,
-                            last_visited_at: row.get(7)?,
-                            updated_at: row.get(8)?,
-                            status: row.get(9)?,
-                            completed_at: row.get(10)?,
+                            snoozed_at: row.get(6)?,
+                            pinned: row.get(7)?,
+                            last_visited_at: row.get(8)?,
+                            updated_at: row.get(9)?,
+                            status: row.get(10)?,
+                            completed_at: row.get(11)?,
                         })
                     })?
                     .collect::<rusqlite::Result<Vec<Listed>>>()
@@ -108,7 +110,7 @@ impl Reader {
             .map_err(io::Error::other)?;
         let threads = rows
             .into_iter()
-            .map(|listed| listed.thread(now))
+            .map(Listed::thread)
             .collect::<io::Result<_>>()?;
         Ok(Some(Snapshot {
             environment_id,
@@ -125,6 +127,7 @@ struct Listed {
     provider: String,
     settled: bool,
     snoozed_until: Option<String>,
+    snoozed_at: Option<String>,
     pinned: bool,
     last_visited_at: Option<String>,
     updated_at: String,
@@ -133,25 +136,22 @@ struct Listed {
 }
 
 impl Listed {
-    fn thread(self, now: i64) -> io::Result<T3Thread> {
-        let updated_at = timestamp(&self.updated_at)?;
+    fn thread(self) -> io::Result<T3Thread> {
+        let updated_at = millis(&self.updated_at)?;
         let status = self.status.unwrap_or_else(|| "idle".into());
-        let unseen = if FINISHED.contains(&status.as_str()) {
-            let finished = self
-                .completed_at
-                .as_deref()
-                .map_or(Ok(updated_at), timestamp)?;
-            let visited = self.last_visited_at.as_deref().map(timestamp).transpose()?;
-            visited.is_none_or(|visited| visited < finished)
-        } else {
-            false
-        };
-        let snoozed_until = self
-            .snoozed_until
+        let finished = self
+            .completed_at
             .as_deref()
-            .map(timestamp)
-            .transpose()?
-            .filter(|&until| until > now);
+            .map_or(Ok(updated_at), millis)?;
+        let unseen = FINISHED.contains(&status.as_str())
+            && optional_millis(self.last_visited_at.as_deref())?
+                .is_none_or(|visited| visited < finished);
+        // T3 wakes a snoozed thread early when it waits on you or fails after the snooze.
+        let failed_since = status == "failed"
+            && optional_millis(self.snoozed_at.as_deref())?.is_none_or(|at| finished > at);
+        let snoozed_until = optional_millis(self.snoozed_until.as_deref())?
+            .filter(|_| status != "waiting" && !failed_since)
+            .map(|until| until / 1000);
         Ok(T3Thread {
             id: self.id,
             project_id: self.project_id,
@@ -162,15 +162,20 @@ impl Listed {
             snoozed_until,
             pinned: self.pinned,
             unseen,
-            updated_at,
+            updated_at: updated_at / 1000,
         })
     }
 }
 
-fn timestamp(at: &str) -> io::Result<i64> {
+/// T3's times to the millisecond, which is how finely it orders a visit against a result.
+fn millis(at: &str) -> io::Result<i64> {
     chrono::DateTime::parse_from_rfc3339(at)
-        .map(|at| at.timestamp())
+        .map(|at| at.timestamp_millis())
         .map_err(|error| io::Error::other(format!("T3 time {at}: {error}")))
+}
+
+fn optional_millis(at: Option<&str>) -> io::Result<Option<i64>> {
+    at.map(millis).transpose()
 }
 
 #[cfg(test)]
@@ -187,8 +192,6 @@ mod tests {
     use crate::t3::T3Thread;
 
     const ENV: &str = "env-1";
-    /// 2026-11-15T00:00:00Z
-    const NOW: i64 = 1_794_700_800;
 
     /// The tables and columns of T3 Code 0.1.7 that the reader uses, as T3 creates them.
     const SCHEMA: &str = "
@@ -323,7 +326,7 @@ mod tests {
             &json!({"snoozedUntil": "2026-11-14T23:00:00.000Z"}),
         );
 
-        let snapshot = t3.reader().read(NOW).unwrap().unwrap();
+        let snapshot = t3.reader().read().unwrap().unwrap();
         assert_eq!(snapshot.environment_id, ENV);
         assert_eq!(
             snapshot.projects,
@@ -351,7 +354,10 @@ mod tests {
                     unseen: true,
                     ..expected("unseen", "completed", updated)
                 },
-                expected("woke", "idle", updated),
+                T3Thread {
+                    snoozed_until: Some(at("2026-11-14T23:00:00.000Z")),
+                    ..expected("woke", "idle", updated)
+                },
                 expected("working", "running", updated),
             ]
         );
@@ -382,7 +388,7 @@ mod tests {
             .unwrap();
         let ids: Vec<String> = t3
             .reader()
-            .read(NOW)
+            .read()
             .unwrap()
             .unwrap()
             .threads
@@ -396,7 +402,7 @@ mod tests {
     fn without_t3_installed_there_is_nothing_to_read() {
         let empty = tempfile::tempdir().unwrap();
         assert_eq!(
-            Reader::new(empty.path().to_path_buf()).read(NOW).unwrap(),
+            Reader::new(empty.path().to_path_buf()).read().unwrap(),
             None
         );
         assert!(!empty.path().join("userdata/statev2.sqlite").exists());
@@ -408,7 +414,7 @@ mod tests {
         t3.db
             .execute_batch("DROP TABLE orchestration_v2_projection_runs;")
             .unwrap();
-        assert!(t3.reader().read(NOW).is_err());
+        assert!(t3.reader().read().is_err());
     }
 
     #[test]
@@ -417,7 +423,7 @@ mod tests {
         t3.thread("a", "2026-11-14T20:00:00.000Z", &json!({}));
         let path = t3.dir.path().join("userdata/statev2.sqlite");
         let before = fs::read(&path).unwrap();
-        t3.reader().read(NOW).unwrap().unwrap();
+        t3.reader().read().unwrap().unwrap();
         assert_eq!(fs::read(&path).unwrap(), before);
     }
 
@@ -470,5 +476,107 @@ mod tests {
             updates.recv_timeout(Duration::from_millis(100)),
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected)
         ));
+    }
+
+    #[test]
+    fn a_result_newer_than_your_last_visit_by_a_millisecond_is_unseen() {
+        let t3 = FakeT3::new();
+        let updated = "2026-11-14T20:00:00.000Z";
+        t3.thread(
+            "same-second",
+            updated,
+            &json!({"lastVisitedAt": "2026-11-14T19:30:00.100Z"}),
+        );
+        t3.run(
+            "same-second",
+            1,
+            "completed",
+            Some("2026-11-14T19:30:00.900Z"),
+        );
+        // T3 marks a thread unread by moving its visit to just before the result.
+        t3.thread(
+            "marked-unread",
+            updated,
+            &json!({"lastVisitedAt": "2026-11-14T19:30:00.899Z"}),
+        );
+        t3.run(
+            "marked-unread",
+            1,
+            "completed",
+            Some("2026-11-14T19:30:00.900Z"),
+        );
+        t3.thread(
+            "seen",
+            updated,
+            &json!({"lastVisitedAt": "2026-11-14T19:30:00.901Z"}),
+        );
+        t3.run("seen", 1, "completed", Some("2026-11-14T19:30:00.900Z"));
+        let mut unseen: Vec<(String, bool)> = t3
+            .reader()
+            .read()
+            .unwrap()
+            .unwrap()
+            .threads
+            .into_iter()
+            .map(|thread| (thread.id, thread.unseen))
+            .collect();
+        unseen.sort();
+        assert_eq!(
+            unseen,
+            [
+                ("marked-unread".to_owned(), true),
+                ("same-second".to_owned(), true),
+                ("seen".to_owned(), false),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_snooze_ends_early_as_in_t3_when_the_thread_waits_on_you_or_fails_after_it() {
+        let t3 = FakeT3::new();
+        let updated = "2026-11-14T20:00:00.000Z";
+        let snooze = json!({"snoozedUntil": "2026-11-15T09:00:00.000Z",
+            "snoozedAt": "2026-11-14T19:00:00.000Z"});
+        for id in ["waiting", "failed-after", "failed-before", "finished-after"] {
+            t3.thread(id, updated, &snooze);
+        }
+        t3.run("waiting", 1, "waiting", None);
+        t3.run(
+            "failed-after",
+            1,
+            "failed",
+            Some("2026-11-14T19:30:00.000Z"),
+        );
+        t3.run(
+            "failed-before",
+            1,
+            "failed",
+            Some("2026-11-14T18:30:00.000Z"),
+        );
+        t3.run(
+            "finished-after",
+            1,
+            "completed",
+            Some("2026-11-14T19:30:00.000Z"),
+        );
+        let mut snoozed: Vec<(String, bool)> = t3
+            .reader()
+            .read()
+            .unwrap()
+            .unwrap()
+            .threads
+            .into_iter()
+            .map(|thread| (thread.id, thread.snoozed_until.is_some()))
+            .collect();
+        snoozed.sort();
+        assert_eq!(
+            snoozed,
+            [
+                ("failed-after".to_owned(), false),
+                ("failed-before".to_owned(), true),
+                ("finished-after".to_owned(), true),
+                ("waiting".to_owned(), false),
+            ]
+        );
     }
 }

@@ -8,7 +8,7 @@ use std::io;
 use std::process::{Command, Stdio};
 use std::sync::mpsc::{self, Receiver};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::picker::{Item, Target};
 use crate::triage::{Display, Park, Row, Thread};
@@ -17,6 +17,8 @@ pub use db::Reader;
 
 /// How often the picker rereads T3's threads.
 const POLL: Duration = Duration::from_secs(2);
+
+const OPENER_WAIT: Duration = Duration::from_secs(2);
 
 /// Settled T3 threads untouched this long stay out of the picker, as closed Herdr threads do.
 const SETTLED_RETENTION_SECS: i64 = 30 * 86_400;
@@ -60,7 +62,7 @@ fn watching(reader: Option<Reader>, every: Duration) -> Receiver<Option<Snapshot
         thread::spawn(move || {
             let mut last = None;
             loop {
-                if let Ok(snapshot) = reader.read(chrono::Local::now().timestamp())
+                if let Ok(snapshot) = reader.read()
                     && last.as_ref() != Some(&snapshot)
                 {
                     if sender.send(snapshot.clone()).is_err() {
@@ -94,7 +96,10 @@ fn item(snapshot: &Snapshot, thread: &T3Thread, now: i64) -> Item {
     let park = if thread.settled {
         Some(Park::Settled)
     } else {
-        thread.snoozed_until.map(|until| Park::Snoozed { until })
+        thread
+            .snoozed_until
+            .filter(|&until| until > now)
+            .map(|until| Park::Snoozed { until })
     };
     let row = Row {
         agent_index: None,
@@ -152,13 +157,27 @@ pub fn open(link: &str) -> io::Result<()> {
     } else {
         "xdg-open"
     };
-    Command::new(opener)
+    open_with(opener, link)
+}
+
+/// Runs `opener` on `link` and waits briefly: an opener that fails reports it, and one still
+/// running by then has handed the link on.
+fn open_with(opener: &str, link: &str) -> io::Result<()> {
+    let mut child = Command::new(opener)
         .arg(link)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .spawn()
-        .map(drop)
+        .spawn()?;
+    let deadline = Instant::now() + OPENER_WAIT;
+    while Instant::now() < deadline {
+        match child.try_wait()? {
+            Some(status) if status.success() => return Ok(()),
+            Some(status) => return Err(io::Error::other(format!("{opener} {status}"))),
+            None => thread::sleep(Duration::from_millis(20)),
+        }
+    }
+    Ok(())
 }
 
 /// The desktop app's link to a thread, its ids encoded as T3 encodes them.
@@ -355,5 +374,26 @@ mod tests {
         assert!(items[0].row.pinned);
         assert_eq!(items[0].section(), None);
         assert!(!items[1].row.pinned, "settling unpins, as in T3");
+    }
+
+    #[test]
+    fn a_snooze_whose_time_has_come_wakes_even_in_a_snapshot_read_before() {
+        let woke = T3Thread {
+            snoozed_until: Some(NOW - 1),
+            ..thread("woke", "completed", "codex", 600)
+        };
+        let items = items(&snapshot(vec![woke]), NOW);
+        assert_eq!(items[0].row.park, None);
+        assert_eq!(items[0].section(), None);
+    }
+
+    #[test]
+    fn a_launcher_that_fails_is_reported_and_one_still_running_has_taken_the_link() {
+        assert!(open_with("false", "t3code://threads/e/t").is_err());
+        assert!(open_with("true", "t3code://threads/e/t").is_ok());
+        assert!(open_with("herdr-triage-no-such-opener", "t3code://threads/e/t").is_err());
+        let started = std::time::Instant::now();
+        assert!(open_with("sleep", "30").is_ok());
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
     }
 }

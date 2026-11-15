@@ -265,10 +265,12 @@ impl Picker {
                 ..
             })
         );
-        if t3_selected
-            && !ctrl
-            && matches!(key.code, KeyCode::Char('s' | 'z' | 'u' | 'p' | 'r' | 'D'))
-        {
+        let triage_key = match key.code {
+            KeyCode::Char('s' | 'z' | 'u' | 'r' | 'D') => true,
+            KeyCode::Char('p') => !ctrl,
+            _ => false,
+        };
+        if t3_selected && triage_key {
             self.notify(T3_TRIAGE.into());
             return Effect::None;
         }
@@ -493,7 +495,7 @@ impl Picker {
             .iter()
             .enumerate()
             .filter_map(|(at, &entry)| match entry {
-                Entry::Agent(i) if self.items[i].row.live() => {
+                Entry::Agent(i) if self.items[i].target != Target::Closed => {
                     Some((self.items[i].row.attention()?, at))
                 }
                 _ => None,
@@ -1439,6 +1441,54 @@ mod tests {
                 "old spike",
                 "t3 settled",
             ]
+        );
+    }
+
+    #[test]
+    fn parking_moves_on_to_a_t3_thread_that_needs_you_more() {
+        let herdr = Fixture::new(
+            NOW,
+            &[
+                ("p1", "api refactor", Status::Idle),
+                ("p2", "fix flaky test", Status::Done),
+            ],
+        )
+        .act("p1", Action::ToggleSettle);
+        let mut items = listed(&herdr);
+        let snapshot = crate::t3::Snapshot {
+            environment_id: "env".into(),
+            projects: std::collections::BTreeMap::new(),
+            threads: vec![t3_thread("t3-waiting", "waiting")],
+        };
+        items.extend(crate::t3::items(&snapshot, NOW));
+        let mut picker = Picker::new(items, None, &closed_sections());
+        picker.move_on_from("k-p1", 0);
+        assert_eq!(
+            picker.selected().map(|item| item.row.label()),
+            Some("t3-waiting")
+        );
+    }
+
+    #[test]
+    fn control_keys_cannot_triage_a_t3_thread_but_still_move() {
+        let mut picker = Picker::new(with_t3(), None, &closed_sections());
+        select(&mut picker, "t3-done");
+        let ctrl = |picker: &mut Picker, c| {
+            picker.key(
+                KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL),
+                NOW,
+                &chrono::Utc,
+            )
+        };
+        for key in ['s', 'z', 'u', 'r', 'D'] {
+            assert_eq!(ctrl(&mut picker, key), Effect::None, "{key}");
+            assert!(picker.rename_prompt().is_none(), "{key}");
+            assert!(picker.snooze_prompt().is_none(), "{key}");
+        }
+        ctrl(&mut picker, 'p');
+        assert_eq!(
+            picker.selected().map(|item| item.row.label()),
+            Some("terraform plan")
         );
     }
 }
