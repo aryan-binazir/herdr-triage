@@ -42,11 +42,7 @@ pub struct Reader {
 
 impl Reader {
     pub fn from_env() -> Option<Self> {
-        let set = |name| std::env::var_os(name).filter(|value| !value.is_empty());
-        set("T3CODE_HOME")
-            .map(PathBuf::from)
-            .or_else(|| set("HOME").map(|home| PathBuf::from(home).join(".t3")))
-            .map(Self::new)
+        super::home().map(Self::new)
     }
 
     pub fn new(home: PathBuf) -> Self {
@@ -417,18 +413,33 @@ mod tests {
         assert_eq!(fs::read(&path).unwrap(), before);
     }
 
+    fn worker(reader: Option<Reader>) -> crate::t3::Worker {
+        crate::t3::Worker::spawn(
+            reader,
+            |_: &str, _: crate::t3::Op| Ok(crate::t3::Done::Applied),
+            Duration::from_millis(5),
+        )
+    }
+
+    fn threads(update: crate::t3::Update) -> Option<Snapshot> {
+        match update {
+            crate::t3::Update::Threads(snapshot) => snapshot,
+            other @ crate::t3::Update::Done { .. } => panic!("expected threads, got {other:?}"),
+        }
+    }
+
     #[test]
-    fn the_watcher_sends_changes_only_and_never_a_failed_read() {
+    fn the_worker_sends_changes_only_and_never_a_failed_read() {
         let t3 = FakeT3::new();
         t3.thread("a", "2026-11-14T20:00:00.000Z", &json!({}));
-        let updates = crate::t3::watching(Some(t3.reader()), Duration::from_millis(5));
-        let first = updates
-            .recv_timeout(Duration::from_secs(5))
-            .unwrap()
-            .unwrap();
+        let worker = worker(Some(t3.reader()));
+        let first = threads(worker.updates.recv_timeout(Duration::from_secs(5)).unwrap()).unwrap();
         assert_eq!(first.threads.len(), 1);
         assert!(
-            updates.recv_timeout(Duration::from_millis(100)).is_err(),
+            worker
+                .updates
+                .recv_timeout(Duration::from_millis(100))
+                .is_err(),
             "nothing changed"
         );
 
@@ -436,7 +447,10 @@ mod tests {
             .execute_batch("ALTER TABLE orchestration_v2_projection_threads RENAME TO renamed;")
             .unwrap();
         assert!(
-            updates.recv_timeout(Duration::from_millis(100)).is_err(),
+            worker
+                .updates
+                .recv_timeout(Duration::from_millis(100))
+                .is_err(),
             "a failed read keeps the last list"
         );
 
@@ -444,28 +458,81 @@ mod tests {
             .execute_batch("ALTER TABLE renamed RENAME TO orchestration_v2_projection_threads;")
             .unwrap();
         t3.thread("b", "2026-11-14T20:00:00.000Z", &json!({}));
-        let second = updates
-            .recv_timeout(Duration::from_secs(5))
-            .unwrap()
-            .unwrap();
+        let second = threads(worker.updates.recv_timeout(Duration::from_secs(5)).unwrap()).unwrap();
         assert_eq!(second.threads.len(), 2);
     }
 
     #[test]
-    fn without_t3_the_watcher_says_so_once_and_with_no_home_it_stays_silent() {
+    fn without_t3_the_worker_says_so_once_and_with_no_home_it_stays_silent() {
         let empty = tempfile::tempdir().unwrap();
-        let updates = crate::t3::watching(
-            Some(Reader::new(empty.path().to_path_buf())),
-            Duration::from_millis(5),
+        let worker = worker(Some(Reader::new(empty.path().to_path_buf())));
+        assert_eq!(
+            threads(worker.updates.recv_timeout(Duration::from_secs(5)).unwrap()),
+            None
         );
-        assert_eq!(updates.recv_timeout(Duration::from_secs(5)).unwrap(), None);
-        assert!(updates.recv_timeout(Duration::from_millis(100)).is_err());
+        assert!(
+            worker
+                .updates
+                .recv_timeout(Duration::from_millis(100))
+                .is_err()
+        );
 
-        let updates = crate::t3::watching(None, Duration::from_millis(5));
+        let worker = self::worker(None);
         assert!(matches!(
-            updates.recv_timeout(Duration::from_millis(100)),
+            worker.updates.recv_timeout(Duration::from_millis(100)),
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected)
         ));
+        assert!(!worker.request("t1", crate::t3::Op::Pin));
+    }
+
+    #[test]
+    fn a_command_is_answered_after_the_threads_it_changed() {
+        use crate::t3::{Done, Op, Update};
+        let t3 = FakeT3::new();
+        t3.thread("a", "2026-11-14T20:00:00.000Z", &json!({}));
+        let path = t3.dir.path().join("userdata/statev2.sqlite");
+        // Polls far apart, so only the command can make the worker read again.
+        let worker = crate::t3::Worker::spawn(
+            Some(t3.reader()),
+            move |thread: &str, op: Op| {
+                let db = Connection::open(&path).unwrap();
+                db.execute(
+                    "UPDATE orchestration_v2_projection_threads
+                     SET payload_json = json_set(payload_json, '$.settledOverride', 'settled')
+                     WHERE thread_id = ?1",
+                    params![thread],
+                )
+                .unwrap();
+                match op {
+                    Op::Settle => Ok(Done::Applied),
+                    _ => Err(io::Error::other("T3: refused")),
+                }
+            },
+            Duration::from_secs(3_600),
+        );
+        threads(worker.updates.recv_timeout(Duration::from_secs(5)).unwrap());
+        assert!(worker.request("a", Op::Settle));
+        let settled =
+            threads(worker.updates.recv_timeout(Duration::from_secs(5)).unwrap()).unwrap();
+        assert!(settled.threads[0].settled);
+        assert_eq!(
+            worker.updates.recv_timeout(Duration::from_secs(5)).unwrap(),
+            Update::Done {
+                thread: "a".into(),
+                op: Op::Settle,
+                result: Ok(Done::Applied)
+            }
+        );
+
+        assert!(worker.request("a", Op::Pin));
+        assert_eq!(
+            worker.updates.recv_timeout(Duration::from_secs(5)).unwrap(),
+            Update::Done {
+                thread: "a".into(),
+                op: Op::Pin,
+                result: Err("T3: refused".into())
+            }
+        );
     }
 
     #[test]

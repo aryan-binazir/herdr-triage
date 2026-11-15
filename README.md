@@ -135,13 +135,25 @@ points at it, and `enter` (or its digit) opens it in the T3 desktop app through 
 - T3 rows follow the Herdr rows of the same rank, newest first; snoozed rows of either kind wake
   in order. Settled T3 threads untouched for 30 days are left out. Subagent and side-chat
   threads stay under their parent, as in T3.
-- Triage and rename T3 threads in T3: `s`, `z`, `u`, `p`, `r` and `D` on a T3 row say so and
-  change nothing. `next` and the sidebar cover Herdr's agents only.
+- `s`, `z`, `p` and `u` on a T3 row have T3 settle or unsettle, snooze (same presets) or wake,
+  pin or unpin, and mark unread the thread; the row moves once T3 has done it. T3 decides what it
+  allows and the footer shows its answer, for example that a thread with no finished run can't be
+  marked unread, or that settling a working thread waits for its turn to end. T3 marks a thread
+  read when you open it. Rename and forget T3 threads in T3; `U` undoes Herdr changes only.
+  `next` and the sidebar cover Herdr's agents only.
+- The first change signs herdr-triage in to T3, with no browser: the local `t3` command issues a
+  one-time pairing code (`t3 auth pairing create`), which approves herdr-triage at T3's `auto`
+  access level. T3 then issues a 30-day token, kept owner-only in the plugin state directory
+  (`t3-token.json`); when it expires or is revoked, the next change signs in again. `auto` lets
+  herdr-triage change threads that run in `approval-required` to `auto` mode; T3 refuses changes
+  to `full-access` threads. The token can also message threads, so treat the file like a T3
+  login. See and revoke it with `t3 auth session list` and `t3 auth session revoke <id>`.
 - The picker reads T3's database (`$T3CODE_HOME`, else `~/.t3`, at `userdata/statev2.sqlite`)
-  read-only, every 2 seconds, on a thread of its own. It never writes to it and needs no T3
-  sign-in. Only this machine's T3 threads appear, not those of other T3 environments the app is
-  connected to. If T3 isn't installed, or an update reshapes its database, the picker simply
-  shows no T3 rows (or keeps the last ones it read); Herdr's rows are unaffected.
+  read-only, every 2 seconds, on a thread of its own, which also sends the picker's changes to
+  T3's server. Only this machine's T3 threads appear, not those of other T3 environments the app
+  is connected to. If T3 isn't installed, isn't running, or an update reshapes its database, the
+  picker shows no T3 rows (or keeps the last ones it read) and T3 changes fail with a message;
+  Herdr's rows are unaffected.
 
 ## Sidebar
 
@@ -167,7 +179,7 @@ pin_icon = ""   # default: Nerd Font nf-oct-pin (U+F435); use any text without a
 
 ## How it works
 
-There is no resident daemon. Hooks never touch T3; only the open picker reads it. Herdr runs `herdr-triage sync` on agent status changes, focus changes,
+There is no resident daemon. Hooks never touch T3; only the open picker reads it or sends it changes. Herdr runs `herdr-triage sync` on agent status changes, focus changes,
 agent detection and pane exits (a hook that finds a sync already running asks it to sync again and
 exits, since Herdr rejects plugin commands beyond 32 at once); each sync reconciles threads with `agent.list`, then, under a file lock,
 reports tokens wherever Herdr's copy differs and sets the Agents view. A startup hook does the same after

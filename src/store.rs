@@ -42,6 +42,20 @@ CREATE TABLE IF NOT EXISTS threads (
 CREATE TABLE IF NOT EXISTS settings (name TEXT PRIMARY KEY, value TEXT NOT NULL);
 ";
 
+/// The plugin's state directory, shared by every Herdr server.
+pub fn state_root() -> PathBuf {
+    std::env::var_os("HERDR_PLUGIN_STATE_DIR").map_or_else(
+        || {
+            let state = std::env::var_os("XDG_STATE_HOME").map_or_else(
+                || PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".local/state"),
+                PathBuf::from,
+            );
+            state.join("herdr/plugins/ar.triage")
+        },
+        PathBuf::from,
+    )
+}
+
 pub struct Store {
     dir: PathBuf,
 }
@@ -49,20 +63,7 @@ pub struct Store {
 impl Store {
     /// Herdr shares one plugin state directory across sessions.
     pub fn for_socket(socket: &Path) -> Self {
-        let root = std::env::var_os("HERDR_PLUGIN_STATE_DIR").map_or_else(
-            || {
-                let state = std::env::var_os("XDG_STATE_HOME").map_or_else(
-                    || {
-                        PathBuf::from(std::env::var_os("HOME").unwrap_or_default())
-                            .join(".local/state")
-                    },
-                    PathBuf::from,
-                );
-                state.join("herdr/plugins/ar.triage")
-            },
-            PathBuf::from,
-        );
-        Self::at(root.join(format!(
+        Self::at(state_root().join(format!(
             "{:016x}",
             fnv1a(socket.as_os_str().as_encoded_bytes())
         )))

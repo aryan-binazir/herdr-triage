@@ -4,13 +4,14 @@ use std::collections::BTreeSet;
 use chrono::TimeZone;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
+use crate::t3::Op as T3Op;
 use crate::triage::{Action, Display, Park, Refusal, Row, Section, SnoozePreset, snooze_presets};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Target {
     Pane(String),
     Closed,
-    T3(String),
+    T3 { thread: String, link: String },
 }
 
 #[derive(Debug, Clone)]
@@ -30,13 +31,15 @@ pub enum Effect {
     Close,
     Focus(String),
     OpenT3(String),
+    T3 { thread: String, op: T3Op },
     Apply { key: String, action: Action },
     Rename { key: String, title: Option<String> },
     Undo,
     ToggleSection(Section),
 }
 
-const T3_TRIAGE: &str = "a T3 thread: triage and rename it in T3";
+const T3_READ: &str = "T3 marks a thread read when you open it";
+const T3_ONLY: &str = "rename or forget T3 threads in T3";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
@@ -70,6 +73,8 @@ pub struct ForgetPrompt {
 #[derive(Debug, Clone)]
 pub struct SnoozePrompt {
     pub key: String,
+    /// The T3 thread to snooze, when the row is one.
+    t3_thread: Option<String>,
     pub label: String,
     pub presets: Vec<SnoozePreset>,
 }
@@ -222,12 +227,18 @@ impl Picker {
             else {
                 return Effect::None;
             };
-            let key = prompt.key.clone();
-            self.snooze = None;
-            return Effect::Apply {
-                key,
-                action: Action::Snooze(until),
+            let effect = match &prompt.t3_thread {
+                Some(thread) => Effect::T3 {
+                    thread: thread.clone(),
+                    op: T3Op::Snooze { until },
+                },
+                None => Effect::Apply {
+                    key: prompt.key.clone(),
+                    action: Action::Snooze(until),
+                },
             };
+            self.snooze = None;
+            return effect;
         }
         if key.code == KeyCode::Enter {
             return match self.entries.get(self.selected) {
@@ -247,21 +258,8 @@ impl Picker {
     }
 
     fn navigate_key(&mut self, key: KeyEvent, ctrl: bool, now: i64, tz: &impl TimeZone) -> Effect {
-        let t3_selected = matches!(
-            self.selected(),
-            Some(Item {
-                target: Target::T3(_),
-                ..
-            })
-        );
-        let triage_key = match key.code {
-            KeyCode::Char('s' | 'z' | 'u' | 'r' | 'D') => true,
-            KeyCode::Char('p') => !ctrl,
-            _ => false,
-        };
-        if t3_selected && triage_key {
-            self.notify(T3_TRIAGE.into());
-            return Effect::None;
+        if let Some(effect) = self.t3_key(key, ctrl, now, tz) {
+            return effect;
         }
         let apply = |picker: &Self, action| {
             picker
@@ -326,6 +324,7 @@ impl Picker {
                 }
                 self.snooze = Some(SnoozePrompt {
                     key: item.row.key.clone(),
+                    t3_thread: None,
                     label: item.row.label().to_owned(),
                     presets: snooze_presets(now, tz),
                 });
@@ -333,6 +332,49 @@ impl Picker {
             _ => {}
         }
         Effect::None
+    }
+
+    /// What a triage key does on a T3 row, or `None` when the row or the key is not one.
+    fn t3_key(
+        &mut self,
+        key: KeyEvent,
+        ctrl: bool,
+        now: i64,
+        tz: &impl TimeZone,
+    ) -> Option<Effect> {
+        let item = self.selected()?;
+        let Target::T3 { thread, .. } = &item.target else {
+            return None;
+        };
+        let thread = thread.clone();
+        let parked = item.row.park;
+        let op = match key.code {
+            KeyCode::Char('s') if parked == Some(Park::Settled) => T3Op::Unsettle,
+            KeyCode::Char('s') => T3Op::Settle,
+            KeyCode::Char('z') if matches!(parked, Some(Park::Snoozed { .. })) => T3Op::Unsnooze,
+            KeyCode::Char('z') => {
+                self.snooze = Some(SnoozePrompt {
+                    key: item.row.key.clone(),
+                    t3_thread: Some(thread),
+                    label: item.row.label().to_owned(),
+                    presets: snooze_presets(now, tz),
+                });
+                return Some(Effect::None);
+            }
+            KeyCode::Char('p') if !ctrl && item.row.pinned => T3Op::Unpin,
+            KeyCode::Char('p') if !ctrl => T3Op::Pin,
+            KeyCode::Char('u') if item.row.display.unseen() => {
+                self.notify(T3_READ.into());
+                return Some(Effect::None);
+            }
+            KeyCode::Char('u') => T3Op::MarkUnread,
+            KeyCode::Char('r' | 'D') => {
+                self.notify(T3_ONLY.into());
+                return Some(Effect::None);
+            }
+            _ => return None,
+        };
+        Some(Effect::T3 { thread, op })
     }
 
     fn search_key(&mut self, key: KeyEvent, ctrl: bool) {
@@ -367,7 +409,7 @@ impl Picker {
                 key: item.row.key.clone(),
                 action: Action::Reopen,
             },
-            Target::T3(link) => Effect::OpenT3(link.clone()),
+            Target::T3 { link, .. } => Effect::OpenT3(link.clone()),
         }
     }
 
@@ -593,17 +635,19 @@ impl Item {
     pub fn pane_id(&self) -> Option<&str> {
         match &self.target {
             Target::Pane(pane) => Some(pane),
-            Target::Closed | Target::T3(_) => None,
+            Target::Closed | Target::T3 { .. } => None,
         }
     }
 
     pub fn section(&self) -> Option<Section> {
         match (&self.target, self.row.park) {
-            (Target::T3(_), Some(park)) => Some(park.section()),
-            (Target::T3(_), None) if self.row.display == Display::Working && !self.row.pinned => {
+            (Target::T3 { .. }, Some(park)) => Some(park.section()),
+            (Target::T3 { .. }, None)
+                if self.row.display == Display::Working && !self.row.pinned =>
+            {
                 Some(Section::Working)
             }
-            (Target::T3(_), None) => None,
+            (Target::T3 { .. }, None) => None,
             _ => self.row.section(),
         }
     }
@@ -1364,11 +1408,96 @@ mod tests {
         assert_eq!(press(&mut picker, KeyCode::Char('4')), opened);
     }
 
+    fn t3_op(thread: &str, op: crate::t3::Op) -> Effect {
+        Effect::T3 {
+            thread: thread.into(),
+            op,
+        }
+    }
+
+    fn t3_shelf() -> Vec<Item> {
+        let thread = |id: &str, status: &str, unseen: bool| crate::t3::T3Thread {
+            unseen,
+            ..t3_thread(id, status)
+        };
+        let snapshot = crate::t3::Snapshot {
+            environment_id: "env".into(),
+            projects: std::collections::BTreeMap::new(),
+            threads: vec![
+                thread("t3-done", "completed", true),
+                thread("t3-seen", "completed", false),
+                crate::t3::T3Thread {
+                    pinned: true,
+                    ..thread("t3-pinned", "completed", false)
+                },
+                crate::t3::T3Thread {
+                    snoozed_until: Some(NOW + 600),
+                    ..thread("t3-snoozed", "completed", false)
+                },
+                crate::t3::T3Thread {
+                    settled: true,
+                    ..thread("t3-settled", "completed", false)
+                },
+            ],
+        };
+        crate::t3::items(&snapshot, NOW)
+    }
+
     #[test]
-    fn triage_keys_on_a_t3_thread_say_to_use_t3_and_change_nothing() {
-        let mut picker = Picker::new(with_t3(), None, &closed_sections());
+    fn triage_keys_on_a_t3_thread_send_t3_its_own_commands() {
+        use crate::t3::Op;
+        let mut sections = closed_sections();
+        sections.extend([Section::Snoozed, Section::Settled]);
+        let mut picker = Picker::new(t3_shelf(), None, &sections);
         select(&mut picker, "t3-done");
-        for key in ['s', 'z', 'u', 'p', 'r', 'D'] {
+        assert_eq!(
+            press(&mut picker, KeyCode::Char('s')),
+            t3_op("t3-done", Op::Settle)
+        );
+        assert_eq!(
+            press(&mut picker, KeyCode::Char('p')),
+            t3_op("t3-done", Op::Pin)
+        );
+        assert_eq!(press(&mut picker, KeyCode::Char('z')), Effect::None);
+        assert!(picker.snooze_prompt().is_some());
+        assert_eq!(
+            press(&mut picker, KeyCode::Char('1')),
+            t3_op("t3-done", Op::Snooze { until: NOW + 3_600 })
+        );
+        assert_eq!(press(&mut picker, KeyCode::Char('u')), Effect::None);
+        assert!(picker.message_is_error());
+        assert_eq!(
+            picker.message(),
+            Some("T3 marks a thread read when you open it")
+        );
+
+        select(&mut picker, "t3-seen");
+        assert_eq!(
+            press(&mut picker, KeyCode::Char('u')),
+            t3_op("t3-seen", Op::MarkUnread)
+        );
+        select(&mut picker, "t3-pinned");
+        assert_eq!(
+            press(&mut picker, KeyCode::Char('p')),
+            t3_op("t3-pinned", Op::Unpin)
+        );
+        select(&mut picker, "t3-snoozed");
+        assert_eq!(
+            press(&mut picker, KeyCode::Char('z')),
+            t3_op("t3-snoozed", Op::Unsnooze)
+        );
+        select(&mut picker, "t3-settled");
+        assert_eq!(
+            press(&mut picker, KeyCode::Char('s')),
+            t3_op("t3-settled", Op::Unsettle)
+        );
+    }
+
+    #[test]
+    fn rename_and_forget_stay_with_t3_and_undo_stays_with_herdr() {
+        let mut picker = Picker::new(t3_shelf(), None, &closed_sections());
+        select(&mut picker, "t3-done");
+        for key in ['r', 'D'] {
             assert_eq!(
                 press(&mut picker, KeyCode::Char(key)),
                 Effect::None,
@@ -1377,12 +1506,10 @@ mod tests {
             assert!(picker.message_is_error(), "{key}");
             assert_eq!(
                 picker.message(),
-                Some("a T3 thread: triage and rename it in T3"),
+                Some("rename or forget T3 threads in T3"),
                 "{key}"
             );
-            assert!(picker.snooze_prompt().is_none());
-            assert!(picker.rename_prompt().is_none());
-            assert!(picker.forget_prompt().is_none());
+            assert!(picker.rename_prompt().is_none() && picker.forget_prompt().is_none());
         }
         assert_eq!(press(&mut picker, KeyCode::Char('U')), Effect::Undo);
         press(&mut picker, KeyCode::Char('/'));
@@ -1455,7 +1582,7 @@ mod tests {
     }
 
     #[test]
-    fn control_keys_cannot_triage_a_t3_thread_but_still_move() {
+    fn control_keys_on_a_t3_thread_act_as_on_herdr_rows_and_ctrl_p_still_moves() {
         let mut picker = Picker::new(with_t3(), None, &closed_sections());
         select(&mut picker, "t3-done");
         let ctrl = |picker: &mut Picker, c| {
@@ -1465,11 +1592,12 @@ mod tests {
                 &chrono::Utc,
             )
         };
-        for key in ['s', 'z', 'u', 'r', 'D'] {
-            assert_eq!(ctrl(&mut picker, key), Effect::None, "{key}");
-            assert!(picker.rename_prompt().is_none(), "{key}");
-            assert!(picker.snooze_prompt().is_none(), "{key}");
-        }
+        assert_eq!(
+            ctrl(&mut picker, 's'),
+            t3_op("t3-done", crate::t3::Op::Settle)
+        );
+        assert_eq!(ctrl(&mut picker, 'r'), Effect::None);
+        assert!(picker.rename_prompt().is_none());
         ctrl(&mut picker, 'p');
         assert_eq!(
             picker.selected().map(|item| item.row.label()),
