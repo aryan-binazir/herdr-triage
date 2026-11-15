@@ -4,6 +4,7 @@
 use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Write};
 use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
@@ -173,6 +174,9 @@ impl Client {
         if result["isError"] == json!(true) {
             let message = answer["message"].as_str().unwrap_or(text);
             return Err(other(format!("T3: {message}")).into());
+        }
+        if !answer.is_object() {
+            return Err(other("T3 sent an unreadable reply; check the thread in T3").into());
         }
         Ok(if answer["settlesWhenTurnEnds"] == json!(true) {
             Done::AtTurnEnd
@@ -360,6 +364,7 @@ impl Client {
                 "--json",
             ])
             .env("T3CODE_HOME", &self.home)
+            .process_group(0)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -380,8 +385,7 @@ impl Client {
                 break status;
             }
             if Instant::now() >= deadline {
-                let _ = child.kill();
-                let _ = child.wait();
+                stop_group(&mut child);
                 return Err(other("t3 took too long to issue a pairing code"));
             }
             thread::sleep(Duration::from_millis(25));
@@ -410,6 +414,26 @@ impl Client {
             .map_err(unsent)?;
         json_body(response)
     }
+}
+
+/// Stops the launcher and everything it started: TERM first, so its own cleanup runs.
+fn stop_group(child: &mut std::process::Child) {
+    let group = format!("-{}", child.id());
+    let signal = |name: &str| {
+        let _ = Command::new("kill")
+            .args([name, &group])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    };
+    signal("-TERM");
+    let deadline = Instant::now() + Duration::from_secs(1);
+    while Instant::now() < deadline && matches!(child.try_wait(), Ok(None)) {
+        thread::sleep(Duration::from_millis(20));
+    }
+    signal("-KILL");
+    let _ = child.wait();
 }
 
 fn action(op: Op) -> &'static str {
@@ -1205,5 +1229,39 @@ mod tests {
         let error = client.organize("t1", Op::Pin).unwrap_err();
         assert!(started.elapsed() < std::time::Duration::from_secs(5));
         assert!(error.to_string().contains("t3 took too long"), "{error}");
+    }
+
+    #[test]
+    fn a_reply_that_says_nothing_is_not_taken_for_success() {
+        let fake = FakeT3::start();
+        accept_pairing(&fake, &["CODE1"]);
+        fake.server.lock().unwrap().organize_reply = Some((false, "not json".into()));
+        let error = fake.client().organize("t1", Op::Pin).unwrap_err();
+        assert!(
+            error.to_string().contains("check the thread in T3"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_t3_command_that_hangs_is_stopped_with_everything_it_started() {
+        let fake = FakeT3::start();
+        fs::write(
+            fake.home().join("bin/t3"),
+            "#!/bin/sh\nsleep 30 &\necho $! > \"$T3CODE_HOME/child.pid\"\nwait\n",
+        )
+        .unwrap();
+        let mut client = fake.client();
+        client.cli_timeout = std::time::Duration::from_millis(300);
+        assert!(client.organize("t1", Op::Pin).is_err());
+        let child = fs::read_to_string(fake.home().join("child.pid")).unwrap();
+        thread::sleep(std::time::Duration::from_millis(300));
+        let alive = std::process::Command::new("kill")
+            .args(["-0", child.trim()])
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap()
+            .success();
+        assert!(!alive, "the launcher's child {} still runs", child.trim());
     }
 }

@@ -176,13 +176,11 @@ fn item(snapshot: &Snapshot, thread: &T3Thread, now: i64) -> Item {
         .cloned()
         .unwrap_or_else(|| "-".into());
     let kind = format!("t3 {}", provider_name(&thread.provider));
-    let park = if thread.settled {
-        Some(Park::Settled)
-    } else {
-        thread
-            .snoozed_until
-            .filter(|&until| until > now)
-            .map(|until| Park::Snoozed { until })
+    let snoozed = thread.snoozed_until.filter(|&until| until > now);
+    let park = match (snoozed, thread.settled) {
+        (Some(until), _) => Some(Park::Snoozed { until }),
+        (None, true) => Some(Park::Settled),
+        (None, false) => None,
     };
     let row = Row {
         agent_index: None,
@@ -482,5 +480,16 @@ mod tests {
         let started = std::time::Instant::now();
         assert!(open_with("sleep", "30").is_ok());
         assert!(started.elapsed() < std::time::Duration::from_secs(10));
+    }
+
+    #[test]
+    fn a_settled_thread_snoozed_since_shows_as_snoozed_as_in_t3() {
+        let both = T3Thread {
+            settled: true,
+            snoozed_until: Some(NOW + 600),
+            ..thread("both", "completed", "codex", 60)
+        };
+        let items = items(&snapshot(vec![both]), NOW);
+        assert_eq!(items[0].row.park, Some(Park::Snoozed { until: NOW + 600 }));
     }
 }

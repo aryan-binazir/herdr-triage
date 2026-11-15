@@ -659,6 +659,9 @@ fn prompt_line(picker: &Picker, width: usize) -> Option<(Line<'static>, Option<u
 }
 
 fn footer_line(picker: &Picker, width: usize) -> (Line<'static>, Option<usize>) {
+    if let Some(prompt) = prompt_line(picker, width) {
+        return prompt;
+    }
     if let Some(message) = picker.message() {
         let mark = if picker.message_is_error() {
             vec![
@@ -669,9 +672,6 @@ fn footer_line(picker: &Picker, width: usize) -> (Line<'static>, Option<usize>) 
             vec![Span::from(" • ").blue(), Span::raw(message.to_owned())]
         };
         return (Line::from(mark), None);
-    }
-    if let Some(prompt) = prompt_line(picker, width) {
-        return prompt;
     }
     let mut pairs: Vec<(&str, &str)> = enter_hint(picker).into_iter().collect();
     let line = match picker.mode() {
@@ -1583,5 +1583,21 @@ mod tests {
         for hint in ["u ", "rename", "forget"] {
             assert!(!footer.contains(hint), "{hint} in {footer}");
         }
+    }
+
+    #[test]
+    fn a_notice_that_arrives_during_a_prompt_waits_for_the_prompt_to_close() {
+        let mut picker = picker();
+        press(&mut picker, KeyCode::Char('z'));
+        picker.inform("done in T3".into());
+        let (lines, _) = render(&mut picker, 120, 14);
+        assert!(
+            lines[13].contains("snooze “fix flaky test”"),
+            "{}",
+            lines[13]
+        );
+        press(&mut picker, KeyCode::Esc);
+        let (lines, _) = render(&mut picker, 120, 14);
+        assert!(lines[13].contains("done in T3"), "{}", lines[13]);
     }
 }

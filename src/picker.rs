@@ -110,6 +110,15 @@ pub struct Picker {
     message_is_error: bool,
     offset: usize,
     rows_on_screen: usize,
+    presses: u64,
+}
+
+/// A change sent off from the picker, to move the cursor on from once it is done.
+#[derive(Debug)]
+pub struct Sent {
+    key: String,
+    from: usize,
+    presses: u64,
 }
 
 impl Picker {
@@ -134,6 +143,7 @@ impl Picker {
             message_is_error: false,
             offset: 0,
             rows_on_screen: 10,
+            presses: 0,
         };
         let start = focus_pane
             .and_then(|pane| items.iter().position(|item| item.pane_id() == Some(pane)))
@@ -196,7 +206,11 @@ impl Picker {
         if ctrl && matches!(key.code, KeyCode::Char('c' | 'g')) {
             return Effect::Close;
         }
-        self.message = None;
+        self.presses += 1;
+        // A notice that came in while a prompt was open waits for the prompt to close.
+        if !self.prompt_open() {
+            self.message = None;
+        }
         if self.rename.is_some() {
             return self.rename_key(key, ctrl);
         }
@@ -513,6 +527,26 @@ impl Picker {
 
     /// After `key` was parked, selects the first live row that needs you most, else stays at
     /// the row it left, `from`.
+    pub fn sent(&self, key: &str) -> Sent {
+        Sent {
+            key: key.to_owned(),
+            from: self.selected_row().unwrap_or(0),
+            presses: self.presses,
+        }
+    }
+
+    /// Moves on from what `sent` changed, unless you have pressed a key since: the cursor is
+    /// yours then.
+    pub fn move_on_after(&mut self, sent: &Sent) {
+        if self.presses == sent.presses {
+            self.move_on_from(&sent.key, sent.from);
+        }
+    }
+
+    fn prompt_open(&self) -> bool {
+        self.snooze.is_some() || self.rename.is_some() || self.forget.is_some()
+    }
+
     pub fn move_on_from(&mut self, key: &str, from: usize) {
         if !self
             .items
@@ -1602,6 +1636,48 @@ mod tests {
         assert_eq!(
             picker.selected().map(|item| item.row.label()),
             Some("terraform plan")
+        );
+    }
+
+    #[test]
+    fn a_t3_change_moves_the_cursor_on_only_if_you_have_not_moved_since() {
+        let fixture = Fixture::new(NOW, &[("p1", "needs you", Status::Done)]);
+        let snapshot = |settled| crate::t3::Snapshot {
+            environment_id: "env".into(),
+            projects: std::collections::BTreeMap::new(),
+            threads: vec![crate::t3::T3Thread {
+                settled,
+                ..t3_thread("t3-a", "idle")
+            }],
+        };
+        let shown = |settled| {
+            let mut items = listed(&fixture);
+            items.extend(crate::t3::items(&snapshot(settled), NOW));
+            items
+        };
+        let mut picker = Picker::new(shown(false), None, &closed_sections());
+        select(&mut picker, "t3-a");
+        press(&mut picker, KeyCode::Char('s'));
+        let sent = picker.sent("t3:t3-a");
+        picker.refresh(shown(true), &closed_sections());
+        picker.move_on_after(&sent);
+        assert_eq!(
+            picker.selected().map(|item| item.row.label()),
+            Some("needs you")
+        );
+
+        let mut picker = Picker::new(shown(false), None, &closed_sections());
+        select(&mut picker, "t3-a");
+        press(&mut picker, KeyCode::Char('s'));
+        let sent = picker.sent("t3:t3-a");
+        press(&mut picker, KeyCode::Char('k'));
+        press(&mut picker, KeyCode::Char('j'));
+        picker.refresh(shown(true), &closed_sections());
+        picker.move_on_after(&sent);
+        assert_eq!(
+            picker.selected().map(|item| item.row.label()),
+            None,
+            "stays where you put it: the settled section"
         );
     }
 }
