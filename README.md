@@ -122,6 +122,27 @@ is offered until 30 minutes before, so later in the day the digits after it shif
 Closed threads are forgotten after 30 days untouched unless pinned; `D` forgets one now. Agents
 without a resumable session are forgotten once they exit.
 
+## T3 Code threads
+
+If [T3 Code](https://github.com/pingdotgg/t3code) runs on this machine, the picker also lists its
+threads, so one list shows everything that needs you. A T3 thread still lives only in T3: its row
+points at it, and `enter` (or its digit) opens it in the T3 desktop app through its
+`t3code://threads/…` link (`xdg-open` on Linux, `open` on macOS).
+
+- Rows show T3's own state in the picker's words: running is *working*, waiting on you is
+  *blocked*, a finished run you haven't opened since is *done*, otherwise *idle*. T3's settles,
+  snoozes and pins place the row as Herdr's do; working threads join the `working` section.
+- T3 rows follow the Herdr rows of the same rank, newest first; snoozed rows of either kind wake
+  in order. Settled T3 threads untouched for 30 days are left out. Subagent and side-chat
+  threads stay under their parent, as in T3.
+- Triage and rename T3 threads in T3: `s`, `z`, `u`, `p`, `r` and `D` on a T3 row say so and
+  change nothing. `next` and the sidebar cover Herdr's agents only.
+- The picker reads T3's database (`$T3CODE_HOME`, else `~/.t3`, at `userdata/statev2.sqlite`)
+  read-only, every 2 seconds, on a thread of its own. It never writes to it and needs no T3
+  sign-in. Only this machine's T3 threads appear, not those of other T3 environments the app is
+  connected to. If T3 isn't installed, or an update reshapes its database, the picker simply
+  shows no T3 rows (or keeps the last ones it read); Herdr's rows are unaffected.
+
 ## Sidebar
 
 The plugin owns Herdr's Agents view while it is enabled. It hides snoozed and settled agents and
@@ -146,7 +167,7 @@ pin_icon = ""   # default: Nerd Font nf-oct-pin (U+F435); use any text without a
 
 ## How it works
 
-There is no resident daemon. Herdr runs `herdr-triage sync` on agent status changes, focus changes,
+There is no resident daemon. Hooks never touch T3; only the open picker reads it. Herdr runs `herdr-triage sync` on agent status changes, focus changes,
 agent detection and pane exits (a hook that finds a sync already running asks it to sync again and
 exits, since Herdr rejects plugin commands beyond 32 at once); each sync reconciles threads with `agent.list`, then, under a file lock,
 reports tokens wherever Herdr's copy differs and sets the Agents view. A startup hook does the same after

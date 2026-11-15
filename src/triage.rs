@@ -439,21 +439,7 @@ impl Row {
     }
 
     pub fn status_text(&self, now: i64) -> String {
-        let text = self.countdown(now).unwrap_or_else(|| {
-            let word = match self.display {
-                Display::Blocked => "blocked",
-                Display::Working => "working",
-                Display::Done => "done",
-                Display::Unread(Unread::Manual) => return "unread".into(),
-                Display::Unread(Unread::Woke) => return "woke".into(),
-                Display::Idle => "idle",
-                Display::Unknown => "unknown",
-            };
-            match self.changed_at {
-                Some(at) if self.live() => format!("{word} {}", age(now - at)),
-                _ => word.into(),
-            }
-        });
+        let text = self.state_text(now, self.live());
         match (self.live(), self.park) {
             (false, _) => format!("{text} · closed"),
             (true, Some(_)) => format!("{text} · stays open"),
@@ -486,6 +472,25 @@ impl Row {
             (None, true) => Rank::Pinned,
             (None, false) => Rank::Open,
         }
+    }
+
+    /// The thread's state in a word, with how long it has been so when `aged` and known.
+    pub fn state_text(&self, now: i64, aged: bool) -> String {
+        self.countdown(now).unwrap_or_else(|| {
+            let word = match self.display {
+                Display::Blocked => "blocked",
+                Display::Working => "working",
+                Display::Done => "done",
+                Display::Unread(Unread::Manual) => return "unread".into(),
+                Display::Unread(Unread::Woke) => return "woke".into(),
+                Display::Idle => "idle",
+                Display::Unknown => "unknown",
+            };
+            match self.changed_at {
+                Some(at) if aged => format!("{word} {}", age(now - at)),
+                _ => word.into(),
+            }
+        })
     }
 
     fn countdown(&self, now: i64) -> Option<String> {

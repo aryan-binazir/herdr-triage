@@ -10,7 +10,7 @@ use chrono::Local;
 use serde_json::{Map, Value};
 
 use crate::herdr::{Agent, Herdr, Tab, Workspace};
-use crate::picker::Item;
+use crate::picker::{Item, Target};
 use crate::store::Store;
 use crate::triage::{
     self, Action, After, Close, Closing, Observed, Rank, Refusal, ReopenPlan, Row, Section,
@@ -156,6 +156,10 @@ impl Session {
 
     pub fn focus(&mut self, pane: &str) -> io::Result<()> {
         self.herdr.focus(pane)
+    }
+
+    pub fn notify(&mut self, title: &str) -> io::Result<()> {
+        self.herdr.notify(title)
     }
 
     fn view_after(&mut self, edit: impl FnOnce(&mut State, &[Observed], i64)) -> io::Result<View> {
@@ -550,7 +554,7 @@ fn items(snapshot: &Snapshot, now: i64) -> Vec<Item> {
                 .unwrap_or_else(|| "-".into());
             let cwd = row.thread.cwd.as_deref().unwrap_or_default();
             Item {
-                pane_id: agent.map(|agent| agent.pane_id.clone()),
+                target: agent.map_or(Target::Closed, |agent| Target::Pane(agent.pane_id.clone())),
                 search: format!(
                     "{kind} {} {} {location} {cwd}",
                     row.label(),
@@ -1144,7 +1148,7 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].row.key, key);
         assert_eq!(rows[0].row.label(), "Original conversation");
-        assert_eq!(rows[0].pane_id.as_deref(), Some("w1:p91"));
+        assert_eq!(rows[0].pane_id(), Some("w1:p91"));
     }
 
     #[test]
