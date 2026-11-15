@@ -8,7 +8,7 @@ use ratatui::widgets::{
     Block, BorderType, Cell, HighlightSpacing, Padding, Paragraph, Row, Table, TableState,
 };
 
-use crate::picker::{Item, ListRow, Mode, Picker};
+use crate::picker::{Item, ListRow, Mode, Picker, Target};
 use crate::triage::{Action, Attention, Display, Section, Unread};
 
 const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -418,7 +418,7 @@ fn row<'a>(
     let parked = item.row.park.is_some();
     let faint = Style::new().gray().dim();
     let glyph = match item.row.display {
-        _ if !item.row.live() => Span::styled("◌", faint),
+        _ if item.target == Target::Closed => Span::styled("◌", faint),
         _ if parked => Span::styled("○", faint),
         Display::Working => Span::from(SPINNER[tick % SPINNER.len()]).yellow(),
         Display::Blocked => Span::from("◉").red(),
@@ -546,8 +546,11 @@ fn fitted_hints(
 fn enter_hint(picker: &Picker) -> Option<(&'static str, &'static str)> {
     let row = picker.selected_row()?;
     match picker.selected() {
-        Some(item) if !item.row.live() => Some(("enter", "reopen")),
-        Some(_) => Some(("enter", "focus")),
+        Some(item) => Some(match item.target {
+            Target::Pane(_) => ("enter", "focus"),
+            Target::Closed => ("enter", "reopen"),
+            Target::T3(_) => ("enter", "open in T3"),
+        }),
         None if picker.filter().is_empty() => match picker.rows().get(row) {
             Some(ListRow::Section { open: true, .. }) => Some(("enter", "collapse")),
             _ => Some(("enter", "expand")),
@@ -674,7 +677,10 @@ fn footer_line(picker: &Picker, width: usize) -> (Line<'static>, Option<usize>) 
     let line = match picker.mode() {
         Mode::Navigate => {
             pairs.extend([("j/k", "move"), ("/", "search")]);
-            if let Some(item) = picker.selected() {
+            if let Some(item) = picker
+                .selected()
+                .filter(|item| !matches!(item.target, Target::T3(_)))
+            {
                 let parked = |section| item.row.park.is_some_and(|park| park.section() == section);
                 pairs.extend([
                     (
@@ -1539,5 +1545,42 @@ mod tests {
             "{}",
             lines[13]
         );
+    }
+
+    #[test]
+    fn a_t3_row_shows_its_state_and_offers_only_opening_it_in_t3() {
+        let snapshot = crate::t3::Snapshot {
+            environment_id: "env".into(),
+            projects: std::collections::BTreeMap::from([("p".into(), "bball-lab".into())]),
+            threads: vec![crate::t3::T3Thread {
+                id: "t1".into(),
+                project_id: "p".into(),
+                title: "measure ride home".into(),
+                status: "completed".into(),
+                provider: "codex".into(),
+                settled: false,
+                snoozed_until: None,
+                pinned: false,
+                unseen: true,
+                updated_at: NOW - 120,
+            }],
+        };
+        let mut picker = Picker::new(crate::t3::items(&snapshot, NOW), None, &BTreeSet::new());
+        let (lines, _) = render(&mut picker, 100, 10);
+        let row = &lines[6];
+        assert!(
+            row.contains("●")
+                && row.contains("measure ride home")
+                && row.contains("bball-lab")
+                && row.contains("t3 codex")
+                && row.contains("done 2m"),
+            "{row}"
+        );
+        assert!(!row.contains("◌") && !row.contains("closed"), "{row}");
+        let footer = &lines[9];
+        assert!(footer.contains("enter open in T3"), "{footer}");
+        for hint in ["settle", "snooze", "read", "pin", "rename", "forget"] {
+            assert!(!footer.contains(hint), "{hint} in {footer}");
+        }
     }
 }

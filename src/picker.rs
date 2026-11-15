@@ -1,15 +1,22 @@
+use std::cmp::Reverse;
 use std::collections::BTreeSet;
 
 use chrono::TimeZone;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-use crate::triage::{Action, Park, Refusal, Row, Section, SnoozePreset, snooze_presets};
+use crate::triage::{Action, Display, Park, Refusal, Row, Section, SnoozePreset, snooze_presets};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Target {
+    Pane(String),
+    Closed,
+    T3(String),
+}
 
 #[derive(Debug, Clone)]
 pub struct Item {
     pub row: Row,
-    /// The pane a live thread runs in; `None` exactly when the row is not live.
-    pub pane_id: Option<String>,
+    pub target: Target,
     pub location: String,
     pub kind: String,
     pub search: String,
@@ -22,11 +29,14 @@ pub enum Effect {
     None,
     Close,
     Focus(String),
+    OpenT3(String),
     Apply { key: String, action: Action },
     Rename { key: String, title: Option<String> },
     Undo,
     ToggleSection(Section),
 }
+
+const T3_TRIAGE: &str = "a T3 thread: triage and rename it in T3";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
@@ -121,11 +131,7 @@ impl Picker {
             rows_on_screen: 10,
         };
         let start = focus_pane
-            .and_then(|pane| {
-                items
-                    .iter()
-                    .position(|item| item.pane_id.as_deref() == Some(pane))
-            })
+            .and_then(|pane| items.iter().position(|item| item.pane_id() == Some(pane)))
             .or_else(|| items.iter().position(|item| item.focused));
         picker.items = items;
         picker.refilter();
@@ -140,7 +146,7 @@ impl Picker {
             .iter()
             .position(|&entry| entry == Entry::Agent(index))
             .or_else(|| {
-                let section = self.items[index].row.section()?;
+                let section = self.items[index].section()?;
                 self.entries.iter().position(
                     |entry| matches!(entry, Entry::Section { section: s, .. } if *s == section),
                 )
@@ -156,10 +162,9 @@ impl Picker {
         // Herdr rekeys a thread once it learns its session; the pane stays the same.
         if let Some(prompt) = &mut self.rename
             && !self.items.iter().any(|item| item.row.key == prompt.key)
-            && let Some(item) = self
-                .items
-                .iter()
-                .find(|item| item.pane_id.is_some() && item.pane_id == prompt.pane_id)
+            && let Some(item) = self.items.iter().find(|item| {
+                item.pane_id().is_some() && item.pane_id() == prompt.pane_id.as_deref()
+            })
         {
             prompt.key.clone_from(&item.row.key);
         }
@@ -242,6 +247,22 @@ impl Picker {
     }
 
     fn navigate_key(&mut self, key: KeyEvent, ctrl: bool, now: i64, tz: &impl TimeZone) -> Effect {
+        let t3_selected = matches!(
+            self.selected(),
+            Some(Item {
+                target: Target::T3(_),
+                ..
+            })
+        );
+        let triage_key = match key.code {
+            KeyCode::Char('s' | 'z' | 'u' | 'r' | 'D') => true,
+            KeyCode::Char('p') => !ctrl,
+            _ => false,
+        };
+        if t3_selected && triage_key {
+            self.notify(T3_TRIAGE.into());
+            return Effect::None;
+        }
         let apply = |picker: &Self, action| {
             picker
                 .selected()
@@ -273,7 +294,7 @@ impl Picker {
                 if let Some(item) = self.selected() {
                     self.rename = Some(RenamePrompt {
                         key: item.row.key.clone(),
-                        pane_id: item.pane_id.clone(),
+                        pane_id: item.pane_id().map(str::to_owned),
                         text: item.row.label().to_owned(),
                     });
                 }
@@ -340,12 +361,13 @@ impl Picker {
 
     fn open(&self, index: usize) -> Effect {
         let item = &self.items[index];
-        match &item.pane_id {
-            Some(pane) => Effect::Focus(pane.clone()),
-            None => Effect::Apply {
+        match &item.target {
+            Target::Pane(pane) => Effect::Focus(pane.clone()),
+            Target::Closed => Effect::Apply {
                 key: item.row.key.clone(),
                 action: Action::Reopen,
             },
+            Target::T3(link) => Effect::OpenT3(link.clone()),
         }
     }
 
@@ -388,7 +410,7 @@ impl Picker {
             matches
                 .iter()
                 .copied()
-                .filter(|&i| items[i].row.section() == section)
+                .filter(|&i| items[i].section() == section)
                 .collect()
         };
         let mut entries: Vec<Entry> = in_section(None).into_iter().map(Entry::Agent).collect();
@@ -462,7 +484,7 @@ impl Picker {
             .iter()
             .enumerate()
             .filter_map(|(at, &entry)| match entry {
-                Entry::Agent(i) if self.items[i].row.live() => {
+                Entry::Agent(i) if self.items[i].target != Target::Closed => {
                     Some((self.items[i].row.attention()?, at))
                 }
                 _ => None,
@@ -567,6 +589,26 @@ impl Picker {
     }
 }
 
+impl Item {
+    pub fn pane_id(&self) -> Option<&str> {
+        match &self.target {
+            Target::Pane(pane) => Some(pane),
+            Target::Closed | Target::T3(_) => None,
+        }
+    }
+
+    pub fn section(&self) -> Option<Section> {
+        match (&self.target, self.row.park) {
+            (Target::T3(_), Some(park)) => Some(park.section()),
+            (Target::T3(_), None) if self.row.display == Display::Working && !self.row.pinned => {
+                Some(Section::Working)
+            }
+            (Target::T3(_), None) => None,
+            _ => self.row.section(),
+        }
+    }
+}
+
 #[cfg(test)]
 impl Item {
     pub(crate) fn projected(fixture: &crate::triage::Fixture, now: i64) -> Vec<Item> {
@@ -574,7 +616,7 @@ impl Item {
             .rows()
             .into_iter()
             .map(|(row, pane_id)| Item {
-                pane_id,
+                target: pane_id.map_or(Target::Closed, Target::Pane),
                 location: "acme-api".into(),
                 kind: "claude".into(),
                 search: row.label().to_owned(),
@@ -584,6 +626,20 @@ impl Item {
             })
             .collect()
     }
+}
+
+pub fn combine(herdr: Vec<Item>, mut t3: Vec<Item>) -> Vec<Item> {
+    t3.sort_by_key(|item| Reverse(item.row.changed_at));
+    let mut items = herdr;
+    items.extend(t3);
+    items.sort_by_key(|item| {
+        let wake = match item.row.park {
+            Some(Park::Snoozed { until }) => until,
+            _ => 0,
+        };
+        (item.row.rank(), wake)
+    });
+    items
 }
 
 pub fn fuzzy_score(needle: &str, haystack: &str) -> Option<i64> {
@@ -677,7 +733,7 @@ mod tests {
             .rows()
             .iter()
             .map(|row| match row {
-                ListRow::Agent(item) => item.pane_id.clone().unwrap_or_default(),
+                ListRow::Agent(item) => item.pane_id().unwrap_or_default().to_owned(),
                 ListRow::Section {
                     section,
                     count,
@@ -695,16 +751,12 @@ mod tests {
     fn opens_on_the_agent_it_was_invoked_from() {
         let picker = Picker::new(items(), Some("p3"), &closed_sections());
         assert_eq!(
-            picker
-                .selected()
-                .map(|i| i.pane_id.as_deref().unwrap_or_default()),
+            picker.selected().map(|i| i.pane_id().unwrap_or_default()),
             Some("p3")
         );
         let picker = Picker::new(items(), None, &closed_sections());
         assert_eq!(
-            picker
-                .selected()
-                .map(|i| i.pane_id.as_deref().unwrap_or_default()),
+            picker.selected().map(|i| i.pane_id().unwrap_or_default()),
             Some("p1")
         );
     }
@@ -759,9 +811,7 @@ mod tests {
         without_target.remove(1);
         picker.refresh(without_target, &closed_sections());
         assert_ne!(
-            picker
-                .selected()
-                .map(|i| i.pane_id.as_deref().unwrap_or_default()),
+            picker.selected().map(|i| i.pane_id().unwrap_or_default()),
             Some("p2")
         );
 
@@ -838,7 +888,7 @@ mod tests {
     fn selection_follows_the_agent_even_when_it_moves_to_another_pane() {
         let mut picker = Picker::new(items(), Some("p2"), &closed_sections());
         let mut moved = items();
-        moved[1].pane_id = Some("p9".into());
+        moved[1].target = Target::Pane("p9".into());
         moved.swap(0, 1);
         picker.refresh(moved, &closed_sections());
         assert_eq!(picker.selected().map(|i| i.row.key.as_str()), Some("k-p2"));
@@ -851,9 +901,7 @@ mod tests {
         reordered.rotate_left(1);
         picker.refresh(reordered, &closed_sections());
         assert_eq!(
-            picker
-                .selected()
-                .map(|i| i.pane_id.as_deref().unwrap_or_default()),
+            picker.selected().map(|i| i.pane_id().unwrap_or_default()),
             Some("p2")
         );
     }
@@ -1027,16 +1075,12 @@ mod tests {
         let mut picker = Picker::new(items(), None, &closed_sections());
         press(&mut picker, KeyCode::Char('k'));
         assert_eq!(
-            picker
-                .selected()
-                .map(|i| i.pane_id.as_deref().unwrap_or_default()),
+            picker.selected().map(|i| i.pane_id().unwrap_or_default()),
             Some("p3")
         );
         press(&mut picker, KeyCode::Down);
         assert_eq!(
-            picker
-                .selected()
-                .map(|i| i.pane_id.as_deref().unwrap_or_default()),
+            picker.selected().map(|i| i.pane_id().unwrap_or_default()),
             Some("p1")
         );
     }
@@ -1240,5 +1284,196 @@ mod tests {
         press(&mut picker, KeyCode::Char('r'));
         assert_eq!(press(&mut picker, KeyCode::Esc), Effect::None);
         assert!(picker.rename_prompt().is_none());
+    }
+
+    fn with_t3() -> Vec<Item> {
+        let mut snooze = t3_thread("t3-snoozed", "completed");
+        snooze.snoozed_until = Some(NOW + 600);
+        let snapshot = crate::t3::Snapshot {
+            environment_id: "env".into(),
+            projects: std::collections::BTreeMap::new(),
+            threads: vec![
+                t3_thread("t3-done", "completed"),
+                t3_thread("t3-busy", "running"),
+                snooze,
+            ],
+        };
+        let mut items = items();
+        items.extend(crate::t3::items(&snapshot, NOW));
+        items
+    }
+
+    fn t3_thread(id: &str, status: &str) -> crate::t3::T3Thread {
+        crate::t3::T3Thread {
+            id: id.into(),
+            project_id: "p".into(),
+            title: id.into(),
+            status: status.into(),
+            provider: "codex".into(),
+            settled: false,
+            snoozed_until: None,
+            pinned: false,
+            unseen: true,
+            updated_at: NOW - 60,
+        }
+    }
+
+    fn select(picker: &mut Picker, label: &str) {
+        for _ in 0..picker.rows().len() {
+            if picker
+                .selected()
+                .is_some_and(|item| item.row.label() == label)
+            {
+                return;
+            }
+            press(picker, KeyCode::Char('j'));
+        }
+        panic!("no row {label}");
+    }
+
+    #[test]
+    fn t3_threads_join_the_sections_herdr_agents_use() {
+        let picker = Picker::new(with_t3(), None, &closed_sections());
+        let rows: Vec<String> = picker
+            .rows()
+            .iter()
+            .map(|row| match row {
+                ListRow::Agent(item) => item.row.label().to_owned(),
+                ListRow::Section { section, count, .. } => format!("{section:?}:{count}"),
+            })
+            .collect();
+        assert_eq!(
+            rows,
+            [
+                "api refactor",
+                "fix flaky test",
+                "terraform plan",
+                "t3-done",
+                "Working:1",
+                "Snoozed:1"
+            ]
+        );
+    }
+
+    #[test]
+    fn enter_or_its_digit_opens_a_t3_thread_in_t3() {
+        let mut picker = Picker::new(with_t3(), None, &closed_sections());
+        select(&mut picker, "t3-done");
+        let opened = Effect::OpenT3("t3code://threads/env/t3-done".into());
+        assert_eq!(press(&mut picker, KeyCode::Enter), opened);
+        assert_eq!(press(&mut picker, KeyCode::Char('4')), opened);
+    }
+
+    #[test]
+    fn triage_keys_on_a_t3_thread_say_to_use_t3_and_change_nothing() {
+        let mut picker = Picker::new(with_t3(), None, &closed_sections());
+        select(&mut picker, "t3-done");
+        for key in ['s', 'z', 'u', 'p', 'r', 'D'] {
+            assert_eq!(
+                press(&mut picker, KeyCode::Char(key)),
+                Effect::None,
+                "{key}"
+            );
+            assert!(picker.message_is_error(), "{key}");
+            assert_eq!(
+                picker.message(),
+                Some("a T3 thread: triage and rename it in T3"),
+                "{key}"
+            );
+            assert!(picker.snooze_prompt().is_none());
+            assert!(picker.rename_prompt().is_none());
+            assert!(picker.forget_prompt().is_none());
+        }
+        assert_eq!(press(&mut picker, KeyCode::Char('U')), Effect::Undo);
+        press(&mut picker, KeyCode::Char('/'));
+        press(&mut picker, KeyCode::Char('s'));
+        assert_eq!(picker.filter(), "s");
+    }
+
+    #[test]
+    fn t3_threads_follow_herdr_agents_of_the_same_rank_and_snoozes_wake_in_order() {
+        let t3 = |id: &str, updated_ago: i64, snoozed_for: Option<i64>, settled: bool| {
+            crate::t3::T3Thread {
+                updated_at: NOW - updated_ago,
+                snoozed_until: snoozed_for.map(|secs| NOW + secs),
+                settled,
+                ..t3_thread(id, "completed")
+            }
+        };
+        let snapshot = crate::t3::Snapshot {
+            environment_id: "env".into(),
+            projects: std::collections::BTreeMap::new(),
+            threads: vec![
+                t3("t3 settled", 60, None, true),
+                t3("t3 wakes late", 60, Some(600), false),
+                t3("t3 older", 7_200, None, false),
+                t3("t3 wakes soon", 60, Some(30), false),
+                t3("t3 newer", 60, None, false),
+            ],
+        };
+        let combined = combine(shelf(), crate::t3::items(&snapshot, NOW));
+        let labels: Vec<&str> = combined.iter().map(|item| item.row.label()).collect();
+        assert_eq!(
+            labels,
+            [
+                "api refactor",
+                "t3 newer",
+                "t3 older",
+                "t3 wakes soon",
+                "bench run",
+                "t3 wakes late",
+                "release notes",
+                "old spike",
+                "t3 settled",
+            ]
+        );
+    }
+
+    #[test]
+    fn parking_moves_on_to_a_t3_thread_that_needs_you_more() {
+        let herdr = Fixture::new(
+            NOW,
+            &[
+                ("p1", "api refactor", Status::Idle),
+                ("p2", "fix flaky test", Status::Done),
+            ],
+        )
+        .act("p1", Action::ToggleSettle);
+        let mut items = listed(&herdr);
+        let snapshot = crate::t3::Snapshot {
+            environment_id: "env".into(),
+            projects: std::collections::BTreeMap::new(),
+            threads: vec![t3_thread("t3-waiting", "waiting")],
+        };
+        items.extend(crate::t3::items(&snapshot, NOW));
+        let mut picker = Picker::new(items, None, &closed_sections());
+        picker.move_on_from("k-p1", 0);
+        assert_eq!(
+            picker.selected().map(|item| item.row.label()),
+            Some("t3-waiting")
+        );
+    }
+
+    #[test]
+    fn control_keys_cannot_triage_a_t3_thread_but_still_move() {
+        let mut picker = Picker::new(with_t3(), None, &closed_sections());
+        select(&mut picker, "t3-done");
+        let ctrl = |picker: &mut Picker, c| {
+            picker.key(
+                KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL),
+                NOW,
+                &chrono::Utc,
+            )
+        };
+        for key in ['s', 'z', 'u', 'r', 'D'] {
+            assert_eq!(ctrl(&mut picker, key), Effect::None, "{key}");
+            assert!(picker.rename_prompt().is_none(), "{key}");
+            assert!(picker.snooze_prompt().is_none(), "{key}");
+        }
+        ctrl(&mut picker, 'p');
+        assert_eq!(
+            picker.selected().map(|item| item.row.label()),
+            Some("terraform plan")
+        );
     }
 }

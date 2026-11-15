@@ -2,6 +2,7 @@ mod herdr;
 mod picker;
 mod session;
 mod store;
+mod t3;
 mod triage;
 mod ui;
 mod wakers;
@@ -65,14 +66,22 @@ fn run_picker() -> io::Result<()> {
     let mut session = Session::connect()?;
     let focus = std::env::var("HERDR_TRIAGE_FOCUS").ok();
     let pin_icon = session::pin_icon();
-    let view = session.view()?;
-    let mut picker = Picker::new(view.items, focus.as_deref(), &view.open_sections);
-    picker.set_undoable(view.undoable);
+    let mut shown = Shown {
+        herdr: session.view()?,
+        t3: None,
+    };
+    let t3_updates = t3::watch();
+    let mut picker = Picker::new(shown.items(), focus.as_deref(), &shown.herdr.open_sections);
+    picker.set_undoable(shown.herdr.undoable);
 
     let mut terminal = ratatui::init();
     let started = Instant::now();
     let mut refreshed = Instant::now();
     let outcome = loop {
+        if let Some(snapshot) = t3_updates.try_iter().last() {
+            shown.t3 = snapshot;
+            picker.refresh(shown.items(), &shown.herdr.open_sections);
+        }
         let tick = usize::try_from(started.elapsed().as_millis() / 125).unwrap_or(0);
         if let Err(error) = terminal.draw(|frame| ui::draw(frame, &mut picker, tick, &pin_icon)) {
             break Err(error);
@@ -82,7 +91,7 @@ fn run_picker() -> io::Result<()> {
             Ok(false) => {
                 if refreshed.elapsed() >= Duration::from_secs(1) {
                     refreshed = Instant::now();
-                    show(&mut picker, session.view());
+                    show(&mut picker, &mut shown, session.view());
                 }
                 continue;
             }
@@ -95,81 +104,132 @@ fn run_picker() -> io::Result<()> {
         };
         match picker.key(key, Local::now().timestamp(), &Local) {
             Effect::None => {}
-            Effect::Close => break Ok(None),
-            Effect::Focus(pane) => break Ok(Some(pane)),
-            Effect::Rename { key, title } => show(&mut picker, session.rename(&key, title)),
-            Effect::ToggleSection(section) => show(&mut picker, session.toggle_section(section)),
+            Effect::Close => break Ok(Leave::Close),
+            Effect::Focus(pane) => break Ok(Leave::Focus(pane)),
+            Effect::OpenT3(link) => break Ok(Leave::OpenT3(link)),
+            Effect::Rename { key, title } => {
+                show(&mut picker, &mut shown, session.rename(&key, title));
+            }
+            Effect::ToggleSection(section) => {
+                show(&mut picker, &mut shown, session.toggle_section(section));
+            }
             Effect::Apply { key, action } => {
-                let from = picker.selected_row().unwrap_or(0);
-                match session.act(&key, action) {
-                    Ok(Outcome::Reopened) => break Ok(None),
-                    Ok(Outcome::Refused(refusal)) => {
-                        show(&mut picker, session.view());
-                        picker.notify(refusal);
-                    }
-                    Ok(Outcome::Done {
-                        key,
-                        notice,
-                        wake_failed,
-                    }) => {
-                        show(&mut picker, session.view());
-                        if let Some(notice) = notice {
-                            picker.inform(notice);
-                        }
-                        if matches!(action, Action::ToggleSettle | Action::Snooze(_)) {
-                            picker.move_on_from(&key, from);
-                        }
-                        if let Some(error) = wake_failed {
-                            picker.notify(format!(
-                                "snooze saved, but its wake timer failed: {error}"
-                            ));
-                        }
-                    }
-                    Err(error) => picker.notify(format!("herdr: {error}")),
-                }
+                let leave = apply(&mut session, &mut picker, &mut shown, &key, action);
                 refreshed = Instant::now();
+                if let Some(leave) = leave {
+                    break Ok(leave);
+                }
             }
             Effect::Undo => {
-                match session.undo() {
-                    Ok(Outcome::Reopened) => break Ok(None),
-                    Ok(Outcome::Refused(refusal)) => {
-                        show(&mut picker, session.view());
-                        picker.notify(refusal);
-                    }
-                    Ok(Outcome::Done {
-                        notice,
-                        wake_failed,
-                        ..
-                    }) => {
-                        show(&mut picker, session.view());
-                        if let Some(notice) = notice {
-                            picker.inform(notice);
-                        }
-                        picker.inform("undone".into());
-                        if let Some(error) = wake_failed {
-                            picker.notify(format!(
-                                "snooze restored, but its wake timer failed: {error}"
-                            ));
-                        }
-                    }
-                    Err(error) => picker.notify(format!("herdr: {error}")),
-                }
+                let leave = undo(&mut session, &mut picker, &mut shown);
                 refreshed = Instant::now();
+                if let Some(leave) = leave {
+                    break Ok(leave);
+                }
             }
         }
     };
     ratatui::restore();
     match outcome? {
-        Some(pane) => session.focus(&pane),
-        None => Ok(()),
+        Leave::Close => Ok(()),
+        Leave::Focus(pane) => session.focus(&pane),
+        Leave::OpenT3(link) => {
+            t3::open(&link).or_else(|error| session.notify(&format!("Could not open T3: {error}")))
+        }
     }
 }
 
-fn show(picker: &mut Picker, view: io::Result<View>) {
+fn apply(
+    session: &mut Session,
+    picker: &mut Picker,
+    shown: &mut Shown,
+    key: &str,
+    action: Action,
+) -> Option<Leave> {
+    let from = picker.selected_row().unwrap_or(0);
+    match session.act(key, action) {
+        Ok(Outcome::Reopened) => return Some(Leave::Close),
+        Ok(Outcome::Refused(refusal)) => {
+            show(picker, shown, session.view());
+            picker.notify(refusal);
+        }
+        Ok(Outcome::Done {
+            key,
+            notice,
+            wake_failed,
+        }) => {
+            show(picker, shown, session.view());
+            if let Some(notice) = notice {
+                picker.inform(notice);
+            }
+            if matches!(action, Action::ToggleSettle | Action::Snooze(_)) {
+                picker.move_on_from(&key, from);
+            }
+            if let Some(error) = wake_failed {
+                picker.notify(format!("snooze saved, but its wake timer failed: {error}"));
+            }
+        }
+        Err(error) => picker.notify(format!("herdr: {error}")),
+    }
+    None
+}
+
+fn undo(session: &mut Session, picker: &mut Picker, shown: &mut Shown) -> Option<Leave> {
+    match session.undo() {
+        Ok(Outcome::Reopened) => return Some(Leave::Close),
+        Ok(Outcome::Refused(refusal)) => {
+            show(picker, shown, session.view());
+            picker.notify(refusal);
+        }
+        Ok(Outcome::Done {
+            notice,
+            wake_failed,
+            ..
+        }) => {
+            show(picker, shown, session.view());
+            if let Some(notice) = notice {
+                picker.inform(notice);
+            }
+            picker.inform("undone".into());
+            if let Some(error) = wake_failed {
+                picker.notify(format!(
+                    "snooze restored, but its wake timer failed: {error}"
+                ));
+            }
+        }
+        Err(error) => picker.notify(format!("herdr: {error}")),
+    }
+    None
+}
+
+enum Leave {
+    Close,
+    Focus(String),
+    OpenT3(String),
+}
+
+struct Shown {
+    herdr: View,
+    t3: Option<t3::Snapshot>,
+}
+
+impl Shown {
+    fn items(&self) -> Vec<picker::Item> {
+        let t3 = self
+            .t3
+            .as_ref()
+            .map(|snapshot| t3::items(snapshot, Local::now().timestamp()))
+            .unwrap_or_default();
+        picker::combine(self.herdr.items.clone(), t3)
+    }
+}
+
+fn show(picker: &mut Picker, shown: &mut Shown, view: io::Result<View>) {
     match view {
         Ok(view) => {
-            picker.refresh(view.items, &view.open_sections);
-            picker.set_undoable(view.undoable);
+            shown.herdr = view;
+            picker.refresh(shown.items(), &shown.herdr.open_sections);
+            picker.set_undoable(shown.herdr.undoable);
         }
         Err(error) => picker.notify(format!("herdr: {error}")),
     }
