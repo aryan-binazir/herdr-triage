@@ -1,6 +1,3 @@
-//! Changes T3 threads' triage through T3's own server. The first change signs herdr-triage in
-//! with a one-time pairing code from the local `t3` command and keeps the token it gets.
-
 use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Write};
 use std::os::unix::fs::OpenOptionsExt;
@@ -22,7 +19,7 @@ use super::Op;
 const PROTOCOL_VERSION: &str = "2025-06-18";
 /// Never visited: T3 hands the authorization code back in its reply instead.
 const REDIRECT: &str = "http://127.0.0.1/herdr-triage/callback";
-/// The run mode up to which T3 lets herdr-triage change threads, as the user chose.
+/// The run mode up to which T3 lets herdr-triage change threads.
 const ACCESS: &str = "auto";
 const MAX_BODY_BYTES: u64 = 1 << 20;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
@@ -35,8 +32,7 @@ pub struct Client {
     token_file: PathBuf,
     agent: ureq::Agent,
     credential: Option<Credential>,
-    /// The MCP session, with the origin it belongs to.
-    session: Option<(String, String)>,
+    session: Option<Session>,
     next_id: u64,
     pub(crate) cli_timeout: Duration,
 }
@@ -54,6 +50,11 @@ struct Credential {
     environment_id: String,
     token: String,
     expires_at: i64,
+}
+
+struct Session {
+    origin: String,
+    id: String,
 }
 
 struct Server {
@@ -79,7 +80,6 @@ fn other(message: impl Into<String>) -> io::Error {
 }
 
 impl Client {
-    /// The T3 install in `$T3CODE_HOME`, else `~/.t3`.
     pub fn from_env(state_root: &Path) -> Option<Self> {
         super::home().map(|home| Self::new(home, state_root))
     }
@@ -142,10 +142,13 @@ impl Client {
 
     fn send(&mut self, server: &Server, thread: &str, op: Op) -> Result<Done, Failure> {
         let session = match &self.session {
-            Some((origin, id)) if *origin == server.origin => id.clone(),
+            Some(session) if session.origin == server.origin => session.id.clone(),
             _ => {
                 let id = self.initialize(server)?;
-                self.session = Some((server.origin.clone(), id.clone()));
+                self.session = Some(Session {
+                    origin: server.origin.clone(),
+                    id: id.clone(),
+                });
                 id
             }
         };
@@ -203,7 +206,6 @@ impl Client {
         self.next_id
     }
 
-    /// Sends one JSON-RPC message; returns the session T3 named and the reply to it, if any.
     fn mcp(
         &self,
         server: &Server,
@@ -251,8 +253,6 @@ impl Client {
         Ok((named, Some(reply)))
     }
 
-    /// Signs in as T3 lets an app with no browser sign in: T3's own `t3` command issues a
-    /// one-time pairing code, which approves this app at `ACCESS` in place of a person.
     fn sign_in(&self, server: &Server) -> io::Result<Credential> {
         let metadata = self.get_json(&format!(
             "{}/.well-known/oauth-authorization-server",
@@ -335,7 +335,6 @@ impl Client {
             token: token.to_owned(),
             expires_at: chrono::Utc::now().timestamp() + lifetime,
         };
-        // A token that cannot be kept still serves this picker; the next one signs in again.
         let _ = write_private(&self.token_file, &serde_json::to_vec(&credential)?);
         Ok(credential)
     }
@@ -448,7 +447,6 @@ fn action(op: Op) -> &'static str {
     }
 }
 
-/// Where this machine's T3 server listens; one elsewhere is not one herdr-triage signs in to.
 fn discover(home: &Path) -> io::Result<Server> {
     let userdata = home.join("userdata");
     let runtime = fs::read_to_string(userdata.join("server-runtime.json"))
@@ -484,7 +482,6 @@ fn is_loopback(origin: &str) -> bool {
     matches!(host, "127.0.0.1" | "localhost" | "[::1]")
 }
 
-/// A request that never reached T3 as the error to show.
 fn unsent(error: ureq::Error) -> io::Error {
     match failure(error) {
         Failure::Unreachable => other("T3 isn't running"),
@@ -532,7 +529,6 @@ fn json_body(response: ureq::http::Response<ureq::Body>) -> io::Result<Value> {
     serde_json::from_str(&body).map_err(|_| other("T3 sent an unreadable reply"))
 }
 
-/// T3's own explanation of a failed request, when it gave one.
 fn refused(status: u16, body: &str) -> io::Error {
     let reply: Value = serde_json::from_str(body).unwrap_or(Value::Null);
     let message = reply["message"]
@@ -554,7 +550,6 @@ fn rpc_result(reply: &Value) -> Result<&Value, Failure> {
     Ok(&reply["result"])
 }
 
-/// The reply to request `id` in a server-sent event stream.
 fn reply_in_stream(body: &str, id: &Value) -> Option<Value> {
     let mut data = String::new();
     for line in body.lines().chain([""]) {
@@ -620,7 +615,6 @@ fn read_credential(path: &Path) -> Option<Credential> {
     serde_json::from_slice(&fs::read(path).ok()?).ok()
 }
 
-/// Replaces `path` whole with a file only its owner can ever read.
 fn write_private(path: &Path, contents: &[u8]) -> io::Result<()> {
     let dir = path.parent().unwrap_or(Path::new("."));
     fs::create_dir_all(dir)?;
@@ -631,9 +625,14 @@ fn write_private(path: &Path, contents: &[u8]) -> io::Result<()> {
         .create_new(true)
         .mode(0o600)
         .open(&staging)?;
-    file.write_all(contents)?;
-    file.sync_all()?;
-    fs::rename(&staging, path)
+    let written = file
+        .write_all(contents)
+        .and_then(|()| file.sync_all())
+        .and_then(|()| fs::rename(&staging, path));
+    if written.is_err() {
+        let _ = fs::remove_file(&staging);
+    }
+    written
 }
 
 #[cfg(test)]
@@ -652,24 +651,17 @@ mod tests {
     use sha2::{Digest, Sha256};
 
     const ENV: &str = "env-1";
-    /// 2026-11-15T09:00:00Z
-    const NINE: i64 = 1_794_733_200;
+    const NOV_15_2026_0900_UTC: i64 = 1_794_733_200;
 
     #[derive(Default)]
     struct Server {
-        /// Pairing codes the fake `t3` handed out that T3 would still accept.
         pairing_codes: Vec<String>,
-        /// PKCE challenges by authorization code.
-        codes: BTreeMap<String, String>,
+        pkce_challenges_by_code: BTreeMap<String, String>,
         valid_tokens: Vec<String>,
         sessions: Vec<String>,
-        /// What `t3_thread_organize` answers: `(is_error, text)`.
         organize_reply: Option<(bool, String)>,
-        /// Answer `t3_thread_organize` as a server-sent event stream.
         stream_replies: bool,
-        /// Answer `t3_thread_organize` with this JSON-RPC error instead.
         rpc_error: Option<String>,
-        /// `(path, method or tool, body)` per request.
         calls: Vec<(String, String, Value)>,
     }
 
@@ -841,7 +833,6 @@ mod tests {
         out
     }
 
-    #[allow(clippy::too_many_lines)]
     fn respond(
         server: &mut Server,
         port: u16,
@@ -891,8 +882,8 @@ mod tests {
                     return ("400 Bad Request", String::new(), body.to_string());
                 }
                 server.pairing_codes.retain(|known| known != code);
-                let auth_code = format!("auth-{}", server.codes.len() + 1);
-                server.codes.insert(
+                let auth_code = format!("auth-{}", server.pkce_challenges_by_code.len() + 1);
+                server.pkce_challenges_by_code.insert(
                     auth_code.clone(),
                     authorization["code_challenge"].as_str().unwrap().to_owned(),
                 );
@@ -910,7 +901,7 @@ mod tests {
                 ));
                 let challenge = request
                     .get("code")
-                    .and_then(|code| server.codes.remove(code));
+                    .and_then(|code| server.pkce_challenges_by_code.remove(code));
                 let verified = challenge.is_some_and(|challenge| {
                     base64url(&Sha256::digest(request["code_verifier"].as_bytes())) == challenge
                 });
@@ -931,81 +922,85 @@ mod tests {
                     "expires_in": 2_592_000, "scope": "orchestration:read orchestration:operate"});
                 ("200 OK", String::new(), body.to_string())
             }
-            ("POST", "/mcp") => {
-                let request: Value = serde_json::from_str(body).unwrap();
-                let method = request["method"].as_str().unwrap_or_default().to_owned();
-                let name = if method == "tools/call" {
-                    request["params"]["name"]
-                        .as_str()
-                        .unwrap_or_default()
-                        .to_owned()
-                } else {
-                    method.clone()
-                };
-                server.calls.push((
-                    path.into(),
-                    name.clone(),
-                    request["params"]["arguments"].clone(),
-                ));
-                let token = headers
-                    .get("authorization")
-                    .and_then(|auth| auth.strip_prefix("Bearer "));
-                if !token.is_some_and(|token| server.valid_tokens.iter().any(|t| t == token)) {
-                    return (
-                        "401 Unauthorized",
-                        String::new(),
-                        json!({"error": "invalid_token"}).to_string(),
-                    );
-                }
-                if method == "initialize" {
-                    let id = format!("session-{}", server.sessions.len() + 1);
-                    server.sessions.push(id.clone());
-                    let body = json!({"jsonrpc": "2.0", "id": request["id"], "result": {
-                        "protocolVersion": "2025-06-18", "capabilities": {},
-                        "serverInfo": {"name": "T3 Code", "version": "0.1.7"}}});
-                    return (
-                        "200 OK",
-                        format!("mcp-session-id: {id}\r\n"),
-                        body.to_string(),
-                    );
-                }
-                let session = headers.get("mcp-session-id");
-                if !session.is_some_and(|session| server.sessions.contains(session)) {
-                    return ("404 Not Found", String::new(), "{}".into());
-                }
-                if method == "notifications/initialized" {
-                    return ("202 Accepted", String::new(), String::new());
-                }
-                if let Some(message) = &server.rpc_error {
-                    let body = json!({"jsonrpc": "2.0", "id": request["id"],
-                        "error": {"code": -32602, "message": message}});
-                    return ("200 OK", String::new(), body.to_string());
-                }
-                let (is_error, text) = server
-                    .organize_reply
-                    .clone()
-                    .unwrap_or((false, json!({"sequence": 7}).to_string()));
-                let body = json!({"jsonrpc": "2.0", "id": request["id"], "result": {
-                    "content": [{"type": "text", "text": text}], "isError": is_error}});
-                if server.stream_replies {
-                    let other =
-                        json!({"jsonrpc": "2.0", "method": "notifications/progress", "params": {}});
-                    let stream = format!(
-                        "event: message\ndata: {other}\n\nevent: message\ndata: {body}\n\n"
-                    );
-                    return (
-                        "200 OK",
-                        "content-type: text/event-stream\r\n".into(),
-                        stream,
-                    );
-                }
-                ("200 OK", String::new(), body.to_string())
-            }
+            ("POST", "/mcp") => respond_mcp(server, path, headers, body),
             _ => ("404 Not Found", String::new(), "{}".into()),
         }
     }
 
-    /// Lets the fake `t3`'s next pairing codes through, as T3 would.
+    fn respond_mcp(
+        server: &mut Server,
+        path: &str,
+        headers: &BTreeMap<String, String>,
+        body: &str,
+    ) -> (&'static str, String, String) {
+        let request: Value = serde_json::from_str(body).unwrap();
+        let method = request["method"].as_str().unwrap_or_default().to_owned();
+        let name = if method == "tools/call" {
+            request["params"]["name"]
+                .as_str()
+                .unwrap_or_default()
+                .to_owned()
+        } else {
+            method.clone()
+        };
+        server.calls.push((
+            path.into(),
+            name.clone(),
+            request["params"]["arguments"].clone(),
+        ));
+        let token = headers
+            .get("authorization")
+            .and_then(|auth| auth.strip_prefix("Bearer "));
+        if !token.is_some_and(|token| server.valid_tokens.iter().any(|t| t == token)) {
+            return (
+                "401 Unauthorized",
+                String::new(),
+                json!({"error": "invalid_token"}).to_string(),
+            );
+        }
+        if method == "initialize" {
+            let id = format!("session-{}", server.sessions.len() + 1);
+            server.sessions.push(id.clone());
+            let body = json!({"jsonrpc": "2.0", "id": request["id"], "result": {
+                "protocolVersion": "2025-06-18", "capabilities": {},
+                "serverInfo": {"name": "T3 Code", "version": "0.1.7"}}});
+            return (
+                "200 OK",
+                format!("mcp-session-id: {id}\r\n"),
+                body.to_string(),
+            );
+        }
+        let session = headers.get("mcp-session-id");
+        if !session.is_some_and(|session| server.sessions.contains(session)) {
+            return ("404 Not Found", String::new(), "{}".into());
+        }
+        if method == "notifications/initialized" {
+            return ("202 Accepted", String::new(), String::new());
+        }
+        if let Some(message) = &server.rpc_error {
+            let body = json!({"jsonrpc": "2.0", "id": request["id"],
+                "error": {"code": -32602, "message": message}});
+            return ("200 OK", String::new(), body.to_string());
+        }
+        let (is_error, text) = server
+            .organize_reply
+            .clone()
+            .unwrap_or((false, json!({"sequence": 7}).to_string()));
+        let body = json!({"jsonrpc": "2.0", "id": request["id"], "result": {
+            "content": [{"type": "text", "text": text}], "isError": is_error}});
+        if server.stream_replies {
+            let other = json!({"jsonrpc": "2.0", "method": "notifications/progress", "params": {}});
+            let stream =
+                format!("event: message\ndata: {other}\n\nevent: message\ndata: {body}\n\n");
+            return (
+                "200 OK",
+                "content-type: text/event-stream\r\n".into(),
+                stream,
+            );
+        }
+        ("200 OK", String::new(), body.to_string())
+    }
+
     fn accept_pairing(fake: &FakeT3, codes: &[&str]) {
         fake.server
             .lock()
@@ -1020,7 +1015,12 @@ mod tests {
         accept_pairing(&fake, &["CODE1"]);
         let done = fake
             .client()
-            .organize("t1", Op::Snooze { until: NINE })
+            .organize(
+                "t1",
+                Op::Snooze {
+                    until: NOV_15_2026_0900_UTC,
+                },
+            )
             .unwrap();
         assert_eq!(done, Done::Applied);
 
@@ -1108,6 +1108,25 @@ mod tests {
     }
 
     #[test]
+    fn an_unpersisted_token_serves_this_client_but_the_next_client_signs_in_again() {
+        let fake = FakeT3::start();
+        accept_pairing(&fake, &["CODE1", "CODE2"]);
+        fs::create_dir_all(fake.state().join("t3-token.json")).unwrap();
+        let mut client = fake.client();
+        client.organize("t1", Op::Pin).unwrap();
+        client.organize("t1", Op::Unpin).unwrap();
+        assert_eq!(fake.cli_calls().len(), 1);
+
+        fake.client().organize("t1", Op::Pin).unwrap();
+        assert_eq!(fake.cli_calls().len(), 2);
+        let left: Vec<_> = fs::read_dir(fake.state())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(left, ["t3-token.json"], "no copy of the token left behind");
+    }
+
+    #[test]
     fn a_token_t3_no_longer_accepts_is_replaced_once() {
         let fake = FakeT3::start();
         accept_pairing(&fake, &["CODE1", "CODE2", "CODE3"]);
@@ -1127,7 +1146,7 @@ mod tests {
     #[test]
     fn a_token_for_another_t3_or_one_past_its_expiry_is_not_sent() {
         for stale in [
-            json!({"environmentId": "elsewhere", "token": "token-9", "expiresAt": NINE * 2}),
+            json!({"environmentId": "elsewhere", "token": "token-9", "expiresAt": NOV_15_2026_0900_UTC * 2}),
             json!({"environmentId": ENV, "token": "token-9", "expiresAt": 1}),
         ] {
             let fake = FakeT3::start();

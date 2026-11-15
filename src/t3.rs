@@ -14,7 +14,6 @@ use crate::triage::{Display, Park, Row, Thread};
 
 pub use client::{Client, Done};
 
-/// The T3 install in `$T3CODE_HOME`, else `~/.t3`.
 fn home() -> Option<PathBuf> {
     let set = |name| std::env::var_os(name).filter(|value| !value.is_empty());
     set("T3CODE_HOME")
@@ -23,7 +22,6 @@ fn home() -> Option<PathBuf> {
 }
 pub use db::Reader;
 
-/// A change to a T3 thread's triage, made by T3 itself.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Op {
     Settle,
@@ -62,12 +60,9 @@ pub struct T3Thread {
     pub updated_at: i64,
 }
 
-/// What the T3 worker tells the picker, in the order it happened.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Update {
-    /// T3's threads changed; `None` means T3 is not installed here.
     Threads(Option<Snapshot>),
-    /// A command finished, after any change it made was sent as `Threads`.
     Done {
         thread: String,
         op: Op,
@@ -75,8 +70,6 @@ pub enum Update {
     },
 }
 
-/// Reads T3's threads and carries out commands on a thread of its own, one thing at a time, so
-/// a slow T3 never holds up the picker and no stale read overtakes a newer one.
 pub struct Worker {
     requests: Option<Sender<(String, Op)>>,
     pub updates: Receiver<Update>,
@@ -147,7 +140,6 @@ impl Worker {
         }
     }
 
-    /// Queues `op` on `thread`; false when no worker runs to take it.
     pub fn request(&self, thread: &str, op: Op) -> bool {
         self.requests
             .as_ref()
@@ -155,7 +147,6 @@ impl Worker {
     }
 }
 
-/// The picker key of a T3 thread's row.
 pub fn row_key(thread: &str) -> String {
     format!("t3:{thread}")
 }

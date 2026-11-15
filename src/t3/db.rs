@@ -491,7 +491,7 @@ mod tests {
         let t3 = FakeT3::new();
         t3.thread("a", "2026-11-14T20:00:00.000Z", &json!({}));
         let path = t3.dir.path().join("userdata/statev2.sqlite");
-        // Polls far apart, so only the command can make the worker read again.
+        let poll_interval_beyond_test_deadline = Duration::from_secs(3_600);
         let worker = crate::t3::Worker::spawn(
             Some(t3.reader()),
             move |thread: &str, op: Op| {
@@ -508,7 +508,7 @@ mod tests {
                     _ => Err(io::Error::other("T3: refused")),
                 }
             },
-            Duration::from_secs(3_600),
+            poll_interval_beyond_test_deadline,
         );
         threads(worker.updates.recv_timeout(Duration::from_secs(5)).unwrap());
         assert!(worker.request("a", Op::Settle));

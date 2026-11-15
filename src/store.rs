@@ -42,7 +42,6 @@ CREATE TABLE IF NOT EXISTS threads (
 CREATE TABLE IF NOT EXISTS settings (name TEXT PRIMARY KEY, value TEXT NOT NULL);
 ";
 
-/// The plugin's state directory, shared by every Herdr server.
 pub fn state_root() -> PathBuf {
     std::env::var_os("HERDR_PLUGIN_STATE_DIR").map_or_else(
         || {

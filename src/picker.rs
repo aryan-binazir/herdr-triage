@@ -73,7 +73,6 @@ pub struct ForgetPrompt {
 #[derive(Debug, Clone)]
 pub struct SnoozePrompt {
     pub key: String,
-    /// The T3 thread to snooze, when the row is one.
     t3_thread: Option<String>,
     pub label: String,
     pub presets: Vec<SnoozePreset>,
@@ -113,7 +112,6 @@ pub struct Picker {
     presses: u64,
 }
 
-/// A change sent off from the picker, to move the cursor on from once it is done.
 #[derive(Debug)]
 pub struct Sent {
     key: String,
@@ -207,7 +205,6 @@ impl Picker {
             return Effect::Close;
         }
         self.presses += 1;
-        // A notice that came in while a prompt was open waits for the prompt to close.
         if !self.prompt_open() {
             self.message = None;
         }
@@ -348,7 +345,6 @@ impl Picker {
         Effect::None
     }
 
-    /// What a triage key does on a T3 row, or `None` when the row or the key is not one.
     fn t3_key(
         &mut self,
         key: KeyEvent,
@@ -535,8 +531,6 @@ impl Picker {
         }
     }
 
-    /// Moves on from what `sent` changed, unless you have pressed a key since: the cursor is
-    /// yours then.
     pub fn move_on_after(&mut self, sent: &Sent) {
         if self.presses == sent.presses {
             self.move_on_from(&sent.key, sent.from);

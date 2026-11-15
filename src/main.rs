@@ -156,7 +156,6 @@ fn run_picker() -> io::Result<()> {
     }
 }
 
-/// Shows how a T3 command went; a settle or snooze T3 made moves the cursor on, as for Herdr's.
 fn t3_done(
     picker: &mut Picker,
     op: t3::Op,

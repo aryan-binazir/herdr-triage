@@ -1579,7 +1579,6 @@ mod tests {
             footer.contains("enter open in T3") && footer.contains("s settle  z snooze  p pin"),
             "{footer}"
         );
-        // A done T3 thread is read by opening it, and T3 alone renames or forgets.
         for hint in ["u ", "rename", "forget"] {
             assert!(!footer.contains(hint), "{hint} in {footer}");
         }
