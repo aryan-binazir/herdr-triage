@@ -2,8 +2,9 @@
 
 An agent picker for [Herdr](https://herdr.dev) with T3 Code-style triage. Finished threads can be
 **settled** out of the way, **snoozed** until later, marked **unread**, or **pinned** to the top.
-Settling or snoozing an agent whose session Herdr can resume (Claude, OpenCode, Pi, or Codex run with
-`--no-daemon`) closes its session, unless it is the last pane in its workspace; the thread stays in the picker and reopens with its conversation
+Settling an agent closes its pane, unless it is the last pane in its workspace. If Herdr can resume
+its session (Claude, OpenCode, Pi, or Codex run with `--no-daemon`), snoozing closes it too, and the
+thread stays in the picker and reopens with its conversation
 when you unsettle, wake or open it. Herdr's native Agents sidebar
 follows the same order and hides parked threads.
 
@@ -92,9 +93,12 @@ is offered until 30 minutes before, so later in the day the digits after it shif
 - **Snooze** (`z`) parks it until the chosen time; then it returns marked *woke*. The picker shows
   the time left (`snoozed · 45m`). An agent that blocks on you wakes early; other activity, including
   a snoozed agent finishing its work, does not. Viewing the agent clears *woke*.
-- **Closing:** settling or snoozing an agent whose session Herdr can resume (Claude, Codex, OpenCode or Pi with
-  Herdr's integration) closes its pane. Other agents, agents still working when snoozed, and the last
-  pane of a workspace stay open and are marked `stays open`. Codex only reports its session to Herdr when it runs without its shared
+- **Closing:** settling an agent closes its pane. If Herdr can resume its session (Claude, Codex,
+  OpenCode or Pi with Herdr's integration), the thread stays listed as closed and snoozing closes
+  it too. An agent with no session to resume is closed for good when settled: the footer says so,
+  the thread leaves the picker and undo can't bring it back. Snoozing one, or settling one whose
+  state Herdr can't tell (`unknown`), leaves it open, as does snoozing an agent that is still
+  working, and so does the last pane of a workspace; these are marked `stays open`. Codex only reports its session to Herdr when it runs without its shared
   app-server: start it with `codex --no-daemon` (or alias `codex` to that).
 - **After a Herdr restart,** Herdr relaunches restored agents; state changes in the first 20 seconds
   are not treated as new activity, so parked threads stay parked.

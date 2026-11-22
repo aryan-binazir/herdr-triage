@@ -541,11 +541,12 @@ impl Picker {
         self.snooze.is_some() || self.rename.is_some() || self.forget.is_some()
     }
 
+    /// Moves on after parking `key`, which a settle can also have forgotten.
     pub fn move_on_from(&mut self, key: &str, from: usize) {
-        if !self
+        if self
             .items
             .iter()
-            .any(|item| item.row.key == key && item.row.park.is_some())
+            .any(|item| item.row.key == key && item.row.park.is_none())
         {
             return;
         }
@@ -1205,6 +1206,23 @@ mod tests {
             picker.selected().map(|i| i.row.key.as_str()),
             Some("k-p3"),
             "an unparked thread keeps the selection"
+        );
+
+        let closed_for_good = listed(&Fixture::new(
+            NOW,
+            &[
+                ("p2", "fix flaky test", Status::Done),
+                ("p3", "terraform plan", Status::Idle),
+                ("p4", "bench run", Status::Blocked),
+            ],
+        ));
+        let mut picker = Picker::new(list(false), Some("p1"), &closed_sections());
+        picker.refresh(closed_for_good, &closed_sections());
+        picker.move_on_from("k-p1", 0);
+        assert_eq!(
+            picker.selected().map(|i| i.row.key.as_str()),
+            Some("k-p4"),
+            "a settle that forgot its thread moves on too"
         );
     }
 

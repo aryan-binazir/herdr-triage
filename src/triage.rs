@@ -319,6 +319,8 @@ pub enum After {
 }
 
 /// A settle or snooze that means to close the agent's pane, as it was when the action was taken.
+/// A settle closes any agent, unless Herdr can't tell its state and it can't be resumed; a snooze
+/// closes only an agent whose session can be resumed to wake it.
 /// `State::confirm_close` decides whether it still may.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Close {
@@ -825,16 +827,23 @@ impl State {
         Ok(Closing::Close(close.pane_id.clone()))
     }
 
-    pub fn report_close(&mut self, close: &Close, closed: bool) {
+    /// Returns what to tell the user when the close forgot the thread: one with no session to
+    /// resume cannot be reopened, so it is not kept as closed.
+    pub fn report_close(&mut self, close: &Close, closed: bool) -> Option<String> {
         if !closed {
             self.mark_undo_closed(&close.key, false);
-            return;
+            return None;
         }
-        if let Some(record) = self.records.get_mut(&close.key) {
+        let record = self.records.get_mut(&close.key)?;
+        if record.resumable() {
             record.live = false;
             record.ended = true;
             record.missing_since = None;
+            return None;
         }
+        self.records.remove(&close.key);
+        self.drop_orphaned_undo();
+        Some("closed for good: it has no session to resume".into())
     }
 
     fn mark_undo_closed(&mut self, key: &str, closed: bool) {
@@ -984,14 +993,23 @@ impl State {
             Action::ToggleSettle if record.park == Some(Park::Settled) => unpark(record),
             Action::ToggleSettle => {
                 record.pinned = false;
-                Ok(park(record, seq, Park::Settled, live_agent))
+                let closable = record.resumable() || shown != Display::Unknown;
+                Ok(park(
+                    record,
+                    seq,
+                    Park::Settled,
+                    live_agent.filter(|_| closable),
+                ))
             }
-            Action::Snooze(until) => Ok(park(
-                record,
-                seq,
-                Park::Snoozed { until },
-                live_agent.filter(|_| shown != Display::Working),
-            )),
+            Action::Snooze(until) => {
+                let wakeable = record.resumable() && shown != Display::Working;
+                Ok(park(
+                    record,
+                    seq,
+                    Park::Snoozed { until },
+                    live_agent.filter(|_| wakeable),
+                ))
+            }
             Action::ToggleUnread if shown.unseen() => {
                 record.unread = None;
                 record.ack_seq = Some(seq);
@@ -1104,16 +1122,15 @@ fn park(record: &mut Record, seq: u64, park: Park, closing: Option<&Observed>) -
     record.park = Some(park);
     record.unread = None;
     record.ack_seq = Some(seq);
-    match closing {
-        Some(agent) if record.resumable() => After::ClosePane(Close {
+    closing.map_or(After::Nothing, |agent| {
+        After::ClosePane(Close {
             key: agent.key.clone(),
             pane_id: agent.pane_id.clone(),
             terminal_id: agent.terminal_id.clone(),
             seq: agent.seq,
             workspace_panes: agent.workspace_panes,
-        }),
-        _ => After::Nothing,
-    }
+        })
+    })
 }
 
 #[cfg(test)]
@@ -1947,7 +1964,7 @@ mod tests {
     }
 
     #[test]
-    fn settling_or_snoozing_a_resumable_agent_closes_its_pane() {
+    fn settling_closes_any_agent_and_snoozing_only_a_resumable_one() {
         let (a, b) = (
             resumable("a", Status::Idle, 1),
             resumable("b", Status::Done, 2),
@@ -1958,7 +1975,7 @@ mod tests {
         close_as_herdr_would(&mut state, &a, Action::ToggleSettle);
         close_as_herdr_would(&mut state, &b, Action::Snooze(NOW + 60));
         assert_eq!(
-            act(&mut state, &plain, Action::ToggleSettle),
+            act(&mut state, &plain, Action::Snooze(NOW + 60)),
             Ok(After::Nothing)
         );
         assert_eq!(closed(&state, "a").status_text(NOW), "settled · closed");
@@ -1971,7 +1988,37 @@ mod tests {
             .into_iter()
             .find(|r| r.key == plain.key)
             .unwrap();
-        assert_eq!(row.status_text(NOW), "settled · stays open");
+        assert_eq!(row.status_text(NOW), "snoozed · 1m · stays open");
+
+        let close = confirmed_close(&mut state, &plain, Action::ToggleSettle);
+        assert_eq!(
+            state.report_close(&close, true),
+            Some("closed for good: it has no session to resume".into())
+        );
+        assert!(
+            !state.records.contains_key(&plain.key),
+            "a thread that cannot reopen is not kept as closed"
+        );
+        assert_eq!(state.undo(NOW + 1), Err(Refusal("nothing to undo".into())));
+    }
+
+    #[test]
+    fn settling_an_agent_in_an_unknown_state_closes_it_only_if_it_can_reopen() {
+        let resumable_unknown = resumable("a", Status::Unknown, 1);
+        let plain_unknown = agent("terminal:t1", Status::Unknown, 2);
+        let mut state = State::default();
+        state.reconcile(
+            GEN,
+            &[resumable_unknown.clone(), plain_unknown.clone()],
+            NOW,
+        );
+        close_as_herdr_would(&mut state, &resumable_unknown, Action::ToggleSettle);
+        assert_eq!(
+            act(&mut state, &plain_unknown, Action::ToggleSettle),
+            Ok(After::Nothing),
+            "it may still be working, and closing it would lose it"
+        );
+        assert_eq!(closed(&state, "a").status_text(NOW), "settled · closed");
     }
 
     fn confirm(

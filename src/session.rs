@@ -306,8 +306,8 @@ impl Session {
         match closing {
             Closing::Close(pane) => {
                 let closed = self.herdr.close_pane(&pane);
-                self.locked(|_, state| state.report_close(close, closed.is_ok()))?;
-                closed.map(|()| None)
+                let notice = self.locked(|_, state| state.report_close(close, closed.is_ok()))?;
+                closed.map(|()| notice)
             }
             Closing::KeepOpen(notice) => Ok(Some(notice)),
             Closing::Skip => Ok(None),
@@ -890,9 +890,11 @@ mod tests {
         session
             .act("terminal:t-w1:p1", Action::ToggleSettle)
             .unwrap();
+        assert_eq!(fake.take("pane.close"), [json!({"pane_id": "w1:p1"})]);
+        let closed = store(&fake).transact(|state| state.ordered(&[])).unwrap();
         assert!(
-            fake.take("pane.close").is_empty(),
-            "a codex agent is not closed as a claude thread"
+            closed.is_empty(),
+            "a codex agent is not kept as a claude thread to resume"
         );
     }
 
@@ -1065,7 +1067,7 @@ mod tests {
     }
 
     #[test]
-    fn opencode_without_trusted_session_id_metadata_keeps_its_pane() {
+    fn settling_opencode_without_trusted_session_id_metadata_closes_it_for_good() {
         for metadata in [
             Value::Null,
             json!({"source": "custom", "agent": "opencode", "kind": "id", "value": "ses_x"}),
@@ -1084,8 +1086,23 @@ mod tests {
                 .unwrap()
                 .row
                 .key;
-            session.act(key, Action::ToggleSettle).unwrap();
-            assert!(fake.take("pane.close").is_empty());
+            session.act(key, Action::Snooze(NOW + 3600)).unwrap();
+            assert!(
+                fake.take("pane.close").is_empty(),
+                "a snooze keeps a pane it could not reopen to wake"
+            );
+            assert_eq!(
+                session.act(key, Action::ToggleSettle).unwrap(),
+                Outcome::Done {
+                    key: key.clone(),
+                    notice: Some("closed for good: it has no session to resume".into()),
+                    wake_failed: None,
+                }
+            );
+            assert_eq!(fake.take("pane.close"), [json!({"pane_id": "w1:p1"})]);
+            let closed = store(&fake).transact(|state| state.ordered(&[])).unwrap();
+            assert!(closed.is_empty(), "nothing is listed that cannot reopen");
+            assert!(matches!(session.undo().unwrap(), Outcome::Refused(_)));
         }
     }
 
