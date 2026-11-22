@@ -303,18 +303,17 @@ impl Session {
                     .collect())
             })
         })??;
-        let pane = match closing {
-            Closing::Close(pane) => pane,
-            Closing::CloseForGood(pane) => {
-                let _ = self.herdr.notify(CLOSED_FOR_GOOD);
-                pane
-            }
+        let (pane, for_good) = match closing {
+            Closing::Close(pane) => (pane, false),
+            Closing::CloseForGood(pane) => (pane, true),
             Closing::KeepOpen(notice) => return Ok(Some(notice)),
             Closing::Skip => return Ok(None),
         };
         let closed = self.herdr.close_pane(&pane);
         self.locked(|_, state| state.report_close(close, closed.is_ok()))?;
-        closed.map(|()| None)
+        closed?;
+        let unannounced = for_good && self.herdr.notify(CLOSED_FOR_GOOD).is_err();
+        Ok(unannounced.then(|| CLOSED_FOR_GOOD.to_owned()))
     }
 
     fn reopen(&mut self, snapshot: &Snapshot, plan: &ReopenPlan) -> io::Result<()> {
@@ -1109,11 +1108,11 @@ mod tests {
             assert_eq!(
                 calls,
                 [
+                    json!({"method": "pane.close", "params": {"pane_id": "w1:p1"}}),
                     json!({"method": "notification.show",
                            "params": {"title": "closed for good: it has no session to resume"}}),
-                    json!({"method": "pane.close", "params": {"pane_id": "w1:p1"}}),
                 ],
-                "the notice goes out first, so it outlives a picker that closes with the pane"
+                "nothing comes between the last check and the close, and only a close is announced"
             );
             let kept = store(&fake)
                 .transact(|state| state.records.contains_key(key.as_str()))
@@ -1121,6 +1120,39 @@ mod tests {
             assert!(!kept, "nothing is kept that cannot reopen");
             assert!(matches!(session.undo().unwrap(), Outcome::Refused(_)));
         }
+    }
+
+    #[test]
+    fn a_close_herdr_refuses_is_not_announced_as_closed_for_good() {
+        let fake = opencode_and_claude();
+        fake.agents.lock().unwrap()[0]["agent_session"] = Value::Null;
+        let (mut session, _) = connect(&fake);
+        let key = "terminal:t-w1:p1";
+        *fake.fail_method.lock().unwrap() = Some("pane.close".into());
+        assert!(session.act(key, Action::ToggleSettle).is_err());
+        assert!(fake.take("notification.show").is_empty());
+        let kept = store(&fake)
+            .transact(|state| state.records.contains_key(key))
+            .unwrap();
+        assert!(kept, "the thread stays while its pane does");
+    }
+
+    #[test]
+    fn a_failed_notification_falls_back_to_the_picker_notice() {
+        let fake = opencode_and_claude();
+        fake.agents.lock().unwrap()[0]["agent_session"] = Value::Null;
+        let (mut session, _) = connect(&fake);
+        let key = "terminal:t-w1:p1";
+        *fake.fail_method.lock().unwrap() = Some("notification.show".into());
+        assert_eq!(
+            session.act(key, Action::ToggleSettle).unwrap(),
+            Outcome::Done {
+                key: key.into(),
+                notice: Some("closed for good: it has no session to resume".into()),
+                wake_failed: None,
+            }
+        );
+        assert_eq!(fake.take("pane.close"), [json!({"pane_id": "w1:p1"})]);
     }
 
     #[test]

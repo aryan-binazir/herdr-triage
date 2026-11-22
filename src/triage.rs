@@ -335,8 +335,7 @@ pub struct Close {
 pub enum Closing {
     /// Close this pane, then report how it went with `State::report_close`.
     Close(String),
-    /// As `Close`, but the thread has no session to reopen it: tell the user `CLOSED_FOR_GOOD`
-    /// before closing, since closing the viewed pane can end the picker.
+    /// As `Close`, but the thread has no session to reopen it, so tell the user `CLOSED_FOR_GOOD`.
     CloseForGood(String),
     KeepOpen(String),
     Skip,

@@ -13,11 +13,14 @@ mod fake_herdr;
 
 use std::io;
 use std::process::ExitCode;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use chrono::Local;
 use ratatui::crossterm::event::{self, Event, KeyEventKind};
 use serde_json::Value;
+use signal_hook::consts::{SIGHUP, SIGTERM};
 
 use herdr::Herdr;
 use picker::{Effect, Picker};
@@ -63,6 +66,11 @@ fn invoked_from(context: &Value) -> Option<&str> {
 }
 
 fn run_picker() -> io::Result<()> {
+    // Herdr hangs up a closing pane before it kills it: finish the action in hand, then leave.
+    let hung_up = Arc::new(AtomicBool::new(false));
+    for signal in [SIGHUP, SIGTERM] {
+        signal_hook::flag::register(signal, Arc::clone(&hung_up))?;
+    }
     let mut session = Session::connect()?;
     let focus = std::env::var("HERDR_TRIAGE_FOCUS").ok();
     let pin_icon = session::pin_icon();
@@ -79,6 +87,9 @@ fn run_picker() -> io::Result<()> {
     let started = Instant::now();
     let mut refreshed = Instant::now();
     let outcome = loop {
+        if hung_up.load(Ordering::Relaxed) {
+            break Ok(Leave::Close);
+        }
         for update in t3.updates.try_iter() {
             match update {
                 t3::Update::Threads(snapshot) => {
