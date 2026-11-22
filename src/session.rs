@@ -13,8 +13,8 @@ use crate::herdr::{Agent, Herdr, Tab, Workspace};
 use crate::picker::{Item, Target};
 use crate::store::Store;
 use crate::triage::{
-    self, Action, After, Close, Closing, Observed, Rank, Refusal, ReopenPlan, Row, Section,
-    SessionRef, State, Thread, UNTITLED,
+    self, Action, After, CLOSED_FOR_GOOD, Close, Closing, Observed, Rank, Refusal, ReopenPlan, Row,
+    Section, SessionRef, State, Thread, UNTITLED,
 };
 use crate::wakers;
 
@@ -303,15 +303,18 @@ impl Session {
                     .collect())
             })
         })??;
-        match closing {
-            Closing::Close(pane) => {
-                let closed = self.herdr.close_pane(&pane);
-                let notice = self.locked(|_, state| state.report_close(close, closed.is_ok()))?;
-                closed.map(|()| notice)
+        let pane = match closing {
+            Closing::Close(pane) => pane,
+            Closing::CloseForGood(pane) => {
+                let _ = self.herdr.notify(CLOSED_FOR_GOOD);
+                pane
             }
-            Closing::KeepOpen(notice) => Ok(Some(notice)),
-            Closing::Skip => Ok(None),
-        }
+            Closing::KeepOpen(notice) => return Ok(Some(notice)),
+            Closing::Skip => return Ok(None),
+        };
+        let closed = self.herdr.close_pane(&pane);
+        self.locked(|_, state| state.report_close(close, closed.is_ok()))?;
+        closed.map(|()| None)
     }
 
     fn reopen(&mut self, snapshot: &Snapshot, plan: &ReopenPlan) -> io::Result<()> {
@@ -1093,15 +1096,25 @@ mod tests {
                 fake.take("pane.close").is_empty(),
                 "a snooze keeps a pane it could not reopen to wake"
             );
+            methods(&fake);
+            assert_eq!(session.act(key, Action::ToggleSettle).unwrap(), done(key));
+            let calls: Vec<Value> = fake
+                .requests
+                .lock()
+                .unwrap()
+                .drain(..)
+                .filter(|r| r["method"] == "notification.show" || r["method"] == "pane.close")
+                .map(|r| json!({"method": r["method"], "params": r["params"]}))
+                .collect();
             assert_eq!(
-                session.act(key, Action::ToggleSettle).unwrap(),
-                Outcome::Done {
-                    key: key.clone(),
-                    notice: Some("closed for good: it has no session to resume".into()),
-                    wake_failed: None,
-                }
+                calls,
+                [
+                    json!({"method": "notification.show",
+                           "params": {"title": "closed for good: it has no session to resume"}}),
+                    json!({"method": "pane.close", "params": {"pane_id": "w1:p1"}}),
+                ],
+                "the notice goes out first, so it outlives a picker that closes with the pane"
             );
-            assert_eq!(fake.take("pane.close"), [json!({"pane_id": "w1:p1"})]);
             let kept = store(&fake)
                 .transact(|state| state.records.contains_key(key.as_str()))
                 .unwrap();

@@ -96,7 +96,7 @@ is offered until 30 minutes before, so later in the day the digits after it shif
   a snoozed agent finishing its work, does not. Viewing the agent clears *woke*.
 - **Closing:** settling an agent closes its pane. If Herdr can resume its session (Claude, Codex,
   OpenCode or Pi with Herdr's integration), the thread stays listed as closed and snoozing closes
-  it too. An agent with no session to resume is closed for good when settled: the footer says so,
+  it too. An agent with no session to resume is closed for good when settled: Herdr notifies you,
   the thread leaves the picker and undo can't bring it back. Snoozing one, or settling one whose
   state Herdr can't tell (`unknown`), leaves it open, as does snoozing an agent that is still
   working, and so does the last pane of a workspace; these are marked `stays open`. Codex only reports its session to Herdr when it runs without its shared

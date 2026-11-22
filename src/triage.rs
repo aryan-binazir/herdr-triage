@@ -13,6 +13,7 @@ const REOPEN_PENDING_SECS: i64 = 60;
 const RESTORE_SETTLE_SECS: i64 = 20;
 const REOPEN_ADOPT_SECS: i64 = 300;
 pub const UNTITLED: &str = "Untitled thread";
+pub const CLOSED_FOR_GOOD: &str = "closed for good: it has no session to resume";
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -334,6 +335,9 @@ pub struct Close {
 pub enum Closing {
     /// Close this pane, then report how it went with `State::report_close`.
     Close(String),
+    /// As `Close`, but the thread has no session to reopen it: tell the user `CLOSED_FOR_GOOD`
+    /// before closing, since closing the viewed pane can end the picker.
+    CloseForGood(String),
     KeepOpen(String),
     Skip,
 }
@@ -826,26 +830,31 @@ impl State {
         }
         // Closing the viewed pane can end the picker before it reports the close.
         self.mark_undo_closed(&close.key, true);
-        Ok(Closing::Close(close.pane_id.clone()))
+        let pane = close.pane_id.clone();
+        Ok(if resumable {
+            Closing::Close(pane)
+        } else {
+            Closing::CloseForGood(pane)
+        })
     }
 
-    /// Returns what to tell the user when the close forgot the thread: one with no session to
-    /// resume cannot be reopened, so it is not kept as closed.
-    pub fn report_close(&mut self, close: &Close, closed: bool) -> Option<String> {
+    /// A thread with no session to resume cannot be reopened, so it is not kept as closed.
+    pub fn report_close(&mut self, close: &Close, closed: bool) {
         if !closed {
             self.mark_undo_closed(&close.key, false);
-            return None;
+            return;
         }
-        let record = self.records.get_mut(&close.key)?;
+        let Some(record) = self.records.get_mut(&close.key) else {
+            return;
+        };
         if record.resumable() {
             record.live = false;
             record.ended = true;
             record.missing_since = None;
-            return None;
+        } else {
+            self.records.remove(&close.key);
+            self.drop_orphaned_undo();
         }
-        self.records.remove(&close.key);
-        self.drop_orphaned_undo();
-        Some("closed for good: it has no session to resume".into())
     }
 
     fn mark_undo_closed(&mut self, key: &str, closed: bool) {
@@ -1993,11 +2002,12 @@ mod tests {
             .unwrap();
         assert_eq!(row.status_text(NOW), "snoozed · 1m · stays open");
 
-        let close = confirmed_close(&mut state, &plain, Action::ToggleSettle);
+        let close = intended_close(&mut state, &plain, Action::ToggleSettle);
         assert_eq!(
-            state.report_close(&close, true),
-            Some("closed for good: it has no session to resume".into())
+            confirm(&mut state, &close, std::slice::from_ref(&plain), GEN, NOW),
+            Closing::CloseForGood(plain.pane_id.clone())
         );
+        state.report_close(&close, true);
         assert!(
             !state.records.contains_key(&plain.key),
             "a thread that cannot reopen is not kept as closed"
