@@ -541,13 +541,12 @@ impl Picker {
         self.snooze.is_some() || self.rename.is_some() || self.forget.is_some()
     }
 
-    /// Moves on after parking `key`, which a settle can also have forgotten.
     pub fn move_on_from(&mut self, key: &str, from: usize) {
-        if self
+        let still_listed_unparked = self
             .items
             .iter()
-            .any(|item| item.row.key == key && item.row.park.is_none())
-        {
+            .any(|item| item.row.key == key && item.row.park.is_none());
+        if still_listed_unparked {
             return;
         }
         let needs_you = self

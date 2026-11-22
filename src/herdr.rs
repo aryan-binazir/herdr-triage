@@ -179,7 +179,6 @@ impl Herdr {
             .map(drop)
     }
 
-    /// Whether Herdr showed it: it can decline, for example when rate limited.
     pub fn notify(&mut self, title: &str) -> io::Result<bool> {
         let result = self.call("notification.show", &json!({"title": title}))?;
         Ok(result["shown"].as_bool().unwrap_or(true))

@@ -335,7 +335,6 @@ pub struct Close {
 pub enum Closing {
     /// Close this pane, then report how it went with `State::report_close`.
     Close(String),
-    /// As `Close`, but the thread has no session to reopen it, so tell the user `CLOSED_FOR_GOOD`.
     CloseForGood(String),
     KeepOpen(String),
     Skip,
@@ -786,11 +785,7 @@ impl State {
         }
     }
 
-    /// Decides, under the store lock, whether an intended close may still happen. The last pane of
-    /// a workspace stays open. Otherwise the thread must still be parked as the action left it and
-    /// live on server `generation`, and `look`, called only then, must show exactly one pane for it:
-    /// the same terminal, not working or blocked, in a known state unless its session can be
-    /// resumed, and unchanged since the action unless Herdr is restoring it.
+    /// Decides, under the store lock, whether an intended close may still happen.
     pub fn confirm_close(
         &mut self,
         close: &Close,
@@ -837,7 +832,6 @@ impl State {
         })
     }
 
-    /// A thread with no session to resume cannot be reopened, so it is not kept as closed.
     pub fn report_close(&mut self, close: &Close, closed: bool) {
         if !closed {
             self.mark_undo_closed(&close.key, false);
