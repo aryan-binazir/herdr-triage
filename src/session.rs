@@ -891,9 +891,11 @@ mod tests {
             .act("terminal:t-w1:p1", Action::ToggleSettle)
             .unwrap();
         assert_eq!(fake.take("pane.close"), [json!({"pane_id": "w1:p1"})]);
-        let closed = store(&fake).transact(|state| state.ordered(&[])).unwrap();
+        let kept = store(&fake)
+            .transact(|state| state.records.contains_key("terminal:t-w1:p1"))
+            .unwrap();
         assert!(
-            closed.is_empty(),
+            !kept,
             "a codex agent is not kept as a claude thread to resume"
         );
     }
@@ -1100,8 +1102,10 @@ mod tests {
                 }
             );
             assert_eq!(fake.take("pane.close"), [json!({"pane_id": "w1:p1"})]);
-            let closed = store(&fake).transact(|state| state.ordered(&[])).unwrap();
-            assert!(closed.is_empty(), "nothing is listed that cannot reopen");
+            let kept = store(&fake)
+                .transact(|state| state.records.contains_key(key.as_str()))
+                .unwrap();
+            assert!(!kept, "nothing is kept that cannot reopen");
             assert!(matches!(session.undo().unwrap(), Outcome::Refused(_)));
         }
     }

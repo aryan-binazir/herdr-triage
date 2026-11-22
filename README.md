@@ -2,7 +2,8 @@
 
 An agent picker for [Herdr](https://herdr.dev) with T3 Code-style triage. Finished threads can be
 **settled** out of the way, **snoozed** until later, marked **unread**, or **pinned** to the top.
-Settling an agent closes its pane, unless it is the last pane in its workspace. If Herdr can resume
+Settling an agent closes its pane, unless it is the last pane in its workspace or Herdr can neither
+tell its state nor resume it. If Herdr can resume
 its session (Claude, OpenCode, Pi, or Codex run with `--no-daemon`), snoozing closes it too, and the
 thread stays in the picker and reopens with its conversation
 when you unsettle, wake or open it. Herdr's native Agents sidebar
@@ -117,7 +118,8 @@ is offered until 30 minutes before, so later in the day the digits after it shif
   `woke · closed`. Settle and unread are refused while an agent is working or blocked;
   snooze only while it is blocked.
 - **Undo** (`U`) takes back the last settle, snooze, wake, unread, pin or rename, once. It never closes
-  a pane; undoing a settle or snooze that closed a session reopens it. Once the agent has done
+  a pane; undoing a settle or snooze that closed a session reopens it, unless it closed for good.
+  Once the agent has done
   something new, undo can still bring a thread back but won't park it again. Forgetting a thread
   can't be undone.
 - **Rename** (`r`) gives a thread its own title in the picker; search still finds the automatic one.
