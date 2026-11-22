@@ -122,7 +122,7 @@ impl Session {
         let next = triage::next_attention(&snapshot.rows, current.as_deref());
         match next.and_then(|row| row.agent_index) {
             Some(index) => self.herdr.focus(&snapshot.agents[index].pane_id),
-            None => self.herdr.notify("Nothing needs you"),
+            None => self.herdr.notify("Nothing needs you").map(drop),
         }
     }
 
@@ -159,7 +159,7 @@ impl Session {
     }
 
     pub fn notify(&mut self, title: &str) -> io::Result<()> {
-        self.herdr.notify(title)
+        self.herdr.notify(title).map(drop)
     }
 
     fn view_after(&mut self, edit: impl FnOnce(&mut State, &[Observed], i64)) -> io::Result<View> {
@@ -310,10 +310,11 @@ impl Session {
             Closing::Skip => return Ok(None),
         };
         let closed = self.herdr.close_pane(&pane);
+        let announced =
+            closed.is_ok() && for_good && matches!(self.herdr.notify(CLOSED_FOR_GOOD), Ok(true));
         self.locked(|_, state| state.report_close(close, closed.is_ok()))?;
         closed?;
-        let unannounced = for_good && self.herdr.notify(CLOSED_FOR_GOOD).is_err();
-        Ok(unannounced.then(|| CLOSED_FOR_GOOD.to_owned()))
+        Ok((for_good && !announced).then(|| CLOSED_FOR_GOOD.to_owned()))
     }
 
     fn reopen(&mut self, snapshot: &Snapshot, plan: &ReopenPlan) -> io::Result<()> {
@@ -1135,6 +1136,43 @@ mod tests {
             .transact(|state| state.records.contains_key(key))
             .unwrap();
         assert!(kept, "the thread stays while its pane does");
+    }
+
+    #[test]
+    fn a_close_is_announced_before_it_waits_for_the_store() {
+        let fake = opencode_and_claude();
+        fake.agents.lock().unwrap()[0]["agent_session"] = Value::Null;
+        let (mut session, _) = connect(&fake);
+        let key = "terminal:t-w1:p1";
+        let unreported = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let (seen, store) = (unreported.clone(), store(&fake));
+        fake.on("notification.show", move |_| {
+            let kept = store.transact(|state| state.records.contains_key(key));
+            *seen.lock().unwrap() = kept.ok();
+        });
+        session.act(key, Action::ToggleSettle).unwrap();
+        assert_eq!(
+            *unreported.lock().unwrap(),
+            Some(true),
+            "a picker killed with its pane while waiting for the store still told the user"
+        );
+    }
+
+    #[test]
+    fn a_suppressed_notification_falls_back_to_the_picker_notice() {
+        let fake = opencode_and_claude();
+        fake.agents.lock().unwrap()[0]["agent_session"] = Value::Null;
+        let (mut session, _) = connect(&fake);
+        let key = "terminal:t-w1:p1";
+        *fake.notification_shown.lock().unwrap() = false;
+        assert_eq!(
+            session.act(key, Action::ToggleSettle).unwrap(),
+            Outcome::Done {
+                key: key.into(),
+                notice: Some("closed for good: it has no session to resume".into()),
+                wake_failed: None,
+            }
+        );
     }
 
     #[test]

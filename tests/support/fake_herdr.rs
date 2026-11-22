@@ -17,6 +17,7 @@ pub struct FakeHerdr {
     pub fail_method: Arc<Mutex<Option<String>>>,
     pub list_delay: Arc<Mutex<std::time::Duration>>,
     pub tabs: Arc<Mutex<Vec<Value>>>,
+    pub notification_shown: Arc<Mutex<bool>>,
     hooks: Arc<Mutex<Vec<(String, Hook)>>>,
 }
 
@@ -38,8 +39,10 @@ impl FakeHerdr {
             fail_method: Arc::new(Mutex::new(None)),
             list_delay: Arc::new(Mutex::new(std::time::Duration::ZERO)),
             tabs: Arc::new(Mutex::new(Vec::new())),
+            notification_shown: Arc::new(Mutex::new(true)),
             hooks: Arc::new(Mutex::new(Vec::new())),
         };
+        let shown = fake.notification_shown.clone();
         let (agents, workspaces, tabs, requests, fail, list_delay, hooks) = (
             fake.agents.clone(),
             fake.workspaces.clone(),
@@ -94,7 +97,10 @@ impl FakeHerdr {
                                "tab": {"tab_id": format!("{workspace}:t9{opened}"), "workspace_id": workspace},
                                "root_pane": {"pane_id": format!("{workspace}:p9{opened}")}})
                     }
-                    "notification.show" => json!({"type": "notification_show", "shown": true}),
+                    "notification.show" => {
+                        let shown = *shown.lock().unwrap();
+                        json!({"type": "notification_show", "shown": shown, "reason": (!shown).then_some("rate_limited")})
+                    }
                     "agent.view.set" => json!({"type": "agent_view", "active": true}),
                     _ => json!({"type": "ok"}),
                 };
