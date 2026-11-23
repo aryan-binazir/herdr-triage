@@ -179,9 +179,9 @@ impl Herdr {
             .map(drop)
     }
 
-    pub fn notify(&mut self, title: &str) -> io::Result<()> {
-        self.call("notification.show", &json!({"title": title}))
-            .map(drop)
+    pub fn notify(&mut self, title: &str) -> io::Result<bool> {
+        let result = self.call("notification.show", &json!({"title": title}))?;
+        Ok(result["shown"].as_bool().unwrap_or(true))
     }
 
     pub fn report_tokens(&mut self, pane_id: &str, tokens: &Map<String, Value>) -> io::Result<()> {
