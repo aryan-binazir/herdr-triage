@@ -637,6 +637,25 @@ fn prompt_line(picker: &Picker, width: usize) -> Option<(Line<'static>, Option<u
             None,
         ));
     }
+    if let Some(prompt) = picker.close_prompt() {
+        let options = vec![
+            Span::raw("  y"),
+            Span::from(" close").dim(),
+            Span::raw("  n"),
+            Span::from(" settle, keep it open").dim(),
+        ];
+        let verb = Span::from("close").red().bold();
+        return Some((
+            labelled_prompt(
+                verb,
+                &prompt.label,
+                " for good? (can't resume)",
+                options,
+                width,
+            ),
+            None,
+        ));
+    }
     if let Some(prompt) = picker.snooze_prompt() {
         let options = prompt
             .presets
@@ -885,7 +904,11 @@ mod tests {
             &chrono::Utc,
         );
         let (lines, buffer) = render(&mut picker, 120, 14);
-        assert!(lines[13].contains("3 today 18:00  4 tomorrow 09:00"), "{}", lines[13]);
+        assert!(
+            lines[13].contains("3 today 18:00  4 tomorrow 09:00"),
+            "{}",
+            lines[13]
+        );
         let x = |text: &str| {
             let byte = lines[13].find(text).unwrap();
             u16::try_from(lines[13][..byte].chars().count()).unwrap()
@@ -893,6 +916,23 @@ mod tests {
         let crossed = |x| buffer[(x, 13)].modifier.contains(Modifier::CROSSED_OUT);
         assert!(crossed(x("today")) && crossed(x("3 today")));
         assert!(!crossed(x("tomorrow")) && !crossed(x("4 tomorrow")));
+    }
+
+    #[test]
+    fn settling_an_agent_that_cannot_be_resumed_asks_in_the_footer() {
+        let fixture = Fixture::new(NOW, &[("p1", "fix flaky test", Status::Done)]);
+        let mut items = listed(&fixture);
+        items[0].row.thread.session = None;
+        let mut picker = Picker::new(items, Some("p1"), &BTreeSet::new());
+        press(&mut picker, KeyCode::Char('s'));
+        let (lines, _) = render(&mut picker, 120, 14);
+        assert!(
+            lines[13].contains(
+                "close “fix flaky test” for good? (can't resume)  y close  n settle, keep it open  esc cancel"
+            ),
+            "{}",
+            lines[13]
+        );
     }
 
     #[test]

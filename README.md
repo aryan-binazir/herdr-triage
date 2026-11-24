@@ -61,7 +61,7 @@ rows = [
 | `enter` | focus agent · reopen closed thread · open/close section | same |
 | `1`–`9`, `0` | open row 1–10 on screen | typed |
 | `/` | search (edits the kept search) | — |
-| `s` | settle / unsettle | typed |
+| `s` | settle / unsettle (asks first if it would close an agent for good) | typed |
 | `z` | snooze (1h, 3h, today 18:00, tomorrow 09:00, next Mon 09:00; press the digit shown beside one) / wake | typed |
 | `u` | mark read / unread | typed |
 | `p` | pin / unpin | typed |
@@ -69,7 +69,7 @@ rows = [
 | `U` | undo the last triage change or rename | typed |
 | `D` | forget a closed thread (asks `y`) | typed |
 | `esc` | clear the search, else close | leave search, keeping it |
-| `q` | close (cancels an open snooze or forget prompt) | typed |
+| `q` | close (cancels an open prompt) | typed |
 | `^u` / `^w` | — | clear / delete word |
 
 The picker opens on the agent you invoked it from. Agents busy working (unless pinned) collect in a
@@ -97,8 +97,9 @@ and refused. A time that has passed while the prompt was open is refused too:
   a snoozed agent finishing its work, does not. Viewing the agent clears *woke*.
 - **Closing:** settling an agent closes its pane. If Herdr can resume its session (Claude, Codex,
   OpenCode or Pi with Herdr's integration), the thread stays listed as closed and snoozing closes
-  it too. An agent with no session to resume is closed for good when settled: Herdr notifies you,
-  the thread leaves the picker and undo can't bring it back. Snoozing one, or settling one whose
+  it too. Settling an agent with no session to resume first asks: `y` closes it for good (Herdr
+  notifies you, the thread leaves the picker and undo can't bring it back), `n` settles it and
+  keeps its pane open. Snoozing one, or settling one whose
   state Herdr can't tell (`unknown`), leaves it open, as does snoozing an agent that is still
   working, and so does the last pane of a workspace; these are marked `stays open`. Codex only reports its session to Herdr when it runs without its shared
   app-server: start it with `codex --no-daemon` (or alias `codex` to that).

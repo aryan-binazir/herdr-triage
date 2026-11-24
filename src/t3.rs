@@ -10,7 +10,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::picker::{Item, Target};
-use crate::triage::{Display, Park, Row, Thread};
+use crate::triage::{Display, Park, Row, Status, Thread};
 
 pub use client::{Client, Done};
 
@@ -181,6 +181,7 @@ fn item(snapshot: &Snapshot, thread: &T3Thread, now: i64) -> Item {
         park,
         pinned: thread.pinned && !thread.settled,
         changed_at: Some(thread.updated_at),
+        status: Status::Unknown,
         thread: Thread {
             label: thread.title.clone(),
             agent: Some(kind.clone()),

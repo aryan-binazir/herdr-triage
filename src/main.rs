@@ -210,7 +210,10 @@ fn apply(
             if let Some(notice) = notice {
                 picker.inform(notice);
             }
-            if matches!(action, Action::ToggleSettle | Action::Snooze(_)) {
+            if matches!(
+                action,
+                Action::ToggleSettle | Action::SettleKeepingOpen | Action::Snooze(_)
+            ) {
                 picker.move_on_from(&key, from);
             }
             if let Some(error) = wake_failed {

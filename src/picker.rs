@@ -70,6 +70,13 @@ pub struct ForgetPrompt {
     pub label: String,
 }
 
+/// Asks before a settle closes an agent that has no session to resume.
+#[derive(Debug, Clone)]
+pub struct ClosePrompt {
+    pub key: String,
+    pub label: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct SnoozePrompt {
     pub key: String,
@@ -104,6 +111,7 @@ pub struct Picker {
     selected: usize,
     snooze: Option<SnoozePrompt>,
     forget: Option<ForgetPrompt>,
+    close: Option<ClosePrompt>,
     rename: Option<RenamePrompt>,
     undoable: bool,
     message: Option<String>,
@@ -136,6 +144,7 @@ impl Picker {
             selected: 0,
             snooze: None,
             forget: None,
+            close: None,
             rename: None,
             undoable: false,
             message: None,
@@ -211,6 +220,17 @@ impl Picker {
         }
         if self.rename.is_some() {
             return self.rename_key(key, ctrl);
+        }
+        if let Some(prompt) = self.close.take() {
+            let action = match key.code {
+                KeyCode::Char('y') => Action::ToggleSettle,
+                KeyCode::Char('n') => Action::SettleKeepingOpen,
+                _ => return Effect::None,
+            };
+            return Effect::Apply {
+                key: prompt.key,
+                action,
+            };
         }
         if let Some(prompt) = self.forget.take() {
             return match key.code {
@@ -296,7 +316,18 @@ impl Picker {
                     .get(row)
                     .map_or(Effect::None, |&i| self.open(i));
             }
-            KeyCode::Char('s') => return apply(self, Action::ToggleSettle),
+            KeyCode::Char('s') => {
+                if let Some(item) = self.selected()
+                    && item.row.settle_closes_for_good()
+                {
+                    self.close = Some(ClosePrompt {
+                        key: item.row.key.clone(),
+                        label: item.row.label().to_owned(),
+                    });
+                    return Effect::None;
+                }
+                return apply(self, Action::ToggleSettle);
+            }
             KeyCode::Char('u') => return apply(self, Action::ToggleUnread),
             KeyCode::Char('p') => return apply(self, Action::TogglePin),
             KeyCode::Char('U') => return Effect::Undo,
@@ -539,7 +570,10 @@ impl Picker {
     }
 
     fn prompt_open(&self) -> bool {
-        self.snooze.is_some() || self.rename.is_some() || self.forget.is_some()
+        self.snooze.is_some()
+            || self.rename.is_some()
+            || self.forget.is_some()
+            || self.close.is_some()
     }
 
     pub fn move_on_from(&mut self, key: &str, from: usize) {
@@ -645,6 +679,10 @@ impl Picker {
 
     pub fn forget_prompt(&self) -> Option<&ForgetPrompt> {
         self.forget.as_ref()
+    }
+
+    pub fn close_prompt(&self) -> Option<&ClosePrompt> {
+        self.close.as_ref()
     }
 
     pub fn snooze_prompt(&self) -> Option<&SnoozePrompt> {
@@ -990,6 +1028,43 @@ mod tests {
         let past_six = NOW + 5 * 3_600 + 60;
         assert_eq!(picker.key(key('3'), past_six, &chrono::Utc), Effect::None);
         assert_eq!(picker.message(), Some("today 18:00 is too soon"));
+    }
+
+    #[test]
+    fn settling_an_agent_that_cannot_be_resumed_asks_first() {
+        let sessionless = || {
+            let mut items = items();
+            for item in &mut items {
+                item.row.thread.session = None;
+            }
+            items
+        };
+        let settle = |answer| {
+            let mut picker = Picker::new(sessionless(), Some("p2"), &closed_sections());
+            assert_eq!(press(&mut picker, KeyCode::Char('s')), Effect::None);
+            assert_eq!(
+                picker.close_prompt().map(|p| p.label.as_str()),
+                Some("fix flaky test")
+            );
+            let effect = press(&mut picker, answer);
+            assert!(picker.close_prompt().is_none());
+            effect
+        };
+        let apply = |action| Effect::Apply {
+            key: "k-p2".into(),
+            action,
+        };
+        assert_eq!(settle(KeyCode::Char('y')), apply(Action::ToggleSettle));
+        assert_eq!(settle(KeyCode::Char('n')), apply(Action::SettleKeepingOpen));
+        assert_eq!(settle(KeyCode::Esc), Effect::None);
+        assert_eq!(settle(KeyCode::Char('q')), Effect::None);
+
+        let mut picker = Picker::new(items(), Some("p2"), &closed_sections());
+        assert_eq!(
+            press(&mut picker, KeyCode::Char('s')),
+            apply(Action::ToggleSettle),
+            "a resumable agent settles at once"
+        );
     }
 
     #[test]

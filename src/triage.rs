@@ -301,6 +301,8 @@ impl Rank {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Action {
     ToggleSettle,
+    /// Settles without closing the agent's pane.
+    SettleKeepingOpen,
     Snooze(i64),
     Wake,
     ToggleUnread,
@@ -399,6 +401,8 @@ pub struct Row {
     pub park: Option<Park>,
     pub pinned: bool,
     pub changed_at: Option<i64>,
+    /// Herdr's own state for a live agent; `Unknown` otherwise.
+    pub status: Status,
     pub thread: Thread,
     pub title: Option<String>,
 }
@@ -433,6 +437,15 @@ impl Row {
             display if display.unseen() => Some(Attention::Unseen),
             _ => None,
         }
+    }
+
+    /// Settling this agent would close its pane with no session to resume it from.
+    pub fn settle_closes_for_good(&self) -> bool {
+        self.live()
+            && self.park != Some(Park::Settled)
+            && self.status != Status::Unknown
+            && self.thread.resume_argv().is_none()
+            && self.refusal(Action::ToggleSettle).is_none()
     }
 
     /// Why triage would refuse `action` on this thread as shown. `None` does not promise
@@ -608,7 +621,7 @@ fn refusal(action: Action, shown: Display, live: bool) -> Option<Refusal> {
         Action::Forget if live => {
             return Some(Refusal("only closed threads can be forgotten".into()));
         }
-        Action::ToggleSettle => "settle",
+        Action::ToggleSettle | Action::SettleKeepingOpen => "settle",
         Action::ToggleUnread => "mark unread",
         Action::Snooze(_) if shown == Display::Blocked => "snooze",
         _ => return None,
@@ -1010,6 +1023,10 @@ impl State {
                     live_agent.filter(|agent| resumable || agent.status != Status::Unknown),
                 ))
             }
+            Action::SettleKeepingOpen => {
+                record.pinned = false;
+                Ok(park(record, seq, Park::Settled, None))
+            }
             Action::Snooze(until) => {
                 let wakeable = record.resumable() && shown != Display::Working;
                 Ok(park(
@@ -1048,6 +1065,7 @@ impl State {
                 park: record.and_then(|r| r.park),
                 pinned: record.is_some_and(|r| r.pinned),
                 changed_at: record.and_then(|r| r.changed_at),
+                status: agent.status,
                 thread: agent.thread.clone(),
                 title: record.and_then(|r| r.title.clone()),
             }
@@ -1064,6 +1082,7 @@ impl State {
                 park: record.park,
                 pinned: record.pinned,
                 changed_at: record.changed_at,
+                status: Status::Unknown,
                 thread: record.thread.clone(),
                 title: record.title.clone(),
             });
@@ -2056,6 +2075,38 @@ mod tests {
         assert_eq!(
             confirm(&mut state, &close, &[restored_unknown], GEN, NOW + 1),
             Closing::Skip
+        );
+    }
+
+    #[test]
+    fn only_settling_a_known_sessionless_agent_would_close_it_for_good() {
+        let row = |agent: &Observed| {
+            let mut state = State::default();
+            state.reconcile(GEN, std::slice::from_ref(agent), NOW);
+            state.ordered(std::slice::from_ref(agent)).remove(0)
+        };
+        assert!(row(&agent("plain", Status::Idle, 2)).settle_closes_for_good());
+        assert!(row(&agent("done", Status::Done, 2)).settle_closes_for_good());
+        assert!(!row(&resumable("resumable", Status::Idle, 2)).settle_closes_for_good());
+        assert!(!row(&agent("unknown", Status::Unknown, 2)).settle_closes_for_good());
+        assert!(!row(&agent("working", Status::Working, 2)).settle_closes_for_good());
+    }
+
+    #[test]
+    fn settling_a_sessionless_agent_keeping_it_open_parks_it_without_closing() {
+        let idle = agent("terminal:t1", Status::Idle, 2);
+        let mut state = State::default();
+        state.reconcile(GEN, std::slice::from_ref(&idle), NOW);
+        assert_eq!(
+            act(&mut state, &idle, Action::SettleKeepingOpen),
+            Ok(After::Nothing)
+        );
+        let row = state.ordered(std::slice::from_ref(&idle)).remove(0);
+        assert_eq!(row.park, Some(Park::Settled));
+        assert_eq!(row.status_text(NOW), "settled · stays open");
+        assert!(
+            !row.settle_closes_for_good(),
+            "unsettling it closes nothing"
         );
     }
 

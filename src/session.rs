@@ -1437,6 +1437,7 @@ mod tests {
             park,
             pinned: false,
             changed_at: None,
+            status: triage::Status::Idle,
             title: None,
             thread: Thread::default(),
         };
