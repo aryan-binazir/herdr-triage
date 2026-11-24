@@ -5,6 +5,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use chrono::Local;
 use serde_json::{Map, Value};
@@ -19,6 +20,7 @@ use crate::triage::{
 use crate::wakers;
 
 const DEFAULT_PIN_ICON: &str = "\u{f435}";
+const STORE_RETRY: Duration = Duration::from_millis(50);
 
 type Clock = dyn Fn() -> i64;
 
@@ -102,24 +104,39 @@ impl Session {
 
     /// Records that the agent in `pane` was launched by `by`, under `title`. `None` when Herdr
     /// does not list an agent there.
+    /// Waits for the store no later than `deadline`, then fails with `TimedOut`.
     pub fn stamp_launch(
         &mut self,
         pane: &str,
         by: &str,
         title: &str,
+        deadline: Instant,
     ) -> io::Result<Option<String>> {
-        let (_, key) = self.sync_and_serve(false, |state, observed, _| {
-            let key = observed
-                .iter()
-                .find(|agent| agent.pane_id == pane)?
-                .key
-                .clone();
-            let record = state.records.get_mut(&key)?;
-            record.launched_by = Some(by.to_owned());
-            record.title = Some(title.trim().to_owned()).filter(|title| !title.is_empty());
-            Some(key)
-        })?;
-        Ok(key)
+        loop {
+            let stamp = |state: &mut State, observed: &[Observed], _| {
+                let key = observed
+                    .iter()
+                    .find(|agent| agent.pane_id == pane)?
+                    .key
+                    .clone();
+                let record = state.records.get_mut(&key)?;
+                record.launched_by = Some(by.to_owned());
+                record.title = Some(title.trim().to_owned()).filter(|title| !title.is_empty());
+                Some(key)
+            };
+            if let Some(synced) = self.sync_once(false, false, stamp)? {
+                let (_, key) = synced?;
+                self.serve_sync_requests()?;
+                return Ok(key);
+            }
+            if Instant::now() >= deadline {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "the triage store stayed busy",
+                ));
+            }
+            std::thread::sleep(STORE_RETRY);
+        }
     }
 
     /// Herdr runs at most 32 plugin commands at once and rejects the rest, so a hook that finds a

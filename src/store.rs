@@ -46,10 +46,13 @@ CREATE TABLE IF NOT EXISTS settings (name TEXT PRIMARY KEY, value TEXT NOT NULL)
 pub fn state_root() -> PathBuf {
     std::env::var_os("HERDR_PLUGIN_STATE_DIR").map_or_else(
         || {
-            let state = std::env::var_os("XDG_STATE_HOME").map_or_else(
-                || PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".local/state"),
-                PathBuf::from,
-            );
+            // An empty or relative XDG_STATE_HOME counts as unset, as the XDG spec says.
+            let state = std::env::var_os("XDG_STATE_HOME")
+                .map(PathBuf::from)
+                .filter(|dir| dir.is_absolute())
+                .unwrap_or_else(|| {
+                    PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".local/state")
+                });
             state.join("herdr/plugins/ar.triage")
         },
         PathBuf::from,

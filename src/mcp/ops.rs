@@ -95,6 +95,8 @@ pub struct Call<'a> {
     herdr: Herdr,
     session: Session,
     caller: Option<Caller>,
+    /// When a launch's time runs out: every Herdr request it makes is cut to fit.
+    deadline: Option<Instant>,
 }
 
 #[derive(Clone)]
@@ -114,11 +116,36 @@ impl<'a> Call<'a> {
             herdr: Herdr::at(&env.socket)?,
             session: (env.session)()?,
             caller: None,
+            deadline: None,
         })
     }
 
+    fn request(
+        &mut self,
+        method: &str,
+        params: &Value,
+        within: Duration,
+    ) -> Result<Result<Value, Refused>, Failure> {
+        let Some(deadline) = self.deadline else {
+            return Ok(self.herdr.request(method, params, within)?);
+        };
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err(out_of_time());
+        }
+        self.herdr
+            .request(method, params, within.min(left))
+            .map_err(|error| {
+                if Instant::now() < deadline {
+                    error.into()
+                } else {
+                    out_of_time()
+                }
+            })
+    }
+
     fn ask(&mut self, method: &str, params: &Value, within: Duration) -> Done {
-        Ok(self.herdr.request(method, params, within)??)
+        Ok(self.request(method, params, within)??)
     }
 
     fn caller(&mut self) -> Caller {
@@ -176,14 +203,16 @@ impl<'a> Call<'a> {
     /// Herdr's workspaces, each with the checkout it is in. `workspace.list` names the checkout
     /// only for some, so the rest are asked for one repository at a time.
     fn workspaces(&mut self) -> Result<Vec<Workspace>, Failure> {
-        let mut workspaces = self.herdr.workspaces()?;
+        let mut listed = self.ask("workspace.list", &json!({}), QUICK)?;
+        let mut workspaces: Vec<Workspace> = serde_json::from_value(listed["workspaces"].take())
+            .map_err(|error| Failure::new("herdr_unavailable", error.to_string()))?;
         for at in 0..workspaces.len() {
             if workspaces[at].worktree.is_some() {
                 continue;
             }
             let params = json!({"workspace_id": workspaces[at].workspace_id});
             // A workspace outside any repository is refused here, and stays a project of its own.
-            let Ok(Ok(listed)) = self.herdr.request("worktree.list", &params, QUICK) else {
+            let Ok(Ok(listed)) = self.request("worktree.list", &params, QUICK) else {
                 continue;
             };
             let source = &listed["source"];
@@ -531,6 +560,7 @@ struct Opened {
 
 pub fn launch_tool(call: &mut Call, args: &LaunchArgs, budget: Duration) -> Done {
     let deadline = Instant::now() + budget;
+    call.deadline = Some(deadline);
     let config = call.config()?;
     let caller = call.caller();
     let workspaces = call.workspaces()?;
@@ -560,13 +590,17 @@ pub fn launch_tool(call: &mut Call, args: &LaunchArgs, budget: Duration) -> Done
         let slug = slug(&args.title, 40);
         format!("{}{slug}-{suffix}", config.worktree.branch_prefix)
     });
+    let checkout = deadline.saturating_duration_since(Instant::now() + AFTER_CHECKOUT);
+    if checkout.is_zero() {
+        return Err(out_of_time());
+    }
     let opened = open_worktree(
         call,
         &config,
         &project,
         &branch,
         args.base.as_deref(),
-        deadline,
+        checkout,
     )
     // Herdr may have made the worktree even when no answer came: a retry must not make another.
     .map_err(|failure| failure.with("branch", branch.as_str()))?;
@@ -595,8 +629,11 @@ pub fn launch_tool(call: &mut Call, args: &LaunchArgs, budget: Duration) -> Done
     };
     let thread = call
         .session
-        .stamp_launch(&opened.pane, &caller.key, &args.title)
-        .map_err(|error| with_place(error.into()))?;
+        .stamp_launch(&opened.pane, &caller.key, &args.title, deadline)
+        .map_err(|error| match error.kind() {
+            io::ErrorKind::TimedOut => with_place(out_of_time()),
+            _ => with_place(error.into()),
+        })?;
     let message = args
         .message
         .as_deref()
@@ -608,14 +645,6 @@ pub fn launch_tool(call: &mut Call, args: &LaunchArgs, budget: Duration) -> Done
         }
         _ => None,
     };
-    let next = match (ready, sent) {
-        (false, _) => {
-            "The agent stopped at a dialog before taking input, so nothing was sent: \
-             herdr_read it and tell the user."
-        }
-        (true, Some(())) => "herdr_wait for the turn to end, then herdr_read.",
-        (true, None) => "It is idle: herdr_send gives it work.",
-    };
     let mut result = opened.detail;
     result.insert(
         "thread".into(),
@@ -624,8 +653,19 @@ pub fn launch_tool(call: &mut Call, args: &LaunchArgs, budget: Duration) -> Done
     result.insert("launched".into(), selection_json(&selection));
     result.insert("ready".into(), ready.into());
     result.insert("sent".into(), sent.is_some().into());
-    result.insert("next".into(), next.into());
+    result.insert("next".into(), after_launch(ready, sent.is_some()).into());
     Ok(Value::Object(result))
+}
+
+fn after_launch(ready: bool, sent: bool) -> &'static str {
+    match (ready, sent) {
+        (false, _) => {
+            "The agent stopped at a dialog before taking input, so nothing was sent: \
+             herdr_read it and tell the user."
+        }
+        (true, true) => SENT,
+        (true, false) => "It is idle: herdr_send gives it work.",
+    }
 }
 
 /// A launch past its budget stops before its next step: the client may have given up on it, and
@@ -634,11 +674,19 @@ fn in_time(deadline: Instant) -> Result<(), Failure> {
     if Instant::now() < deadline {
         return Ok(());
     }
-    Err(Failure::new(
+    Err(out_of_time())
+}
+
+fn out_of_time() -> Failure {
+    Failure::new(
         "launch_timeout",
         "the launch ran out of time before its next step",
-    ))
+    )
 }
+
+const SENT: &str = "herdr_wait for the turn to end, then herdr_read. Herdr cannot tie a turn to a \
+                    message, so check the reply answers yours: a turn someone else started in the \
+                    same instant would end first.";
 
 /// Starts the agent and stays until it takes input. `false` when it stopped first at a dialog of
 /// its own, such as trusting the directory. Herdr's `agent.start` answers before the agent is up,
@@ -647,7 +695,7 @@ fn start_agent(call: &mut Call, start: &Value, deadline: Instant) -> Result<bool
     let pane = json!({"target": start["pane_id"]});
     let by = (Instant::now() + START_TIMEOUT).min(deadline);
     loop {
-        match call.herdr.request("agent.start", start, QUICK)? {
+        match call.request("agent.start", start, QUICK)? {
             Ok(_) => break,
             Err(refused) if refused.code == "agent_pane_busy" && Instant::now() < by => {
                 thread::sleep(POLL);
@@ -656,7 +704,7 @@ fn start_agent(call: &mut Call, start: &Value, deadline: Instant) -> Result<bool
         }
     }
     loop {
-        let mut found = match call.herdr.request("agent.get", &pane, QUICK)? {
+        let mut found = match call.request("agent.get", &pane, QUICK)? {
             Ok(found) => found,
             // Herdr gives up on a launch whose command exits or never becomes the agent.
             Err(refused) if refused.code == "agent_not_found" => {
@@ -690,7 +738,7 @@ fn open_worktree(
     project: &Project,
     branch: &str,
     base: Option<&str>,
-    deadline: Instant,
+    checkout: Duration,
 ) -> Result<Opened, Failure> {
     // The workspace is named for its project, so the thread's row says where it is; the title
     // is on the thread itself.
@@ -705,13 +753,6 @@ fn open_worktree(
         None => worktree["cwd"] = json!(project.root),
     }
     // Herdr runs `git worktree add`, which checks out the whole tree.
-    let checkout = deadline.saturating_duration_since(Instant::now() + AFTER_CHECKOUT);
-    if checkout.is_zero() {
-        return Err(Failure::new(
-            "launch_timeout",
-            "too little of the launch's time is left to check out a worktree",
-        ));
-    }
     let made = call.ask("worktree.create", &worktree, checkout)?;
     let pane = pane_of(&made)?;
     Ok(Opened {
@@ -854,9 +895,7 @@ pub fn send_tool(call: &mut Call, arguments: Value) -> Done {
         "thread": item.row.key,
         "sent": true,
         "mine": mine,
-        "next": "herdr_wait for the turn to end, then herdr_read. Herdr cannot tie a turn to a \
-                 message, so check the reply answers yours: a turn someone else started in the \
-                 same instant would end first.",
+        "next": SENT,
     }))
 }
 
@@ -880,7 +919,7 @@ pub fn read_tool(call: &mut Call, arguments: Value) -> Done {
     });
     // Herdr scrolls back past the screen of an agent showing a full-screen view only while it
     // is idle, so a blocked one is read as it shows now.
-    let read = if let Ok(read) = call.herdr.request("agent.read", &params, QUICK)? {
+    let read = if let Ok(read) = call.request("agent.read", &params, QUICK)? {
         read
     } else {
         params["source"] = json!("visible");
@@ -939,7 +978,7 @@ pub fn wait_tool(call: &mut Call, arguments: Value) -> Done {
         "target": pane, "until": ["idle", "done", "blocked"], "timeout_ms": timeout,
     });
     let within = Duration::from_millis(timeout) + MARGIN;
-    let timed_out = match call.herdr.request("agent.wait", &params, within)? {
+    let timed_out = match call.request("agent.wait", &params, within)? {
         Ok(_) => false,
         Err(refused) if refused.code == "timeout" => true,
         Err(refused) => return Err(refused.into()),

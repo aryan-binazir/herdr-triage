@@ -303,7 +303,7 @@ impl Server {
             return invalid(&id, "a request needs `jsonrpc: \"2.0\"` and a `method`");
         };
         let params = &request["params"];
-        if !(params.is_object() || params.is_null()) {
+        if !(params.is_object() || request.get("params").is_none()) {
             return invalid(&id, "`params` must be an object");
         }
         let result = match method {
@@ -611,6 +611,7 @@ mod tests {
             json!({"jsonrpc": "2.0", "id": null, "method": "ping"}),
             json!({"jsonrpc": "2.0", "id": 1.5, "method": "ping"}),
             json!({"jsonrpc": "2.0", "id": 1, "method": "ping", "params": [1]}),
+            json!({"jsonrpc": "2.0", "id": 1, "method": "ping", "params": null}),
         ] {
             let reply = rig.server.answer(&malformed);
             assert_eq!(reply.unwrap()["error"]["code"], -32600, "{malformed}");
@@ -975,6 +976,21 @@ mod tests {
         assert_eq!(error.code, "launch_timeout");
         assert!(rig.fake.take("worktree.create").is_empty());
         assert!(rig.fake.take("agent.start").is_empty());
+    }
+
+    #[test]
+    fn too_little_time_for_a_checkout_fails_before_asking_and_is_not_kept_for_retries() {
+        let rig = rig(vec![], None);
+        let args = LaunchArgs::decode(json!({"project": "acme-api", "title": "t"})).unwrap();
+        let mut call = Call::open(&rig.server.env, "test-client:i1").unwrap();
+        let budget = std::time::Duration::from_secs(5);
+        let error = ops::launch_tool(&mut call, &args, budget).unwrap_err();
+        assert_eq!(error.code, "launch_timeout");
+        assert!(
+            !error.detail.contains_key("branch"),
+            "nothing was asked for"
+        );
+        assert!(rig.fake.take("worktree.create").is_empty());
     }
 
     #[test]
