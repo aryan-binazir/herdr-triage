@@ -18,6 +18,9 @@ pub struct FakeHerdr {
     pub list_delay: Arc<Mutex<std::time::Duration>>,
     pub tabs: Arc<Mutex<Vec<Value>>>,
     pub notification_shown: Arc<Mutex<bool>>,
+    pub fail_code: Arc<Mutex<String>>,
+    pub worktree_lists: Arc<Mutex<std::collections::BTreeMap<String, Value>>>,
+    pub screen: Arc<Mutex<String>>,
     hooks: Arc<Mutex<Vec<(String, Hook)>>>,
 }
 
@@ -40,9 +43,14 @@ impl FakeHerdr {
             list_delay: Arc::new(Mutex::new(std::time::Duration::ZERO)),
             tabs: Arc::new(Mutex::new(Vec::new())),
             notification_shown: Arc::new(Mutex::new(true)),
+            fail_code: Arc::new(Mutex::new("failed".into())),
+            screen: Arc::new(Mutex::new(String::new())),
+            worktree_lists: Arc::default(),
             hooks: Arc::new(Mutex::new(Vec::new())),
         };
         let shown = fake.notification_shown.clone();
+        let (fail_code, screen) = (fake.fail_code.clone(), fake.screen.clone());
+        let worktree_lists = fake.worktree_lists.clone();
         let (agents, workspaces, tabs, requests, fail, list_delay, hooks) = (
             fake.agents.clone(),
             fake.workspaces.clone(),
@@ -90,19 +98,19 @@ impl FakeHerdr {
                             .retain(|a| a["pane_id"] != params["pane_id"]);
                         json!({"type": "ok"})
                     }
-                    "tab.create" => {
-                        opened += 1;
-                        let workspace = params["workspace_id"].as_str().unwrap_or("w1");
-                        json!({"type": "tab_created",
-                               "tab": {"tab_id": format!("{workspace}:t9{opened}"), "workspace_id": workspace},
-                               "root_pane": {"pane_id": format!("{workspace}:p9{opened}")}})
-                    }
                     "notification.show" => {
                         let shown = *shown.lock().unwrap();
                         json!({"type": "notification_show", "shown": shown, "reason": (!shown).then_some("rate_limited")})
                     }
                     "agent.view.set" => json!({"type": "agent_view", "active": true}),
-                    _ => json!({"type": "ok"}),
+                    method => agent_api(
+                        method,
+                        params,
+                        &mut agents.lock().unwrap(),
+                        &screen,
+                        &worktree_lists.lock().unwrap(),
+                        &mut opened,
+                    ),
                 };
                 for (method, hook) in hooks.lock().unwrap().iter_mut() {
                     if request["method"] == method.as_str() {
@@ -111,7 +119,7 @@ impl FakeHerdr {
                 }
                 requests.lock().unwrap().push(request.clone());
                 let reply = if failing {
-                    json!({"id": request["id"], "error": {"code": "failed", "message": "injected"}})
+                    json!({"id": request["id"], "error": {"code": *fail_code.lock().unwrap(), "message": "injected"}})
                 } else {
                     json!({"id": request["id"], "result": result})
                 };
@@ -175,6 +183,90 @@ impl FakeHerdr {
         let (taken, kept) = requests.drain(..).partition(|r| r["method"] == method);
         *requests = kept;
         taken.into_iter().map(|r| r["params"].clone()).collect()
+    }
+}
+
+fn agent_api(
+    method: &str,
+    params: &Value,
+    agents: &mut Vec<Value>,
+    screen: &Mutex<String>,
+    worktree_lists: &std::collections::BTreeMap<String, Value>,
+    opened: &mut i32,
+) -> Value {
+    match method {
+        "worktree.list" => {
+            let found = if let Some(cwd) = params["cwd"].as_str() {
+                worktree_lists.values().find(|listing| {
+                    let source = listing["source"]["repo_root"].as_str().unwrap();
+                    let worktrees = listing["worktrees"].as_array().unwrap();
+                    std::iter::once(source)
+                        .chain(worktrees.iter().map(|w| w["path"].as_str().unwrap()))
+                        .any(|dir| std::path::Path::new(cwd).starts_with(dir))
+                })
+            } else {
+                worktree_lists.get(params["workspace_id"].as_str().unwrap_or_default())
+            };
+            found.cloned().unwrap_or(json!({"type": "ok"}))
+        }
+        "worktree.create" => {
+            *opened += 1;
+            let workspace = format!("w9{opened}");
+            let branch = params["branch"].as_str().unwrap_or("detached");
+            json!({"type": "worktree_created",
+                   "workspace": {"workspace_id": workspace},
+                   "tab": {"tab_id": format!("{workspace}:t1"), "workspace_id": workspace},
+                   "root_pane": {"pane_id": format!("{workspace}:p1")},
+                   "worktree": {"path": format!("/worktrees/{branch}"), "branch": branch}})
+        }
+        "tab.create" => {
+            *opened += 1;
+            let workspace = params["workspace_id"].as_str().unwrap_or("w1");
+            json!({"type": "tab_created",
+                   "tab": {"tab_id": format!("{workspace}:t9{opened}"), "workspace_id": workspace},
+                   "root_pane": {"pane_id": format!("{workspace}:p9{opened}")}})
+        }
+        "agent.start" => {
+            let pane = params["pane_id"].as_str().unwrap();
+            let mut started = agent(pane, "idle", 1);
+            started["workspace_id"] = json!(pane.split(':').next().unwrap());
+            started["agent"] = params["kind"].clone();
+            started["name"] = params["name"].clone();
+            agents.push(started.clone());
+            json!({"type": "agent_started", "agent": started, "argv": params["args"]})
+        }
+        "agent.prompt" => {
+            if let Some(agent) = agents.iter_mut().find(|a| a["pane_id"] == params["target"]) {
+                agent["agent_status"] = json!("working");
+                agent["state_change_seq"] = json!(agent["state_change_seq"].as_u64().unwrap() + 1);
+            }
+            json!({"type": "agent_prompted"})
+        }
+        "agent.get" => {
+            let mut found = agents
+                .iter()
+                .find(|a| a["pane_id"] == params["target"])
+                .cloned();
+            if let Some(agent) = &mut found {
+                agent["interactive_ready"] = json!(agent["agent_status"] != "blocked");
+            }
+            json!({"type": "agent_info", "agent": found})
+        }
+        "pane.get" => {
+            let pane = params["pane_id"].as_str().unwrap();
+            let workspace = agents.iter().find(|a| a["pane_id"] == pane).map_or_else(
+                || json!(pane.split(':').next()),
+                |a| a["workspace_id"].clone(),
+            );
+            json!({"type": "pane_info", "pane": {
+                "pane_id": pane, "workspace_id": workspace, "terminal_id": format!("t-{pane}"),
+            }})
+        }
+        "agent.wait" => json!({"type": "wait_matched"}),
+        "agent.read" | "pane.read" => json!({"type": "pane_read", "read": {
+            "pane_id": params["target"], "text": *screen.lock().unwrap(), "truncated": false,
+        }}),
+        _ => json!({"type": "ok"}),
     }
 }
 

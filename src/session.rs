@@ -5,6 +5,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use chrono::Local;
 use serde_json::{Map, Value};
@@ -19,6 +20,7 @@ use crate::triage::{
 use crate::wakers;
 
 const DEFAULT_PIN_ICON: &str = "\u{f435}";
+const STORE_RETRY: Duration = Duration::from_millis(50);
 
 type Clock = dyn Fn() -> i64;
 
@@ -27,6 +29,7 @@ pub struct Session {
     store: Store,
     clock: Box<Clock>,
     waker: Box<dyn FnMut(i64) -> io::Result<()>>,
+    focus_reopened: bool,
 }
 
 pub struct View {
@@ -38,7 +41,7 @@ pub struct View {
 #[derive(Debug, PartialEq, Eq)]
 pub enum Outcome {
     Refused(String),
-    /// The thread was resumed in a new tab, which Herdr focused.
+    /// The thread was resumed in a new tab.
     Reopened,
     Done {
         /// The thread acted on, under the key Herdr knows it by now.
@@ -73,7 +76,7 @@ impl Session {
         ))
     }
 
-    fn new(
+    pub(crate) fn new(
         herdr: Herdr,
         store: Store,
         clock: impl Fn() -> i64 + 'static,
@@ -84,6 +87,64 @@ impl Session {
             store,
             clock: Box::new(clock),
             waker: Box::new(waker),
+            focus_reopened: true,
+        }
+    }
+
+    pub fn in_background(mut self) -> Self {
+        self.focus_reopened = false;
+        self
+    }
+
+    pub fn now(&self) -> i64 {
+        (self.clock)()
+    }
+
+    pub fn stamp_launch(
+        &mut self,
+        pane: &str,
+        by: &str,
+        title: &str,
+        deadline: Instant,
+    ) -> io::Result<Option<String>> {
+        self.herdr.deadline = Some(deadline);
+        let stamped = self.stamp_by(pane, by, title, deadline);
+        self.herdr.deadline = None;
+        stamped
+    }
+
+    fn stamp_by(
+        &mut self,
+        pane: &str,
+        by: &str,
+        title: &str,
+        deadline: Instant,
+    ) -> io::Result<Option<String>> {
+        loop {
+            let stamp = |state: &mut State, observed: &[Observed], _| {
+                let key = observed
+                    .iter()
+                    .find(|agent| agent.pane_id == pane)?
+                    .key
+                    .clone();
+                let record = state.records.get_mut(&key)?;
+                record.launched_by = Some(by.to_owned());
+                record.title = Some(title.trim().to_owned()).filter(|title| !title.is_empty());
+                Some(key)
+            };
+            if let Some(synced) = self.sync_once(false, false, stamp)? {
+                let served = self.serve_sync_requests();
+                let (_, key) = synced?;
+                served?;
+                return Ok(key);
+            }
+            if Instant::now() >= deadline {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "the triage store stayed busy",
+                ));
+            }
+            std::thread::sleep(STORE_RETRY);
         }
     }
 
@@ -324,15 +385,21 @@ impl Session {
             .map(|w| w.workspace_id.as_str())
             .collect();
         let launch = plan.launch(&self.herdr.server_generation(), &workspaces);
-        if let Some(pane) = launch.focus
-            && self.herdr.focus_pane(pane).is_ok()
-        {
-            return Ok(());
+        if let Some(pane) = launch.focus {
+            let started = if self.focus_reopened {
+                self.herdr.focus_pane(pane).is_ok()
+            } else {
+                self.herdr.has_pane(pane)?
+            };
+            if started {
+                return Ok(());
+            }
         }
         let cwd = launch.cwd.filter(|dir| Path::new(dir).is_dir());
+        let focus = self.focus_reopened;
         self.locked(|held, state| {
             let herdr = &mut *held.herdr;
-            let pane = herdr.create_tab(launch.workspace, cwd)?;
+            let pane = herdr.create_tab(launch.workspace, cwd, focus)?;
             let launched = match launch.session_to_report {
                 Some((agent, session)) => herdr.report_session(&pane, agent, session),
                 None => Ok(()),
@@ -514,8 +581,21 @@ fn view_label(rows: &[Row]) -> String {
 }
 
 pub fn pin_icon() -> String {
-    let path = std::env::var_os("HERDR_PLUGIN_CONFIG_DIR")
-        .map(|dir| PathBuf::from(dir).join("config.toml"));
+    let dir = std::env::var_os("HERDR_PLUGIN_CONFIG_DIR")
+        .map(PathBuf::from)
+        .or_else(|| {
+            let config = std::env::var_os("XDG_CONFIG_HOME")
+                .map(PathBuf::from)
+                .or_else(|| {
+                    std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config"))
+                })?;
+            Some(
+                config
+                    .join("herdr/plugins/config")
+                    .join(crate::herdr::plugin_id()),
+            )
+        });
+    let path = dir.map(|dir| dir.join("config.toml"));
     path.and_then(|path| fs::read_to_string(path).ok())
         .and_then(|text| text.parse::<toml::Table>().ok())
         .and_then(|table| table.get("pin_icon")?.as_str().map(str::to_owned))
@@ -1428,6 +1508,21 @@ mod tests {
     }
 
     #[test]
+    fn stamping_a_launch_out_of_time_asks_herdr_nothing_and_leaves_no_deadline_behind() {
+        let fake = two_resumable_agents();
+        let (mut session, _) = connect(&fake);
+        let late = session.stamp_launch("w1:p1", "client:c", "t", Instant::now());
+        assert_eq!(late.unwrap_err().kind(), io::ErrorKind::TimedOut);
+        assert!(methods(&fake).is_empty());
+        let later = Instant::now() + Duration::from_secs(5);
+        let stamped = session
+            .stamp_launch("w1:p1", "client:c", "t", later)
+            .unwrap();
+        assert_eq!(stamped.as_deref(), Some(KEY));
+        assert!(session.herdr.deadline.is_none());
+    }
+
+    #[test]
     fn the_sidebar_header_counts_only_snoozed_threads_within_herdrs_limit() {
         let row = |park| Row {
             agent_index: None,
@@ -1438,6 +1533,7 @@ mod tests {
             pinned: false,
             changed_at: None,
             title: None,
+            launched_by: None,
             thread: Thread::default(),
         };
         let snoozed = || row(Some(Park::Snoozed { until: 0 }));

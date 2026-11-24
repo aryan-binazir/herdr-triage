@@ -315,12 +315,7 @@ fn sync_and_next_do_not_depend_on_tabs() {
 fn unchanged_sync_leaves_the_database_unwritten() {
     let herdr = FakeHerdr::start(vec![agent("w1:p1", "idle", 3)]);
     herdr.run(&["sync"]);
-    let server_dir = std::fs::read_dir(herdr.state_dir())
-        .unwrap()
-        .next()
-        .unwrap()
-        .unwrap()
-        .path();
+    let server_dir = server_dir(&herdr);
     let observer = rusqlite::Connection::open(server_dir.join("triage.sqlite3")).unwrap();
     observer
         .execute("UPDATE threads SET touched_at = touched_at - 1", [])
@@ -384,8 +379,12 @@ fn wakers_share_each_deadline_and_remove_expired_locks() {
     assert_eq!(sleepers, 2, "one sleeper per deadline");
     assert_eq!(locks, 2, "both waiting deadlines have locks in their store");
     assert_eq!(herdr.take("agent.list").len(), 2, "one sync per deadline");
-    for server in std::fs::read_dir(herdr.state_dir()).unwrap() {
-        for entry in std::fs::read_dir(server.unwrap().path()).unwrap() {
+    let servers = std::fs::read_dir(herdr.state_dir()).unwrap();
+    for server in servers
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| path.is_dir())
+    {
+        for entry in std::fs::read_dir(server).unwrap() {
             assert!(
                 !entry
                     .unwrap()
@@ -451,4 +450,74 @@ fn an_overdue_waker_started_during_sync_requests_another_sync() {
     assert!(second.wait().unwrap().success());
     assert!(syncing, "first waker never entered sync");
     assert_eq!(herdr.take("agent.list").len(), 2);
+}
+
+#[test]
+fn hooks_keep_a_link_to_the_binary_where_mcp_clients_start_it() {
+    let herdr = FakeHerdr::start(vec![agent("w1:p1", "idle", 3)]);
+    let link = herdr.dir.path().join("state/herdr-triage");
+    std::fs::create_dir_all(link.parent().unwrap()).unwrap();
+    std::os::unix::fs::symlink("/gone/herdr-triage", &link).unwrap();
+    herdr.run(&["sync"]);
+    let binary = std::fs::canonicalize(env!("CARGO_BIN_EXE_herdr-triage")).unwrap();
+    assert_eq!(std::fs::read_link(&link).unwrap(), binary);
+    herdr.run(&["startup"]);
+    assert_eq!(std::fs::read_link(&link).unwrap(), binary);
+    assert!(!link.with_extension("new").exists());
+}
+
+#[test]
+fn mcp_serves_a_client_over_stdio_and_leaves_a_settings_file_to_edit() {
+    use std::io::Write;
+    use std::process::Stdio;
+
+    let herdr = FakeHerdr::start(vec![agent("w1:p1", "done", 3)]);
+    let config = herdr.dir.path().join("xdg");
+    let mut server = Command::new(env!("CARGO_BIN_EXE_herdr-triage"))
+        .arg("mcp")
+        .env("HERDR_SOCKET_PATH", &herdr.socket)
+        .env("HERDR_PLUGIN_STATE_DIR", herdr.dir.path().join("state"))
+        .env("XDG_CONFIG_HOME", &config)
+        .env("HERDR_PANE_ID", "w1:p1")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let requests = [
+        json!({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+               "params": {"protocolVersion": "2025-06-18", "clientInfo": {"name": "test"}}}),
+        json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
+        json!({"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+               "params": {"name": "herdr_threads", "arguments": {}}}),
+        json!({"jsonrpc": "2.0", "id": 3, "method": "tools/call",
+               "params": {"name": "herdr_launch", "arguments": {"title": "Review the diff"}}}),
+    ];
+    let mut stdin = server.stdin.take().unwrap();
+    for request in requests {
+        writeln!(stdin, "{request}").unwrap();
+    }
+    drop(stdin);
+    let output = server.wait_with_output().unwrap();
+    assert!(output.status.success());
+    let replies: Vec<Value> = String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+
+    assert_eq!(replies.len(), 3, "the notification gets no reply");
+    assert_eq!(replies[0]["result"]["protocolVersion"], "2025-06-18");
+    let threads = &replies[1]["result"]["structuredContent"]["threads"];
+    assert_eq!(threads[0]["pane_id"], "w1:p1");
+    assert_eq!(threads[0]["state"], "done");
+    let launched = &replies[2]["result"];
+    assert_eq!(launched["isError"], false, "{launched}");
+    assert_eq!(launched["structuredContent"]["launched"]["harness"], "pi");
+    assert_eq!(
+        herdr.take("worktree.create")[0]["workspace_id"],
+        "w1",
+        "a caller in a Herdr pane launches in its own project"
+    );
+    let settings = std::fs::read_to_string(config.join("herdr-triage/mcp.yaml")).unwrap();
+    assert!(settings.contains("default_harness: pi"));
 }

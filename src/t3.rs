@@ -188,6 +188,7 @@ fn item(snapshot: &Snapshot, thread: &T3Thread, now: i64) -> Item {
             ..Thread::default()
         },
         title: None,
+        launched_by: None,
     };
     Item {
         target: Target::T3 {

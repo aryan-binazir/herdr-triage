@@ -147,6 +147,8 @@ pub struct Record {
     pub restored_at: Option<i64>,
     #[serde(default)]
     pub title: Option<String>,
+    #[serde(default)]
+    pub launched_by: Option<String>,
 }
 
 fn live_by_default() -> bool {
@@ -307,6 +309,19 @@ pub enum Action {
     TogglePin,
     Reopen,
     Forget,
+    Ensure(Want),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Want {
+    Settled,
+    Unsettled,
+    Awake,
+    Open,
+    Pinned,
+    Unpinned,
+    Read,
+    Unread,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -350,7 +365,7 @@ pub struct ReopenPlan {
     pending_generation: Option<String>,
 }
 
-/// What the executor does to reopen a thread: focus `focus` if Herdr still has it, otherwise
+/// What the executor does to reopen a thread: reuse `focus` if Herdr still has it, otherwise
 /// launch `argv` in a new tab and report the tab's pane with `State::report_reopen`.
 #[derive(Debug, PartialEq, Eq)]
 pub struct Launch<'a> {
@@ -401,6 +416,7 @@ pub struct Row {
     pub changed_at: Option<i64>,
     pub thread: Thread,
     pub title: Option<String>,
+    pub launched_by: Option<String>,
 }
 
 impl Row {
@@ -948,6 +964,9 @@ impl State {
             Some(agent) => display(agent, self.records.get(key)),
             None => closed_display(self.records.get(key).ok_or_else(gone)?),
         };
+        let Some(action) = self.toggle_toward(key, live_agent.is_some(), shown, action) else {
+            return Ok(After::Nothing);
+        };
         let refused = refusal(action, shown, live_agent.is_some());
         if action == Action::Forget {
             if let Some(refusal) = refused {
@@ -1024,12 +1043,37 @@ impl State {
                 record.park = None;
                 Ok(After::Nothing)
             }
-            Action::Forget => Ok(After::Nothing),
+            Action::Forget | Action::Ensure(_) => Ok(After::Nothing),
         };
         if after.is_ok() {
             self.remember(key, before);
         }
         after
+    }
+
+    fn toggle_toward(
+        &self,
+        key: &str,
+        live: bool,
+        shown: Display,
+        action: Action,
+    ) -> Option<Action> {
+        let Action::Ensure(want) = action else {
+            return Some(action);
+        };
+        let record = self.records.get(key);
+        let park = record.and_then(|r| r.park);
+        let pinned = record.is_some_and(|r| r.pinned);
+        match want {
+            Want::Settled => (park != Some(Park::Settled)).then_some(Action::ToggleSettle),
+            Want::Unsettled => (park == Some(Park::Settled)).then_some(Action::ToggleSettle),
+            Want::Awake => matches!(park, Some(Park::Snoozed { .. })).then_some(Action::Wake),
+            Want::Open => (!live).then_some(Action::Reopen),
+            Want::Pinned => (!pinned).then_some(Action::TogglePin),
+            Want::Unpinned => pinned.then_some(Action::TogglePin),
+            Want::Read => shown.unseen().then_some(Action::ToggleUnread),
+            Want::Unread => (!shown.unseen()).then_some(Action::ToggleUnread),
+        }
     }
 
     pub fn ordered(&self, agents: &[Observed]) -> Vec<Row> {
@@ -1045,6 +1089,7 @@ impl State {
                 changed_at: record.and_then(|r| r.changed_at),
                 thread: agent.thread.clone(),
                 title: record.and_then(|r| r.title.clone()),
+                launched_by: record.and_then(|r| r.launched_by.clone()),
             }
         });
         let closed = self
@@ -1061,6 +1106,7 @@ impl State {
                 changed_at: record.changed_at,
                 thread: record.thread.clone(),
                 title: record.title.clone(),
+                launched_by: record.launched_by.clone(),
             });
         let mut rows: Vec<Row> = live.chain(closed).collect();
         rows.sort_by_key(|row| {
@@ -1857,6 +1903,32 @@ mod tests {
             shown(&state, &used_again).1,
             None,
             "real activity after the restore unparks"
+        );
+    }
+
+    #[test]
+    fn a_state_already_reached_is_left_alone_where_a_toggle_would_undo_it() {
+        let agent = agent("k", Status::Idle, 3);
+        let mut state = State::default();
+        state.reconcile("g", std::slice::from_ref(&agent), 100);
+        for _ in 0..2 {
+            state
+                .apply("k", Some(&agent), Action::Ensure(Want::Pinned), 100)
+                .unwrap();
+            assert!(state.records["k"].pinned);
+        }
+        state
+            .apply("k", Some(&agent), Action::Ensure(Want::Unpinned), 100)
+            .unwrap();
+        assert!(!state.records["k"].pinned);
+        let woken = state.apply("k", Some(&agent), Action::Ensure(Want::Awake), 100);
+        assert_eq!(woken, Ok(After::Nothing));
+        assert_eq!(state.records["k"].park, None);
+        let reopened = state.apply("k", Some(&agent), Action::Ensure(Want::Open), 100);
+        assert_eq!(
+            reopened,
+            Ok(After::Nothing),
+            "a live thread is already open"
         );
     }
 

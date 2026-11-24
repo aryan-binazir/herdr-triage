@@ -7,7 +7,7 @@ use std::io::{self, BufRead, BufReader, Write};
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
@@ -82,6 +82,24 @@ pub struct Workspace {
     pub tab_count: usize,
     #[serde(default)]
     pub pane_count: usize,
+    #[serde(default)]
+    pub worktree: Option<Checkout>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct Checkout {
+    pub repo_key: String,
+    pub repo_name: String,
+    pub repo_root: String,
+    pub checkout_path: String,
+    #[serde(default)]
+    pub is_linked_worktree: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Refused {
+    pub code: String,
+    pub message: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -95,6 +113,7 @@ pub struct Tab {
 pub struct Herdr {
     path: PathBuf,
     next_id: u64,
+    pub deadline: Option<Instant>,
 }
 
 impl Herdr {
@@ -107,6 +126,7 @@ impl Herdr {
         Ok(Self {
             path: path.to_owned(),
             next_id: 0,
+            deadline: None,
         })
     }
 
@@ -121,12 +141,32 @@ impl Herdr {
     }
 
     fn call(&mut self, method: &str, params: &Value) -> io::Result<Value> {
+        self.request(method, params, TIMEOUT)?
+            .map_err(|refused| io::Error::other(format!("{method}: {}", refused.message)))
+    }
+
+    pub fn request(
+        &mut self,
+        method: &str,
+        params: &Value,
+        timeout: Duration,
+    ) -> io::Result<Result<Value, Refused>> {
+        let timeout = match self.deadline {
+            None => timeout,
+            Some(deadline) => {
+                let left = deadline.saturating_duration_since(Instant::now());
+                if left.is_zero() {
+                    return Err(io::Error::new(io::ErrorKind::TimedOut, "out of time"));
+                }
+                timeout.min(left)
+            }
+        };
         self.next_id += 1;
         let id = format!("triage-{}", self.next_id);
         let request = json!({"id": id, "method": method, "params": params});
         // Herdr answers one request per connection, then closes it.
         let mut stream = UnixStream::connect(&self.path)?;
-        stream.set_read_timeout(Some(TIMEOUT))?;
+        stream.set_read_timeout(Some(timeout))?;
         stream.set_write_timeout(Some(TIMEOUT))?;
         let mut bytes = serde_json::to_vec(&request).map_err(io::Error::other)?;
         bytes.push(b'\n');
@@ -146,10 +186,15 @@ impl Herdr {
                 continue;
             }
             if let Some(error) = reply.get("error") {
-                let message = error["message"].as_str().unwrap_or("request failed");
-                return Err(io::Error::other(format!("{method}: {message}")));
+                let text = |field: &str, missing: &str| {
+                    error[field].as_str().unwrap_or(missing).to_owned()
+                };
+                return Ok(Err(Refused {
+                    code: text("code", "failed"),
+                    message: text("message", "request failed"),
+                }));
             }
-            return Ok(reply["result"].take());
+            return Ok(Ok(reply["result"].take()));
         }
     }
 
@@ -209,6 +254,11 @@ impl Herdr {
             .map(drop)
     }
 
+    pub fn has_pane(&mut self, pane_id: &str) -> io::Result<bool> {
+        let found = self.request("pane.get", &json!({"pane_id": pane_id}), TIMEOUT)?;
+        Ok(found.is_ok())
+    }
+
     pub fn close_pane(&mut self, pane_id: &str) -> io::Result<()> {
         self.call("pane.close", &json!({"pane_id": pane_id}))
             .map(drop)
@@ -234,8 +284,9 @@ impl Herdr {
         &mut self,
         workspace_id: Option<&str>,
         cwd: Option<&str>,
+        focus: bool,
     ) -> io::Result<String> {
-        let params = json!({"workspace_id": workspace_id, "cwd": cwd, "focus": true});
+        let params = json!({"workspace_id": workspace_id, "cwd": cwd, "focus": focus});
         let result = self.call("tab.create", &params)?;
         result["root_pane"]["pane_id"]
             .as_str()
