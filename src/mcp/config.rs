@@ -19,7 +19,7 @@ const TEMPLATE: &str = "\
 default_harness: pi
 
 # Per agent: the model and effort to start it with, and any extra command-line arguments.
-# Leave `model` or `effort` out to use the agent's own default.
+# Left out, pi starts on claude-opus-5-5 at medium; claude and codex on their own defaults.
 harnesses:
   pi:
     model: claude-opus-5-5      # any pattern `pi --model` accepts
@@ -48,10 +48,6 @@ worktree:
   # base: origin/main
   # Prepended to the branch name made from the thread's title, e.g. `agent/`.
   branch_prefix: \"\"
-
-limits:
-  # Launches are refused while this many launched threads are open and not settled or snoozed.
-  max_open: 8
 ";
 
 #[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
@@ -81,18 +77,6 @@ pub struct Worktree {
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-pub struct Limits {
-    pub max_open: usize,
-}
-
-impl Default for Limits {
-    fn default() -> Self {
-        Self { max_open: 8 }
-    }
-}
-
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
 pub struct Config {
     #[serde(default = "default_harness")]
     pub default_harness: String,
@@ -102,8 +86,6 @@ pub struct Config {
     pub projects: BTreeMap<String, Project>,
     #[serde(default)]
     pub worktree: Worktree,
-    #[serde(default)]
-    pub limits: Limits,
 }
 
 fn default_harness() -> String {
@@ -120,8 +102,8 @@ pub struct Selection {
 }
 
 impl Selection {
-    /// The arguments after the agent's own name. Model and effort reach a shell, so anything
-    /// but a plain token is refused rather than quoted.
+    /// The arguments after the agent's own name. A model or effort that could pass for a flag,
+    /// or that no model name would hold, is refused.
     pub fn argv(&self) -> Result<Vec<String>, String> {
         for (name, value) in [("model", &self.model), ("effort", &self.effort)] {
             if let Some(value) = value
@@ -168,20 +150,23 @@ fn plain(value: &str) -> bool {
         && !value.starts_with('-')
         && value
             .chars()
-            .all(|c| c.is_ascii_alphanumeric() || "-_./:@".contains(c))
+            .all(|c| c.is_ascii_alphanumeric() || "-_./:@[]".contains(c))
 }
 
 impl Config {
     /// The file's settings, or the defaults when there is no file. A file that does not parse is
     /// an error: launching something other than what it says would be worse than not launching.
-    pub fn load(path: &Path) -> io::Result<Self> {
-        let text = match fs::read_to_string(path) {
-            Ok(text) => text,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => TEMPLATE.to_owned(),
-            Err(error) => return Err(error),
+    pub fn load(path: Option<&Path>) -> io::Result<Self> {
+        let text = match path.map(fs::read_to_string) {
+            Some(Ok(text)) => text,
+            None => TEMPLATE.to_owned(),
+            Some(Err(error)) if error.kind() == io::ErrorKind::NotFound => TEMPLATE.to_owned(),
+            Some(Err(error)) => return Err(error),
         };
-        serde_yaml_ng::from_str(&text)
-            .map_err(|error| io::Error::other(format!("{}: {error}", path.display())))
+        serde_yaml_ng::from_str(&text).map_err(|error| {
+            let file = path.map_or_else(String::new, |path| format!("{}: ", path.display()));
+            io::Error::other(format!("{file}{error}"))
+        })
     }
 
     /// Call arguments win over the project's settings, which win over the harness's.
@@ -206,8 +191,9 @@ impl Config {
             .or_else(|| project.harness.clone())
             .unwrap_or_else(|| self.default_harness.clone());
         let defaults = self.harness(&chosen);
-        // A project's model belongs to the harness it names, not to one the caller swapped in.
-        let project_applies = harness.is_none() || project.harness.as_deref() == harness;
+        // A project's model belongs to the harness it launches, not to one the caller swapped in.
+        let project_harness = project.harness.as_deref().unwrap_or(&self.default_harness);
+        let project_applies = harness.is_none_or(|asked| asked == project_harness);
         let from_project = |value: Option<String>| value.filter(|_| project_applies);
         Selection {
             model: model
@@ -223,22 +209,44 @@ impl Config {
         }
     }
 
+    /// A harness's settings, each one the file leaves out taken from the built-in defaults.
     pub fn harness(&self, name: &str) -> Harness {
-        self.harnesses
-            .get(name)
-            .cloned()
-            .flatten()
-            .unwrap_or_default()
+        let builtin = builtin(name);
+        match self.harnesses.get(name).cloned().flatten() {
+            Some(set) => Harness {
+                model: set.model.or(builtin.model),
+                effort: set.effort.or(builtin.effort),
+                args: set.args,
+            },
+            None => builtin,
+        }
     }
 }
 
-pub fn path() -> PathBuf {
+/// The agreed defaults: pi on Opus 5.5 at medium effort; other agents on their own.
+fn builtin(harness: &str) -> Harness {
+    match harness {
+        "pi" => Harness {
+            model: Some("claude-opus-5-5".into()),
+            effort: Some("medium".into()),
+            args: Vec::new(),
+        },
+        _ => Harness::default(),
+    }
+}
+
+/// `None` with no absolute config directory to look in: a relative one would be wherever the
+/// client started the server.
+pub fn path() -> Option<PathBuf> {
     let config = std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .filter(|dir| dir.is_absolute())
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))
-        .unwrap_or_default();
-    config.join("herdr-triage").join("mcp.yaml")
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .map(|home| PathBuf::from(home).join(".config"))
+                .filter(|dir| dir.is_absolute())
+        })?;
+    Some(config.join("herdr-triage").join("mcp.yaml"))
 }
 
 /// Leaves a commented file to edit where there is none. Failing to is not an error: the
@@ -248,13 +256,13 @@ pub fn write_template(path: &Path) {
     if fs::create_dir_all(dir).is_err() {
         return;
     }
-    if let Ok(mut file) = fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(path)
-    {
-        let _ = io::Write::write_all(&mut file, TEMPLATE.as_bytes());
+    // Written whole beside it, then linked into place only if still absent, so a client
+    // starting at the same moment never reads half a file.
+    let staged = path.with_extension(format!("yaml.{}", std::process::id()));
+    if fs::write(&staged, TEMPLATE).is_ok() {
+        let _ = fs::hard_link(&staged, path);
     }
+    let _ = fs::remove_file(&staged);
 }
 
 #[cfg(test)]
@@ -268,7 +276,7 @@ mod tests {
     #[test]
     fn with_no_file_pi_starts_on_opus_at_medium_effort() {
         let dir = tempfile::tempdir().unwrap();
-        let config = Config::load(&dir.path().join("mcp.yaml")).unwrap();
+        let config = Config::load(Some(&dir.path().join("mcp.yaml"))).unwrap();
         let selection = config.select(&["acme-api"], None, None, None);
         assert_eq!(selection.harness, "pi");
         assert_eq!(
@@ -281,12 +289,12 @@ mod tests {
     fn the_file_written_for_editing_holds_the_defaults() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("nested/mcp.yaml");
-        let defaults = Config::load(&path).unwrap();
+        let defaults = Config::load(Some(&path)).unwrap();
         write_template(&path);
-        assert_eq!(Config::load(&path).unwrap(), defaults);
+        assert_eq!(Config::load(Some(&path)).unwrap(), defaults);
         fs::write(&path, "default_harness: codex\n").unwrap();
         write_template(&path);
-        assert_eq!(Config::load(&path).unwrap().default_harness, "codex");
+        assert_eq!(Config::load(Some(&path)).unwrap().default_harness, "codex");
     }
 
     #[test]
@@ -326,12 +334,47 @@ mod tests {
     }
 
     #[test]
+    fn a_file_that_leaves_pi_out_keeps_its_agreed_defaults() {
+        for yaml in [
+            "worktree: {branch_prefix: agent/}\n",
+            "harnesses:\n  codex: {effort: high}\n",
+            "harnesses:\n  pi: {effort: high}\n",
+        ] {
+            let selection = config(yaml).select(&[], None, None, None);
+            assert_eq!(
+                selection.model.as_deref(),
+                Some("claude-opus-5-5"),
+                "{yaml}"
+            );
+        }
+        assert_eq!(
+            config("harnesses:\n  pi: {effort: high}\n")
+                .select(&[], None, None, None)
+                .effort
+                .as_deref(),
+            Some("high")
+        );
+        assert!(Config::load(None).unwrap().harness("pi").model.is_some());
+    }
+
+    #[test]
+    fn naming_the_harness_a_project_already_uses_keeps_the_projects_model() {
+        let config = config("projects:\n  acme-api: {model: opus-old, effort: low}\n");
+        let selection = config.select(&["acme-api"], Some("pi"), None, None);
+        assert_eq!(selection.model.as_deref(), Some("opus-old"));
+        let swapped = config.select(&["acme-api"], Some("claude"), None, None);
+        assert_eq!(swapped.model, None);
+    }
+
+    #[test]
     fn a_model_that_is_not_a_plain_token_is_refused() {
         let config = config("{}");
         for model in ["opus; rm -rf ~", "--dangerously-skip", "", "a b"] {
             let selection = config.select(&[], None, Some(model), None);
             assert!(selection.argv().is_err(), "{model}");
         }
+        let long_context = config.select(&[], Some("claude"), Some("opus[1m]"), None);
+        assert_eq!(long_context.argv().unwrap(), ["--model", "opus[1m]"]);
         assert!(
             config
                 .select(&[], Some("gemini"), None, None)
@@ -345,7 +388,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("mcp.yaml");
         fs::write(&path, "default_harnes: pi\n").unwrap();
-        let error = Config::load(&path).unwrap_err().to_string();
+        let error = Config::load(Some(&path)).unwrap_err().to_string();
         assert!(error.contains("default_harnes"), "{error}");
     }
 }

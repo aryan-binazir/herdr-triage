@@ -17,12 +17,13 @@ use crate::store;
 use ops::{Call, Failure, LaunchArgs};
 
 /// Newest first: a client that offers none of these is answered with the first.
-const PROTOCOLS: [&str; 3] = ["2025-06-18", "2025-03-26", "2024-11-05"];
+/// Revisions without JSON-RPC batches, which this server does not take.
+const PROTOCOLS: [&str; 2] = ["2025-06-18", "2024-11-05"];
 
 const INSTRUCTIONS: &str = "\
 Starts and drives coding agents in the user's Herdr terminal session. Each agent is a thread the \
-user sees in their own triage list. herdr_launch starts one in a project, in a new Git worktree \
-unless told otherwise; then herdr_wait for its turn to end and herdr_read what it did. Reach for \
+user sees in their own triage list. herdr_launch starts one in a project, in a new Git worktree; \
+then herdr_wait for its turn to end and herdr_read what it did. Reach for \
 threads marked `mine` (the ones you launched) unless the user names another. A thread whose state \
 is `blocked` is waiting on an approval or a question that is the user's to answer: report it, never \
 answer it. Use herdr_organize's `forget` only when the user asks for it.";
@@ -30,7 +31,7 @@ answer it. Use herdr_organize's `forget` only when the user asks for it.";
 /// Where this server finds Herdr, its settings and its caller.
 pub struct Env {
     pub socket: PathBuf,
-    pub config: PathBuf,
+    pub config: Option<PathBuf>,
     /// The Herdr pane the calling agent runs in, when it runs in one.
     pub caller_pane: Option<String>,
     pub session: Box<dyn Fn() -> io::Result<Session>>,
@@ -39,7 +40,9 @@ pub struct Env {
 impl Env {
     pub fn of_process() -> Self {
         let config = config::path();
-        config::write_template(&config);
+        if let Some(path) = &config {
+            config::write_template(path);
+        }
         Self {
             socket: herdr::socket_path(),
             config,
@@ -66,7 +69,8 @@ pub fn link_for_clients() {
     if fs::read_link(&link).is_ok_and(|target| target == binary) {
         return;
     }
-    let staged = link.with_extension("new");
+    // Hooks run at once, so each stages its own link before swapping it into place.
+    let staged = link.with_extension(format!("new-{}", std::process::id()));
     let _ = fs::remove_file(&staged);
     let linked = link
         .parent()
@@ -123,16 +127,15 @@ fn starting_tools() -> Vec<Tool> {
         Tool {
             name: "herdr_launch",
             title: "Launch an agent",
-            description: "Start a new agent thread in a project and give it its first message. Opens a new Git worktree (its own workspace) unless `checkout` is `existing`, which opens a tab in the project's checkout instead. Leave out harness, model and effort to use the user's defaults. Returns its `thread` id. Next: herdr_wait, then herdr_read.",
+            description: "Start a new agent thread in a new Git worktree of a project open in Herdr (its own workspace), and give it its first message. Leave out harness, model and effort to use the user's defaults. Returns its `thread` id. Next: herdr_wait, then herdr_read.",
             properties: json!({
                 "title": {"type": "string", "description": "A short name for the work. Names the thread, and the branch unless `branch` is given."},
-                "project": {"type": "string", "description": "A project name from herdr_projects, a workspace id, or a repository path. Left out: the project you are running in, when you run inside Herdr."},
+                "project": {"type": "string", "description": "A project name from herdr_projects, a workspace id or label, or a path inside the repository. Left out: the project you are running in, when you run inside Herdr."},
                 "message": {"type": "string", "description": "The agent's first prompt. Left out, it starts idle."},
                 "harness": {"type": "string", "enum": config::HARNESSES},
                 "model": {"type": "string", "description": "A model name the harness accepts."},
                 "effort": {"type": "string", "description": "The harness's reasoning effort, such as low, medium or high."},
-                "checkout": {"type": "string", "enum": ["worktree", "existing"], "description": "Default `worktree`."},
-                "branch": {"type": "string", "description": "The new worktree's branch."},
+                "branch": {"type": "string", "description": "The new worktree's branch. An existing one is checked out as it is, ignoring `base`."},
                 "base": {"type": "string", "description": "The ref the new branch starts from, such as origin/main."},
                 "request_id": {"type": "string", "description": "Any unique string. Repeat it when retrying a launch whose answer you did not get, so it is not started twice."},
             }),
@@ -149,7 +152,7 @@ fn thread_tools() -> Vec<Tool> {
         Tool {
             name: "herdr_send",
             title: "Message an agent",
-            description: "Send a message to an open thread's agent, as if typed at its prompt. Any thread can be reached; prefer ones marked `mine`. Refused with `agent_blocked` while the agent waits on an approval or a question. Next: herdr_wait.",
+            description: "Send a message to an open thread's agent, as if typed at its prompt. Any thread can be reached; prefer ones marked `mine`. Refused with `agent_working` mid-turn (herdr_wait first), and with `agent_blocked` while the agent waits on an approval or a question. Next: herdr_wait.",
             properties: json!({"thread": thread, "message": {"type": "string"}}),
             required: &["thread", "message"],
             reads: false,
@@ -174,7 +177,7 @@ fn thread_tools() -> Vec<Tool> {
             description: "Wait until an open thread's agent stops working: idle, done, or blocked on the user. Returns at once if it already has. On `timed_out`, call again or end your turn.",
             properties: json!({
                 "thread": thread,
-                "timeout_ms": {"type": "integer", "description": "Default 30000, at most 300000."},
+                "timeout_ms": {"type": "integer", "description": "Default 30000, at most 50000."},
             }),
             required: &["thread"],
             reads: true,
@@ -197,7 +200,7 @@ fn thread_tools() -> Vec<Tool> {
         Tool {
             name: "herdr_organize",
             title: "Triage a thread",
-            description: "Change a thread's place in the user's triage list. settle / unsettle: done with it, or not after all. snooze / wake: hide it until `until` or for `minutes`. reopen: bring a closed thread's agent back with its conversation. pin / unpin. mark_unread / mark_read. rename: set `title` (empty restores the automatic one). undo: take back the last change, by anyone; needs no `thread`. forget: drop a closed thread for good, only when the user asks. Settling or snoozing closes the agent's pane when it can be reopened later; a working or blocked agent is refused.",
+            description: "Change a thread's place in the user's triage list. settle / unsettle: done with it, or not after all. snooze / wake: hide it until `until` or for `minutes`. reopen: bring a closed thread's agent back with its conversation. pin / unpin. mark_unread / mark_read. rename: set `title` (empty restores the automatic one). undo: take back the last change, by anyone; needs no `thread`. forget: drop a closed thread for good, only when the user asks. An action already in effect changes nothing. Settling closes the agent's pane, and snoozing closes it when the agent can be reopened later and is not working; the last pane of a workspace stays open. Settling a working or blocked agent is refused, as is snoozing a blocked one.",
             properties: json!({
                 "action": {"type": "string", "enum": ["settle", "unsettle", "snooze", "wake", "reopen", "pin", "unpin", "mark_unread", "mark_read", "rename", "undo", "forget"]},
                 "thread": thread,
@@ -235,47 +238,62 @@ fn listing(tool: &Tool) -> Value {
 struct Server {
     env: Env,
     client: String,
-    /// Launches that succeeded, by the caller's `request_id`, so a retry returns the first one.
-    launched: BTreeMap<String, Value>,
+    /// Launches by the caller's `request_id`: the result, or a failure after something was
+    /// opened, so a retry answers with it instead of opening more.
+    launched: BTreeMap<String, Result<Value, Failure>>,
 }
 
 impl Server {
     fn call(&mut self, name: &str, arguments: Value) -> Result<Value, Failure> {
-        if !tools().iter().any(|tool| tool.name == name) {
-            return Err(Failure::new("unknown_tool", format!("no tool `{name}`")));
+        if name != "herdr_launch" {
+            let mut call = Call::open(&self.env, &self.client)?;
+            return match name {
+                "herdr_projects" => ops::projects_tool(&mut call, arguments),
+                "herdr_capabilities" => ops::capabilities_tool(&mut call, arguments),
+                "herdr_send" => ops::send_tool(&mut call, arguments),
+                "herdr_read" => ops::read_tool(&mut call, arguments),
+                "herdr_wait" => ops::wait_tool(&mut call, arguments),
+                "herdr_threads" => ops::threads_tool(&mut call, arguments),
+                _ => ops::organize_tool(&mut call, arguments),
+            };
         }
-        let mut call = Call::open(&self.env, &self.client)?;
-        match name {
-            "herdr_projects" => ops::projects_tool(&mut call, arguments),
-            "herdr_capabilities" => ops::capabilities_tool(&mut call, arguments),
-            "herdr_send" => ops::send_tool(&mut call, arguments),
-            "herdr_read" => ops::read_tool(&mut call, arguments),
-            "herdr_wait" => ops::wait_tool(&mut call, arguments),
-            "herdr_threads" => ops::threads_tool(&mut call, arguments),
-            "herdr_organize" => ops::organize_tool(&mut call, arguments),
-            _ => {
-                let args = LaunchArgs::decode(arguments)?;
-                if let Some(first) = args
-                    .request_id
-                    .as_ref()
-                    .and_then(|id| self.launched.get(id))
-                {
-                    return Ok(first.clone());
-                }
-                let result = ops::launch_tool(&mut call, &args)?;
-                if let Some(id) = args.request_id {
-                    self.launched.insert(id, result.clone());
-                }
-                Ok(result)
-            }
+        let args = LaunchArgs::decode(arguments)?;
+        if let Some(first) = args
+            .request_id
+            .as_ref()
+            .and_then(|id| self.launched.get(id))
+        {
+            return first.clone();
         }
+        let result = Call::open(&self.env, &self.client)
+            .and_then(|mut call| ops::launch_tool(&mut call, &args));
+        let opened = result
+            .as_ref()
+            .err()
+            .is_none_or(|failure| failure.detail.contains_key("pane_id"));
+        if let Some(id) = args.request_id
+            && opened
+        {
+            self.launched.insert(id, result.clone());
+        }
+        result
     }
 
     /// The reply to one request; `None` for what needs none.
     fn answer(&mut self, request: &Value) -> Option<Value> {
+        let invalid = |id: &Value, message: &str| {
+            let error = json!({"code": -32600, "message": message});
+            Some(json!({"jsonrpc": "2.0", "id": id, "error": error}))
+        };
+        if request.is_array() {
+            return invalid(&Value::Null, "batches are not supported");
+        }
         let id = request.get("id").filter(|id| !id.is_null())?.clone();
+        let Some(method) = request["method"].as_str() else {
+            return invalid(&id, "a request needs a `method`");
+        };
         let params = &request["params"];
-        let result = match request["method"].as_str().unwrap_or_default() {
+        let result = match method {
             "initialize" => {
                 if let Some(name) = params["clientInfo"]["name"].as_str() {
                     name.clone_into(&mut self.client);
@@ -293,7 +311,14 @@ impl Server {
             "tools/list" => Ok(json!({"tools": tools().iter().map(listing).collect::<Vec<_>>()})),
             "tools/call" => {
                 let name = params["name"].as_str().unwrap_or_default();
-                Ok(tool_result(self.call(name, params["arguments"].clone())))
+                let arguments = params["arguments"].clone();
+                if !tools().iter().any(|tool| tool.name == name) {
+                    Err(json!({"code": -32602, "message": format!("unknown tool `{name}`")}))
+                } else if !(arguments.is_object() || arguments.is_null()) {
+                    Err(json!({"code": -32602, "message": "`arguments` must be an object"}))
+                } else {
+                    Ok(tool_result(self.call(name, arguments)))
+                }
             }
             method => Err(json!({"code": -32601, "message": format!("no method `{method}`")})),
         };
@@ -386,7 +411,7 @@ mod tests {
         let (socket, state) = (fake.socket.clone(), fake.state_dir());
         let env = Env {
             socket: fake.socket.clone(),
-            config: fake.dir.path().join("mcp.yaml"),
+            config: Some(fake.dir.path().join("mcp.yaml")),
             caller_pane: caller_pane.map(str::to_owned),
             session: Box::new(move || {
                 let session = Session::new(
@@ -446,6 +471,21 @@ mod tests {
         fn refuse(&self, method: &str, code: &str) {
             *self.fake.fail_method.lock().unwrap() = Some(method.to_owned());
             *self.fake.fail_code.lock().unwrap() = code.to_owned();
+        }
+
+        fn config(&self, yaml: &str) {
+            fs::write(self.server.env.config.as_ref().unwrap(), yaml).unwrap();
+        }
+
+        /// What `herdr_launch` asked Herdr for, its branch's random suffix cut off.
+        fn worktrees(&self) -> Vec<Value> {
+            let mut asked = self.fake.take("worktree.create");
+            for worktree in &mut asked {
+                let branch = worktree["branch"].as_str().unwrap();
+                worktree["branch"] =
+                    json!(branch.rsplit_once('-').map_or(branch, |(stem, _)| stem));
+            }
+            asked
         }
 
         fn threads(&mut self) -> Vec<Value> {
@@ -543,6 +583,23 @@ mod tests {
     }
 
     #[test]
+    fn malformed_requests_get_protocol_errors() {
+        let mut rig = rig(vec![], None);
+        let batch = rig
+            .server
+            .answer(&json!([{"jsonrpc": "2.0", "id": 1, "method": "ping"}]));
+        assert_eq!(batch.unwrap()["error"]["code"], -32600);
+        let unknown = rig.request("tools/call", json!({"name": "herdr_nope", "arguments": {}}));
+        assert_eq!(unknown["error"]["code"], -32602);
+        let positional = rig.request(
+            "tools/call",
+            json!({"name": "herdr_send", "arguments": ["w1:p1", "hi"]}),
+        );
+        assert_eq!(positional["error"]["code"], -32602);
+        assert!(rig.fake.take("agent.prompt").is_empty());
+    }
+
+    #[test]
     fn a_launch_opens_a_worktree_off_the_projects_own_checkout_and_prompts_the_default_agent() {
         let mut rig = rig(vec![], None);
         let launched = rig.ok(
@@ -550,12 +607,11 @@ mod tests {
             json!({"project": "ACME-api", "title": "Fix the login bug!", "message": "fix it"}),
         );
 
-        let worktree = rig.fake.take("worktree.create");
         assert_eq!(
-            worktree,
+            rig.worktrees(),
             [
-                json!({"workspace_id": "w1", "cwd": null, "branch": "fix-the-login-bug",
-                    "base": null, "label": "acme-api", "focus": false})
+                json!({"workspace_id": "w1", "branch": "fix-the-login-bug", "base": null,
+                    "label": "acme-api", "focus": false})
             ]
         );
         let start = &rig.fake.take("agent.start")[0];
@@ -578,8 +634,10 @@ mod tests {
         );
 
         assert_eq!(launched["thread"], "terminal:t-w91:p1");
-        assert_eq!(launched["branch"], "fix-the-login-bug");
-        assert_eq!(launched["path"], "/worktrees/fix-the-login-bug");
+        assert_eq!(launched["pane_id"], "w91:p1");
+        let branch = launched["branch"].as_str().unwrap();
+        assert!(branch.starts_with("fix-the-login-bug-"), "{branch}");
+        assert_eq!(launched["path"], format!("/worktrees/{branch}"));
         assert_eq!(launched["launched"]["harness"], "pi");
         assert_eq!(
             (&launched["ready"], &launched["sent"]),
@@ -596,17 +654,13 @@ mod tests {
     #[test]
     fn a_launch_takes_its_harness_model_effort_branch_and_base_from_the_call() {
         let mut rig = rig(vec![], None);
-        fs::write(
-            &rig.server.env.config,
-            "worktree: {base: origin/main, branch_prefix: agent/}\n",
-        )
-        .unwrap();
+        rig.config("worktree: {base: origin/main, branch_prefix: agent/}\n");
         rig.ok(
             "herdr_launch",
-            json!({"project": "/src/acme-api/src", "title": "t", "harness": "codex",
+            json!({"project": "w2", "title": "t", "harness": "codex",
                    "model": "gpt-5.2", "effort": "high", "branch": "amb/login"}),
         );
-        let worktree = &rig.fake.take("worktree.create")[0];
+        let worktree = &rig.worktrees()[0];
         assert_eq!(
             (&worktree["branch"], &worktree["base"]),
             (&json!("amb/login"), &json!("origin/main"))
@@ -631,27 +685,78 @@ mod tests {
             "herdr_launch",
             json!({"project": "notes", "title": "Tidy up"}),
         );
-        assert_eq!(
-            rig.fake.take("worktree.create")[0]["branch"],
-            "agent/tidy-up"
-        );
+        assert_eq!(rig.worktrees()[0]["branch"], "agent/tidy-up");
     }
 
     #[test]
-    fn checkout_existing_opens_a_tab_in_the_projects_checkout_instead() {
+    fn agent_names_keep_to_herdrs_rule_whatever_the_title() {
         let mut rig = rig(vec![], None);
-        let launched = rig.ok(
+        for title in [
+            "42 flaky tests",
+            "A very long title that goes on and on and on",
+            "!!!",
+        ] {
+            rig.ok(
+                "herdr_launch",
+                json!({"project": "acme-api", "title": title}),
+            );
+        }
+        for start in rig.fake.take("agent.start") {
+            let name = start["name"].as_str().unwrap();
+            assert!(name.len() <= 32, "{name}");
+            assert!(name.starts_with(|c: char| c.is_ascii_lowercase()), "{name}");
+            let allowed =
+                |c: char| c.is_ascii_lowercase() || c.is_ascii_digit() || "-_".contains(c);
+            assert!(name.chars().all(allowed), "{name}");
+        }
+    }
+
+    #[test]
+    fn a_title_is_kept_on_one_line_and_a_message_without_control_keys() {
+        let mut rig = rig(vec![], None);
+        rig.ok(
             "herdr_launch",
-            json!({"project": "w2", "title": "Look around", "checkout": "existing"}),
+            json!({"project": "acme-api", "title": "Fix\n  the\u{1b}[31m bug"}),
         );
-        assert!(rig.fake.take("worktree.create").is_empty());
+        assert_eq!(rig.threads()[0]["title"], "Fix the [31m bug");
+        let escape = rig.failure(
+            "herdr_launch",
+            json!({"project": "acme-api", "title": "x", "message": "go\u{1b}[201~\r"}),
+        );
+        assert_eq!(escape["code"], "invalid_arguments");
+    }
+
+    #[test]
+    fn a_project_is_found_by_its_workspace_id_first_and_never_by_a_guess() {
+        let mut rig = rig(vec![], None);
+        rig.fake
+            .workspaces
+            .lock()
+            .unwrap()
+            .push(json!({"workspace_id": "w4", "label": "notes", "tab_count": 1, "pane_count": 1}));
+        let ambiguous = rig.failure("herdr_launch", json!({"project": "notes", "title": "t"}));
+        assert_eq!(ambiguous["code"], "project_ambiguous");
+        assert_eq!(ambiguous["workspace_ids"], json!(["w3", "w4"]));
+        rig.ok("herdr_launch", json!({"project": "w4", "title": "t"}));
+        assert_eq!(rig.worktrees()[0]["workspace_id"], "w4");
+        let elsewhere = rig.failure(
+            "herdr_launch",
+            json!({"project": "/src/other-repo", "title": "t"}),
+        );
+        assert_eq!(elsewhere["code"], "project_not_open");
+        assert!(rig.worktrees().is_empty());
+    }
+
+    #[test]
+    fn with_only_a_linked_worktree_open_a_launch_branches_off_the_repository_root() {
+        let mut rig = rig(vec![], None);
+        rig.fake.workspaces.lock().unwrap().remove(0);
+        rig.ok("herdr_launch", json!({"project": "acme-api", "title": "t"}));
         assert_eq!(
-            rig.fake.take("tab.create"),
-            [
-                json!({"workspace_id": "w1", "cwd": "/src/acme-api", "label": "Look around", "focus": false})
-            ]
+            rig.worktrees(),
+            [json!({"cwd": "/src/acme-api", "branch": "t", "base": null,
+                    "label": "acme-api", "focus": false})]
         );
-        assert_eq!(launched["pane_id"], "w1:p91");
     }
 
     #[test]
@@ -661,7 +766,7 @@ mod tests {
         let first = rig.ok("herdr_launch", arguments.clone());
         let again = rig.ok("herdr_launch", arguments);
         assert_eq!(first, again);
-        assert_eq!(rig.fake.take("worktree.create").len(), 1);
+        assert_eq!(rig.worktrees().len(), 1);
     }
 
     #[test]
@@ -698,16 +803,22 @@ mod tests {
     }
 
     #[test]
-    fn a_launch_that_cannot_start_its_agent_says_what_it_left_open() {
+    fn a_launch_that_cannot_start_its_agent_says_what_it_left_open_and_a_retry_opens_no_more() {
         let mut rig = rig(vec![], None);
         rig.refuse("agent.start", "agent_start_failed");
-        let error = rig.failure(
-            "herdr_launch",
-            json!({"project": "acme-api", "title": "Broken"}),
-        );
+        let arguments = json!({"project": "acme-api", "title": "Broken", "request_id": "r1"});
+        let error = rig.failure("herdr_launch", arguments.clone());
         assert_eq!(error["code"], "agent_start_failed");
         assert_eq!(error["workspace_id"], "w91");
-        assert_eq!(error["path"], "/worktrees/broken");
+        assert_eq!(error["pane_id"], "w91:p1");
+        assert!(
+            error["path"]
+                .as_str()
+                .unwrap()
+                .starts_with("/worktrees/broken-")
+        );
+        assert_eq!(rig.failure("herdr_launch", arguments), error);
+        assert_eq!(rig.worktrees().len(), 1);
     }
 
     #[test]
@@ -739,7 +850,7 @@ mod tests {
         );
         assert_eq!(unknown["code"], "project_not_found");
         assert_eq!(unknown["projects"], json!(["acme-api", "notes"]));
-        assert!(rig.fake.take("worktree.create").is_empty());
+        assert!(rig.worktrees().is_empty());
     }
 
     #[test]
@@ -748,7 +859,7 @@ mod tests {
         // The fake's agents all say they are in w1.
         rig.fake.agents.lock().unwrap()[0]["workspace_id"] = json!("w3");
         rig.ok("herdr_launch", json!({"title": "Here"}));
-        assert_eq!(rig.fake.take("worktree.create")[0]["workspace_id"], "w3");
+        assert_eq!(rig.worktrees()[0]["workspace_id"], "w3");
         let threads = rig.threads();
         let launched = threads
             .iter()
@@ -761,50 +872,20 @@ mod tests {
     fn a_caller_herdr_does_not_list_as_an_agent_still_launches_in_its_own_project() {
         let mut rig = rig(vec![], Some("w3:p7"));
         rig.ok("herdr_launch", json!({"title": "From a script"}));
-        assert_eq!(rig.fake.take("worktree.create")[0]["workspace_id"], "w3");
+        assert_eq!(rig.worktrees()[0]["workspace_id"], "w3");
         assert_eq!(rig.threads()[0]["mine"], true);
-    }
-
-    #[test]
-    fn launches_stop_at_the_configured_number_of_open_threads() {
-        let mut rig = rig(vec![], None);
-        fs::write(&rig.server.env.config, "limits: {max_open: 1}\n").unwrap();
-        rig.ok(
-            "herdr_launch",
-            json!({"project": "acme-api", "title": "One"}),
-        );
-        let error = rig.failure(
-            "herdr_launch",
-            json!({"project": "acme-api", "title": "Two"}),
-        );
-        assert_eq!(error["code"], "too_many_open");
-        assert_eq!(rig.fake.take("worktree.create").len(), 1);
-
-        // Its pane is the only one in its workspace, so settling parks it without closing it.
-        rig.fake.workspaces.lock().unwrap().push(
-            json!({"workspace_id": "w91", "label": "worktree", "tab_count": 1, "pane_count": 1}),
-        );
-        let settled = rig.ok(
-            "herdr_organize",
-            json!({"action": "settle", "thread": "w91:p1"}),
-        );
-        assert_eq!(settled["thread"]["open"], true);
-        rig.ok(
-            "herdr_launch",
-            json!({"project": "acme-api", "title": "Two"}),
-        );
     }
 
     #[test]
     fn a_config_file_that_does_not_parse_stops_a_launch() {
         let mut rig = rig(vec![], None);
-        fs::write(&rig.server.env.config, "default_harness: [\n").unwrap();
+        rig.config("default_harness: [\n");
         let error = rig.failure(
             "herdr_launch",
             json!({"project": "acme-api", "title": "One"}),
         );
         assert_eq!(error["code"], "bad_config");
-        assert!(rig.fake.take("worktree.create").is_empty());
+        assert!(rig.worktrees().is_empty());
     }
 
     #[test]
@@ -845,6 +926,28 @@ mod tests {
     }
 
     #[test]
+    fn a_message_to_an_agent_mid_turn_is_refused_rather_than_queued() {
+        let mut rig = rig(vec![resumable("w1:p1", "working", 3)], None);
+        let error = rig.failure("herdr_send", json!({"thread": "w1:p1", "message": "also"}));
+        assert_eq!(error["code"], "agent_working");
+        assert!(rig.fake.take("agent.prompt").is_empty());
+    }
+
+    #[test]
+    fn the_id_a_launch_handed_out_still_finds_the_thread_after_it_reports_its_session() {
+        let mut rig = rig(vec![], None);
+        let launched = rig.ok("herdr_launch", json!({"project": "acme-api", "title": "t"}));
+        assert_eq!(launched["thread"], "terminal:t-w91:p1");
+        rig.fake.agents.lock().unwrap()[0]["agent_session"] = json!({
+            "source": "herdr:pi", "agent": "pi", "kind": "id", "value": "s1"
+        });
+        let read = rig.ok("herdr_read", json!({"thread": "terminal:t-w91:p1"}));
+        assert_eq!(read["thread"], "session:pi:id:s1");
+        assert_eq!(read["title"], "t");
+        assert_eq!(read["mine"], true);
+    }
+
+    #[test]
     fn a_message_to_a_blocked_agent_is_refused_with_herdrs_reason() {
         let mut rig = rig(vec![resumable("w1:p1", "blocked", 3)], None);
         rig.refuse("agent.prompt", "agent_blocked");
@@ -879,6 +982,25 @@ mod tests {
             (&request["target"], &request["lines"]),
             (&json!("w1:p1"), &json!(100))
         );
+    }
+
+    #[test]
+    fn a_screen_herdr_will_not_scroll_back_is_read_as_it_shows_now() {
+        let mut rig = rig(vec![resumable("w1:p1", "blocked", 3)], None);
+        rig.refuse("agent.read", "agent_not_ready");
+        let refusing = rig.fake.fail_method.clone();
+        rig.fake
+            .on("agent.read", move |_| *refusing.lock().unwrap() = None);
+        *rig.fake.screen.lock().unwrap() = "Allow this command?".into();
+        let read = rig.ok("herdr_read", json!({"thread": "w1:p1"}));
+        assert_eq!(read["text"], "Allow this command?");
+        let sources: Vec<Value> = rig
+            .fake
+            .take("agent.read")
+            .iter()
+            .map(|read| read["source"].clone())
+            .collect();
+        assert_eq!(sources, [json!("recent"), json!("visible")]);
     }
 
     #[test]
@@ -917,7 +1039,10 @@ mod tests {
             "herdr_organize",
             json!({"action": "settle", "thread": thread}),
         );
-        assert_eq!(again["note"], "already so: nothing changed");
+        assert_eq!(
+            again["thread"]["parked"], "settled",
+            "settling twice is not a toggle"
+        );
         let closed = rig.failure("herdr_send", json!({"thread": thread, "message": "hi"}));
         assert_eq!(closed["code"], "thread_closed");
 
@@ -1043,8 +1168,6 @@ mod tests {
         let error = rig.failure("herdr_threads", json!({"projects": "acme-api"}));
         assert_eq!(error["code"], "invalid_arguments");
         assert!(error["message"].as_str().unwrap().contains("projects"));
-        let unknown = rig.failure("herdr_nope", json!({}));
-        assert_eq!(unknown["code"], "unknown_tool");
     }
 
     #[test]
@@ -1090,8 +1213,13 @@ mod tests {
             "herdr_launch",
             json!({"project": "/wt/fix/src", "title": "From a worktree"}),
         );
+        let lists = rig.fake.take("worktree.list");
+        assert!(
+            lists.iter().any(|list| list["cwd"] == "/wt/fix/src"),
+            "Herdr resolved the path"
+        );
         assert_eq!(
-            rig.fake.take("worktree.create")[0]["workspace_id"],
+            rig.worktrees()[0]["workspace_id"],
             "w1",
             "the new worktree branches off the repository's own checkout"
         );
@@ -1100,11 +1228,7 @@ mod tests {
     #[test]
     fn projects_group_a_repositorys_workspaces_and_say_what_a_launch_starts() {
         let mut rig = rig(vec![resumable("w1:p1", "idle", 3)], None);
-        fs::write(
-            &rig.server.env.config,
-            "projects: {notes: {harness: claude, model: opus}}\n",
-        )
-        .unwrap();
+        rig.config("projects: {notes: {harness: claude, model: opus}}\n");
         let projects = rig.ok("herdr_projects", json!({}))["projects"].clone();
         assert_eq!(projects.as_array().unwrap().len(), 2);
         assert_eq!(projects[0]["project"], "acme-api");
@@ -1117,6 +1241,9 @@ mod tests {
         );
         let capabilities = rig.ok("herdr_capabilities", json!({}));
         assert_eq!(capabilities["default_harness"], "pi");
-        assert_eq!(capabilities["harnesses"]["codex"]["args"], json!([]));
+        assert_eq!(
+            capabilities["harnesses"]["codex"],
+            json!({"model": null, "effort": null})
+        );
     }
 }

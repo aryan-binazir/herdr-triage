@@ -245,6 +245,13 @@ impl Herdr {
             .map(drop)
     }
 
+    pub fn has_pane(&mut self, pane_id: &str) -> bool {
+        matches!(
+            self.request("pane.get", &json!({"pane_id": pane_id}), TIMEOUT),
+            Ok(Ok(_))
+        )
+    }
+
     pub fn close_pane(&mut self, pane_id: &str) -> io::Result<()> {
         self.call("pane.close", &json!({"pane_id": pane_id}))
             .map(drop)

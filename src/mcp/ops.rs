@@ -15,16 +15,15 @@ use super::config::{Config, HARNESSES, Selection};
 use crate::herdr::{self, Herdr, Refused, Workspace};
 use crate::picker::{Item, Target};
 use crate::session::{Outcome, Session};
-use crate::triage::{Action, Display, Park};
+use crate::triage::{Action, Display, Park, Want};
 
-const START_TIMEOUT_MS: u64 = 60_000;
-/// A new pane's shell is refused as busy until it reaches its first prompt.
-const SHELL_TIMEOUT: Duration = Duration::from_secs(15);
+/// Codex gives a tool call 60 seconds unless told otherwise, so a launch stays well inside that.
+const START_TIMEOUT: Duration = Duration::from_secs(40);
 const POLL: Duration = Duration::from_millis(200);
 /// How long a submitted prompt has to start a turn before the caller is told it may not have.
 const TURN_START_MS: u64 = 10_000;
 const WAIT_DEFAULT_MS: u64 = 30_000;
-const WAIT_MAX_MS: u64 = 300_000;
+const WAIT_MAX_MS: u64 = 50_000;
 const RULE: usize = 8;
 const READ_DEFAULT_LINES: u64 = 100;
 const READ_MAX_LINES: u64 = 2_000;
@@ -74,7 +73,7 @@ impl From<Refused> for Failure {
                  sending again."
             }
             "not_git_worktree" => {
-                " `checkout: existing` starts the agent in a tab there instead of a worktree."
+                " Agents launch into a new worktree, so the project has to be a Git repository."
             }
             "worktree_create_failed" => " If the branch is taken, pass another `branch`.",
             _ => "",
@@ -91,6 +90,16 @@ pub struct Call<'a> {
     client: &'a str,
     herdr: Herdr,
     session: Session,
+    caller: Option<Caller>,
+}
+
+#[derive(Clone)]
+struct Caller {
+    /// Who the caller is in `Record::launched_by`: the terminal it runs in, which keeps its
+    /// identity while its agent is detected, reports its session or moves; else this server's
+    /// client session.
+    key: String,
+    workspace: Option<String>,
 }
 
 impl<'a> Call<'a> {
@@ -100,6 +109,7 @@ impl<'a> Call<'a> {
             client,
             herdr: Herdr::at(&env.socket)?,
             session: (env.session)()?,
+            caller: None,
         })
     }
 
@@ -107,18 +117,49 @@ impl<'a> Call<'a> {
         Ok(self.herdr.request(method, params, within)??)
     }
 
-    fn threads(&mut self) -> Result<Threads, Failure> {
-        let items = self.session.view()?.items;
-        let own = self.env.caller_pane.as_ref().and_then(|pane| {
-            let here = Target::Pane(pane.clone());
-            items.iter().find(|item| item.target == here)
+    fn caller(&mut self) -> Caller {
+        if let Some(caller) = &self.caller {
+            return caller.clone();
+        }
+        let pane = self.env.caller_pane.clone().and_then(|pane| {
+            let found = self
+                .ask("pane.get", &json!({"pane_id": pane}), QUICK)
+                .ok()?;
+            Some(found["pane"].clone()).filter(|pane| pane["terminal_id"].is_string())
         });
-        let caller = match (own, &self.env.caller_pane) {
-            (Some(item), _) => item.row.key.clone(),
-            (None, Some(pane)) => format!("pane:{pane}"),
-            (None, None) => format!("client:{}", self.client),
+        let caller = match pane {
+            Some(pane) => Caller {
+                key: format!(
+                    "terminal:{}",
+                    pane["terminal_id"].as_str().unwrap_or_default()
+                ),
+                workspace: pane["workspace_id"].as_str().map(str::to_owned),
+            },
+            None => Caller {
+                key: format!("client:{}:{}", self.client, std::process::id()),
+                workspace: None,
+            },
         };
+        self.caller = Some(caller.clone());
+        caller
+    }
+
+    fn threads(&mut self) -> Result<Threads, Failure> {
+        let caller = self.caller().key;
+        let items = self.session.view()?.items;
         Ok(Threads { items, caller })
+    }
+
+    /// A launch can hand out a thread's id before its agent reports its session, which renames
+    /// the thread; the old id still finds it while its agent runs.
+    fn current_id(&mut self, id: &str) -> String {
+        if id.starts_with("terminal:")
+            && let Ok(agents) = self.herdr.agents()
+            && let Some(agent) = agents.iter().find(|agent| agent.terminal_key() == id)
+        {
+            return agent.key();
+        }
+        id.to_owned()
     }
 
     /// Herdr's workspaces, each with the checkout it is in. `workspace.list` names the checkout
@@ -157,14 +198,13 @@ impl<'a> Call<'a> {
     }
 
     fn config(&self) -> Result<Config, Failure> {
-        Config::load(&self.env.config)
+        Config::load(self.env.config.as_deref())
             .map_err(|error| Failure::new("bad_config", error.to_string()))
     }
 }
 
 struct Threads {
     items: Vec<Item>,
-    /// Who the caller is in `Record::launched_by`: its own thread when it runs in Herdr.
     caller: String,
 }
 
@@ -252,18 +292,20 @@ fn decode<T: for<'de> Deserialize<'de>>(arguments: Value) -> Result<T, Failure> 
 
 /// Workspaces of one repository, or one workspace Herdr found no repository in.
 struct Project<'a> {
+    key: &'a str,
     name: &'a str,
     root: Option<&'a str>,
     workspaces: Vec<&'a Workspace>,
 }
 
 impl<'a> Project<'a> {
-    /// The repository's own checkout when it is open, since worktrees branch off it.
-    fn primary(&self) -> &'a Workspace {
+    /// The repository's own checkout, which new worktrees branch off. Herdr refuses a linked
+    /// worktree's workspace as their source, so with only those open the repository's root is.
+    fn primary(&self) -> Option<&'a Workspace> {
         self.workspaces
             .iter()
             .find(|w| w.worktree.as_ref().is_none_or(|c| !c.is_linked_worktree))
-            .unwrap_or(&self.workspaces[0])
+            .copied()
     }
 
     fn names(&self) -> Vec<&'a str> {
@@ -276,23 +318,10 @@ impl<'a> Project<'a> {
             .iter()
             .any(|w| Some(w.workspace_id.as_str()) == workspace_id)
     }
-
-    /// How deep inside this project `path` is, for picking the nearest of nested checkouts.
-    fn depth_of(&self, path: &str) -> Option<usize> {
-        let checkouts = self
-            .workspaces
-            .iter()
-            .filter_map(|w| w.worktree.as_ref())
-            .flat_map(|c| [c.checkout_path.as_str(), c.repo_root.as_str()]);
-        checkouts
-            .filter(|dir| Path::new(path).starts_with(dir))
-            .map(str::len)
-            .max()
-    }
 }
 
 fn projects(workspaces: &[Workspace]) -> Vec<Project<'_>> {
-    let mut projects: Vec<(&str, Project)> = Vec::new();
+    let mut projects: Vec<Project> = Vec::new();
     for workspace in workspaces {
         let (key, name, root) = match &workspace.worktree {
             Some(c) => (
@@ -306,72 +335,77 @@ fn projects(workspaces: &[Workspace]) -> Vec<Project<'_>> {
                 None,
             ),
         };
-        match projects.iter_mut().find(|(known, _)| *known == key) {
-            Some((_, project)) => project.workspaces.push(workspace),
-            None => projects.push((
+        match projects.iter_mut().find(|project| project.key == key) {
+            Some(project) => project.workspaces.push(workspace),
+            None => projects.push(Project {
                 key,
-                Project {
-                    name,
-                    root,
-                    workspaces: vec![workspace],
-                },
-            )),
+                name,
+                root,
+                workspaces: vec![workspace],
+            }),
         }
     }
-    projects.into_iter().map(|(_, project)| project).collect()
+    projects
 }
 
-enum Place<'a> {
-    Open(Project<'a>),
-    /// A directory no workspace is open in; Herdr opens one for its worktree.
-    Unopened(&'a str),
-}
-
-fn place<'a>(workspaces: &'a [Workspace], query: &'a str) -> Result<Place<'a>, Failure> {
+/// The open project `query` names: a workspace id, a path inside a repository (resolved by
+/// Herdr's own Git discovery), or a repository name or workspace label that names one project.
+fn place<'a>(
+    call: &mut Call,
+    workspaces: &'a [Workspace],
+    query: &str,
+) -> Result<Project<'a>, Failure> {
     let mut all = projects(workspaces);
+    let known: Vec<String> = all.iter().map(|project| project.name.to_owned()).collect();
+    let by_id = all
+        .iter()
+        .position(|p| p.workspaces.iter().any(|w| w.workspace_id == query));
+    if let Some(at) = by_id {
+        return Ok(all.swap_remove(at));
+    }
+    if Path::new(query).is_absolute() {
+        let found = call.ask("worktree.list", &json!({"cwd": query}), QUICK)?;
+        let key = found["source"]["repo_key"].as_str();
+        return match all.iter().position(|project| Some(project.key) == key) {
+            Some(at) => Ok(all.swap_remove(at)),
+            None => Err(Failure::new(
+                "project_not_open",
+                format!(
+                    "`{query}` is in a repository with no workspace open in Herdr: open one first"
+                ),
+            )
+            .with("projects", known)),
+        };
+    }
     let named: Vec<usize> = (0..all.len())
-        .filter(|&at| all[at].name.eq_ignore_ascii_case(query))
-        .collect();
-    if named.len() > 1 {
-        let roots: Vec<&str> = named.iter().filter_map(|&at| all[at].root).collect();
-        return Err(Failure::new(
-            "project_ambiguous",
-            format!("more than one open project is called `{query}`: pass its path instead"),
-        )
-        .with("paths", roots));
-    }
-    let by_workspace = || {
-        all.iter().position(|project| {
-            project
-                .workspaces
-                .iter()
-                .any(|w| w.workspace_id == query || w.label.eq_ignore_ascii_case(query))
+        .filter(|&at| {
+            let project = &all[at];
+            project.name.eq_ignore_ascii_case(query)
+                || project
+                    .workspaces
+                    .iter()
+                    .any(|w| w.label.eq_ignore_ascii_case(query))
         })
-    };
-    let by_path = || {
-        let depths = all.iter().enumerate();
-        depths
-            .filter_map(|(at, project)| Some((project.depth_of(query)?, at)))
-            .max()
-            .map(|(_, at)| at)
-    };
-    if let Some(at) = named
-        .first()
-        .copied()
-        .or_else(by_workspace)
-        .or_else(by_path)
-    {
-        return Ok(Place::Open(all.swap_remove(at)));
+        .collect();
+    match named[..] {
+        [at] => Ok(all.swap_remove(at)),
+        [] => Err(Failure::new(
+            "project_not_found",
+            format!("no open project `{query}`: pass a name from herdr_projects, a workspace id, or a path"),
+        )
+        .with("projects", known)),
+        _ => {
+            let ids: Vec<&str> = named
+                .iter()
+                .flat_map(|&at| all[at].workspaces.iter().map(|w| w.workspace_id.as_str()))
+                .collect();
+            Err(Failure::new(
+                "project_ambiguous",
+                format!("more than one open project answers to `{query}`: pass a workspace id or a path"),
+            )
+            .with("workspace_ids", ids))
+        }
     }
-    if Path::new(query).is_absolute() && Path::new(query).is_dir() {
-        return Ok(Place::Unopened(query));
-    }
-    let known: Vec<&str> = all.iter().map(|project| project.name).collect();
-    Err(Failure::new(
-        "project_not_found",
-        format!("no open project `{query}`: pass a name from `projects`, or a repository's path"),
-    )
-    .with("projects", known))
 }
 
 fn selection_json(selection: &Selection) -> Value {
@@ -426,9 +460,7 @@ pub fn capabilities_tool(call: &mut Call, arguments: Value) -> Done {
         .iter()
         .map(|name| {
             let harness = config.harness(name);
-            let settings = json!({
-                "model": harness.model, "effort": harness.effort, "args": harness.args,
-            });
+            let settings = json!({"model": harness.model, "effort": harness.effort});
             ((*name).to_owned(), settings)
         })
         .collect();
@@ -447,18 +479,9 @@ pub fn capabilities_tool(call: &mut Call, arguments: Value) -> Done {
         "harnesses": harnesses,
         "projects": overrides,
         "worktree": {"base": config.worktree.base, "branch_prefix": config.worktree.branch_prefix},
-        "max_open": config.limits.max_open,
         "config_file": call.env.config,
         "note": "model and effort are passed to the harness as given; null means its own default",
     }))
-}
-
-#[derive(Deserialize, Default, Clone, Copy, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-enum Checkout {
-    #[default]
-    Worktree,
-    Existing,
 }
 
 #[derive(Deserialize)]
@@ -470,8 +493,6 @@ pub struct LaunchArgs {
     harness: Option<String>,
     model: Option<String>,
     effort: Option<String>,
-    #[serde(default)]
-    checkout: Checkout,
     branch: Option<String>,
     base: Option<String>,
     pub request_id: Option<String>,
@@ -479,9 +500,13 @@ pub struct LaunchArgs {
 
 impl LaunchArgs {
     pub fn decode(arguments: Value) -> Result<Self, Failure> {
-        let args: Self = decode(arguments)?;
-        if args.title.trim().is_empty() {
+        let mut args: Self = decode(arguments)?;
+        args.title = one_line(&args.title);
+        if args.title.is_empty() {
             return Err(Failure::new("invalid_arguments", "title is empty"));
+        }
+        if let Some(message) = &args.message {
+            typeable(message)?;
         }
         Ok(args)
     }
@@ -495,45 +520,21 @@ struct Opened {
 
 pub fn launch_tool(call: &mut Call, args: &LaunchArgs) -> Done {
     let config = call.config()?;
-    let threads = call.threads()?;
-    // Settling one frees its place even when its pane stays open, as a worktree's only pane does.
-    let launched =
-        |item: &&Item| item.row.live() && item.row.launched_by.is_some() && item.row.park.is_none();
-    if threads.items.iter().filter(launched).count() >= config.limits.max_open {
-        return Err(Failure::new(
-            "too_many_open",
-            format!(
-                "{} launched threads are open and not settled (max_open in the config file): settle some first",
-                config.limits.max_open
-            ),
-        ));
-    }
+    let caller = call.caller();
     let workspaces = call.workspaces()?;
-    // The caller's pane says where it runs, whether or not Herdr knows it as an agent.
-    let own_workspace = match &call.env.caller_pane {
-        Some(pane) => call
-            .ask("pane.get", &json!({"pane_id": pane}), QUICK)
-            .ok()
-            .and_then(|found| found["pane"]["workspace_id"].as_str().map(str::to_owned)),
-        None => None,
-    };
     let query = args
         .project
         .as_deref()
-        .or(own_workspace.as_deref())
+        .or(caller.workspace.as_deref())
         .ok_or_else(|| {
             Failure::new(
                 "project_required",
                 "pass `project`: herdr_projects lists the open ones",
             )
         })?;
-    let place = place(&workspaces, query)?;
-    let names = match &place {
-        Place::Open(project) => project.names(),
-        Place::Unopened(_) => Vec::new(),
-    };
+    let project = place(call, &workspaces, query)?;
     let selection = config.select(
-        &names,
+        &project.names(),
         args.harness.as_deref(),
         args.model.as_deref(),
         args.effort.as_deref(),
@@ -541,7 +542,12 @@ pub fn launch_tool(call: &mut Call, args: &LaunchArgs) -> Done {
     let command = selection
         .argv()
         .map_err(|error| Failure::new("invalid_arguments", error))?;
-    let opened = open_shell(call, &config, &place, args)?;
+    let suffix = suffix()?;
+    let branch = args.branch.clone().unwrap_or_else(|| {
+        let slug = slug(&args.title, 40);
+        format!("{}{slug}-{suffix}", config.worktree.branch_prefix)
+    });
+    let opened = open_worktree(call, &config, &project, &branch, args.base.as_deref())?;
     let with_place = |mut failure: Failure| {
         failure.detail.extend(opened.detail.clone());
         failure
@@ -549,13 +555,12 @@ pub fn launch_tool(call: &mut Call, args: &LaunchArgs) -> Done {
             .push_str(" What was opened for it is still there.");
         failure
     };
-    let title = args.title.trim();
     let start = json!({
-        "name": format!("{}-{}", slug(title, 32), suffix()?),
+        "name": agent_name(&args.title, &suffix),
         "kind": selection.harness,
         "pane_id": opened.pane,
         "args": command,
-        "timeout_ms": START_TIMEOUT_MS,
+        "timeout_ms": START_TIMEOUT.as_millis(),
     });
     let ready = match start_agent(call, &start) {
         Ok(ready) => ready,
@@ -567,7 +572,8 @@ pub fn launch_tool(call: &mut Call, args: &LaunchArgs) -> Done {
     };
     let thread = call
         .session
-        .stamp_launch(&opened.pane, &threads.caller, title)?;
+        .stamp_launch(&opened.pane, &caller.key, &args.title)
+        .map_err(|error| with_place(error.into()))?;
     let message = args
         .message
         .as_deref()
@@ -579,7 +585,7 @@ pub fn launch_tool(call: &mut Call, args: &LaunchArgs) -> Done {
     let next = match (ready, sent) {
         (false, _) => {
             "The agent stopped at a dialog before taking input, so nothing was sent: \
-                       herdr_read it and tell the user."
+             herdr_read it and tell the user."
         }
         (true, Some(())) => "herdr_wait for the turn to end, then herdr_read.",
         (true, None) => "It is idle: herdr_send gives it work.",
@@ -589,7 +595,6 @@ pub fn launch_tool(call: &mut Call, args: &LaunchArgs) -> Done {
         "thread".into(),
         thread.as_deref().unwrap_or(&opened.pane).into(),
     );
-    result.insert("pane_id".into(), opened.pane.into());
     result.insert("launched".into(), selection_json(&selection));
     result.insert("ready".into(), ready.into());
     result.insert("sent".into(), sent.is_some().into());
@@ -602,17 +607,16 @@ pub fn launch_tool(call: &mut Call, args: &LaunchArgs) -> Done {
 /// and refuses a pane whose shell has not reached its first prompt yet.
 fn start_agent(call: &mut Call, start: &Value) -> Result<bool, Failure> {
     let pane = json!({"target": start["pane_id"]});
-    let shell_by = Instant::now() + SHELL_TIMEOUT;
+    let by = Instant::now() + START_TIMEOUT;
     loop {
         match call.herdr.request("agent.start", start, QUICK)? {
             Ok(_) => break,
-            Err(refused) if refused.code == "agent_pane_busy" && Instant::now() < shell_by => {
+            Err(refused) if refused.code == "agent_pane_busy" && Instant::now() < by => {
                 thread::sleep(POLL);
             }
             Err(refused) => return Err(refused.into()),
         }
     }
-    let ready_by = Instant::now() + Duration::from_millis(START_TIMEOUT_MS);
     loop {
         let mut found = match call.herdr.request("agent.get", &pane, QUICK)? {
             Ok(found) => found,
@@ -632,7 +636,7 @@ fn start_agent(call: &mut Call, start: &Value) -> Result<bool, Failure> {
         if agent["agent_status"] == "blocked" {
             return Ok(false);
         }
-        if Instant::now() >= ready_by {
+        if Instant::now() >= by {
             return Err(Failure::new(
                 "agent_start_timeout",
                 "the agent did not come up in time: `screen` shows where it is.",
@@ -642,64 +646,36 @@ fn start_agent(call: &mut Call, start: &Value) -> Result<bool, Failure> {
     }
 }
 
-fn open_shell(
+fn open_worktree(
     call: &mut Call,
     config: &Config,
-    place: &Place,
-    args: &LaunchArgs,
+    project: &Project,
+    branch: &str,
+    base: Option<&str>,
 ) -> Result<Opened, Failure> {
-    let title = args.title.trim();
-    let workspace = match place {
-        Place::Open(project) => Some(project.primary()),
-        Place::Unopened(_) => None,
-    };
-    if args.checkout == Checkout::Existing {
-        let Some(workspace) = workspace else {
-            return Err(Failure::new(
-                "project_not_open",
-                "`checkout: existing` needs a project that is open in Herdr",
-            ));
-        };
-        let cwd = workspace.worktree.as_ref().map(|c| &c.checkout_path);
-        let tab = json!({
-            "workspace_id": workspace.workspace_id, "cwd": cwd, "label": title, "focus": false,
-        });
-        let made = call.ask("tab.create", &tab, QUICK)?;
-        return Ok(Opened {
-            pane: pane_of(&made)?,
-            detail: detail(&[
-                ("workspace_id", json!(workspace.workspace_id)),
-                ("path", json!(cwd)),
-            ]),
-        });
-    }
-    let branch = args
-        .branch
-        .clone()
-        .unwrap_or_else(|| format!("{}{}", config.worktree.branch_prefix, slug(title, 48)));
     // The workspace is named for its project, so the thread's row says where it is; the title
-    // is on the thread itself. Herdr names an unlabelled one after its branch.
-    let label = match place {
-        Place::Open(project) => Some(project.name),
-        Place::Unopened(_) => None,
-    };
-    let worktree = json!({
-        "workspace_id": workspace.map(|w| &w.workspace_id),
-        "cwd": match place { Place::Unopened(path) => Some(path), Place::Open(_) => None },
+    // is on the thread itself.
+    let mut worktree = json!({
         "branch": branch,
-        "base": args.base.as_ref().or(config.worktree.base.as_ref()),
-        "label": label,
+        "base": base.or(config.worktree.base.as_deref()),
+        "label": project.name,
         "focus": false,
     });
+    match project.primary() {
+        Some(source) => worktree["workspace_id"] = json!(source.workspace_id),
+        None => worktree["cwd"] = json!(project.root),
+    }
     // Herdr runs `git worktree add`, which checks out the whole tree.
     let made = call.ask("worktree.create", &worktree, Duration::from_secs(120))?;
+    let pane = pane_of(&made)?;
     Ok(Opened {
-        pane: pane_of(&made)?,
         detail: detail(&[
             ("workspace_id", made["workspace"]["workspace_id"].clone()),
             ("path", made["worktree"]["path"].clone()),
             ("branch", made["worktree"]["branch"].clone()),
+            ("pane_id", json!(pane)),
         ]),
+        pane,
     })
 }
 
@@ -760,7 +736,41 @@ fn slug(text: &str, max: usize) -> String {
     }
 }
 
-/// Herdr wants each agent's name to be unique; two threads may share a title.
+/// Herdr's agent names start with a lowercase letter, hold at most 32 of `a-z 0-9 - _`, and are
+/// unique; two threads may share a title.
+fn agent_name(title: &str, suffix: &str) -> String {
+    let slug = slug(title, 24);
+    let lead = if slug.starts_with(|c: char| c.is_ascii_lowercase()) {
+        ""
+    } else {
+        "t-"
+    };
+    format!("{lead}{slug}-{suffix}")
+}
+
+/// A title is shown on one row of the picker.
+fn one_line(text: &str) -> String {
+    text.split(char::is_control)
+        .flat_map(str::split_whitespace)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// What reaches an agent's terminal as typing: lines and tabs, but no control characters, which
+/// a terminal would act on as keys.
+fn typeable(text: &str) -> Result<(), Failure> {
+    if text
+        .chars()
+        .any(|c| c.is_control() && c != '\n' && c != '\t')
+    {
+        return Err(Failure::new(
+            "invalid_arguments",
+            "a message can hold line breaks and tabs, but no other control characters",
+        ));
+    }
+    Ok(())
+}
+
 fn suffix() -> Result<String, Failure> {
     let mut bytes = [0u8; 2];
     getrandom::fill(&mut bytes)
@@ -779,8 +789,17 @@ pub fn send_tool(call: &mut Call, arguments: Value) -> Done {
     if args.message.trim().is_empty() {
         return Err(Failure::new("invalid_arguments", "message is empty"));
     }
+    typeable(&args.message)?;
+    let id = call.current_id(&args.thread);
     let threads = call.threads()?;
-    let (item, pane) = threads.pane(&args.thread)?;
+    let (item, pane) = threads.pane(&id)?;
+    // The agent would queue it behind its turn, and a wait then would see that turn end instead.
+    if item.row.display == Display::Working {
+        return Err(Failure::new(
+            "agent_working",
+            "it is in the middle of a turn: herdr_wait for it to end, then send.",
+        ));
+    }
     let mine = threads.mine(item);
     prompt(call, &pane, &args.message)?;
     Ok(json!({
@@ -800,16 +819,24 @@ pub fn read_tool(call: &mut Call, arguments: Value) -> Done {
         max_chars: Option<usize>,
     }
     let args: Args = decode(arguments)?;
+    let id = call.current_id(&args.thread);
     let threads = call.threads()?;
-    let (item, pane) = threads.pane(&args.thread)?;
-    let params = json!({
+    let (item, pane) = threads.pane(&id)?;
+    let mut params = json!({
         "target": pane,
         "source": "recent",
         "lines": args.lines.unwrap_or(READ_DEFAULT_LINES).clamp(1, READ_MAX_LINES),
         "format": "text",
         "strip_ansi": true,
     });
-    let read = call.ask("agent.read", &params, QUICK)?;
+    // Herdr scrolls back past the screen of an agent showing a full-screen view only while it
+    // is idle, so a blocked one is read as it shows now.
+    let read = if let Ok(read) = call.herdr.request("agent.read", &params, QUICK)? {
+        read
+    } else {
+        params["source"] = json!("visible");
+        call.ask("agent.read", &params, QUICK)?
+    };
     let text = without_blank_runs(read["read"]["text"].as_str().unwrap_or_default());
     let max = args
         .max_chars
@@ -853,7 +880,8 @@ pub fn wait_tool(call: &mut Call, arguments: Value) -> Done {
         timeout_ms: Option<u64>,
     }
     let args: Args = decode(arguments)?;
-    let (_, pane) = call.threads()?.pane(&args.thread)?;
+    let id = call.current_id(&args.thread);
+    let (_, pane) = call.threads()?.pane(&id)?;
     let timeout = args
         .timeout_ms
         .unwrap_or(WAIT_DEFAULT_MS)
@@ -897,17 +925,12 @@ pub fn threads_tool(call: &mut Call, arguments: Value) -> Done {
     }
     let args: Args = decode(arguments)?;
     let threads = call.threads()?;
-    let workspaces = call.workspaces()?;
+    let workspaces = match args.project {
+        Some(_) => call.workspaces()?,
+        None => Vec::new(),
+    };
     let project = match args.project.as_deref() {
-        Some(query) => match place(&workspaces, query)? {
-            Place::Open(project) => Some(project),
-            Place::Unopened(_) => {
-                return Err(Failure::new(
-                    "project_not_found",
-                    format!("no open project `{query}`"),
-                ));
-            }
-        },
+        Some(query) => Some(place(call, &workspaces, query)?),
         None => None,
     };
     let wanted = |item: &&Item| {
@@ -984,24 +1007,32 @@ pub fn organize_tool(call: &mut Call, arguments: Value) -> Done {
                 "`thread` is required for every action but undo",
             )
         })?;
-        let threads = call.threads()?;
-        let item = threads.find(id)?;
-        let key = item.row.key.clone();
-        if args.action == Verb::Rename {
-            call.session.rename(&key, args.title.clone())?;
+        let id = call.current_id(id);
+        let key = call.threads()?.find(&id)?.row.key.clone();
+        let action = match args.action {
+            Verb::Rename => None,
+            Verb::Settle => Some(Action::Ensure(Want::Settled)),
+            Verb::Unsettle => Some(Action::Ensure(Want::Unsettled)),
+            Verb::Snooze => Some(Action::Snooze(args.snooze_until(call.session.now())?)),
+            Verb::Wake => Some(Action::Ensure(Want::Awake)),
+            Verb::Reopen => Some(Action::Ensure(Want::Open)),
+            Verb::Pin => Some(Action::Ensure(Want::Pinned)),
+            Verb::Unpin => Some(Action::Ensure(Want::Unpinned)),
+            Verb::MarkUnread => Some(Action::Ensure(Want::Unread)),
+            Verb::MarkRead => Some(Action::Ensure(Want::Read)),
+            Verb::Forget => Some(Action::Forget),
+            // Undo is answered above.
+            Verb::Undo => return Err(Failure::new("invalid_arguments", "undo takes no thread")),
+        };
+        if let Some(action) = action {
+            call.session.act(&key, action)?
+        } else {
+            let title = args.title.as_deref().map(one_line);
+            call.session.rename(&key, title)?;
             Outcome::Done {
                 key,
                 notice: None,
                 wake_failed: None,
-            }
-        } else {
-            match action(&args, item, call.session.now())? {
-                Some(action) => call.session.act(&key, action)?,
-                None => Outcome::Done {
-                    key,
-                    notice: Some("already so: nothing changed".into()),
-                    wake_failed: None,
-                },
             }
         }
     };
@@ -1019,29 +1050,8 @@ pub fn organize_tool(call: &mut Call, arguments: Value) -> Done {
             let threads = call.threads()?;
             let thread = threads.find(&key).ok().map(|item| threads.describe(item));
             let wake = wake_failed.map(|error| format!("its wake timer failed to start: {error}"));
-            Ok(json!({"done": true, "thread": thread, "note": notice.or(wake)}))
+            let notes: Vec<String> = notice.into_iter().chain(wake).collect();
+            Ok(json!({"done": true, "thread": thread, "notes": notes}))
         }
-    }
-}
-
-/// The picker's keys toggle; a caller names the state it wants, so an action already in effect
-/// is `None` rather than its opposite.
-fn action(args: &OrganizeArgs, item: &Item, now: i64) -> Result<Option<Action>, Failure> {
-    let row = &item.row;
-    let settled = row.park == Some(Park::Settled);
-    let snoozed = matches!(row.park, Some(Park::Snoozed { .. }));
-    let when = |wanted: bool, action: Action| Ok(wanted.then_some(action));
-    match args.action {
-        Verb::Settle => when(!settled, Action::ToggleSettle),
-        Verb::Unsettle => when(settled, Action::ToggleSettle),
-        Verb::Snooze => Ok(Some(Action::Snooze(args.snooze_until(now)?))),
-        Verb::Wake => when(snoozed, Action::Wake),
-        Verb::Reopen => when(!row.live(), Action::Reopen),
-        Verb::Pin => when(!row.pinned, Action::TogglePin),
-        Verb::Unpin => when(row.pinned, Action::TogglePin),
-        Verb::MarkUnread => when(!row.display.unseen(), Action::ToggleUnread),
-        Verb::MarkRead => when(row.display.unseen(), Action::ToggleUnread),
-        Verb::Forget => Ok(Some(Action::Forget)),
-        Verb::Rename | Verb::Undo => Ok(None),
     }
 }

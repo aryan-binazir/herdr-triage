@@ -310,6 +310,21 @@ pub enum Action {
     TogglePin,
     Reopen,
     Forget,
+    /// Reach a state rather than toggle, judged under the store's lock: one already reached is
+    /// left alone, so two callers asking for it at once cannot undo each other.
+    Ensure(Want),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Want {
+    Settled,
+    Unsettled,
+    Awake,
+    Open,
+    Pinned,
+    Unpinned,
+    Read,
+    Unread,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -952,6 +967,9 @@ impl State {
             Some(agent) => display(agent, self.records.get(key)),
             None => closed_display(self.records.get(key).ok_or_else(gone)?),
         };
+        let Some(action) = self.toggle_toward(key, live_agent.is_some(), shown, action) else {
+            return Ok(After::Nothing);
+        };
         let refused = refusal(action, shown, live_agent.is_some());
         if action == Action::Forget {
             if let Some(refusal) = refused {
@@ -1028,12 +1046,38 @@ impl State {
                 record.park = None;
                 Ok(After::Nothing)
             }
-            Action::Forget => Ok(After::Nothing),
+            Action::Forget | Action::Ensure(_) => Ok(After::Nothing),
         };
         if after.is_ok() {
             self.remember(key, before);
         }
         after
+    }
+
+    /// The toggle that reaches what `Action::Ensure` wants, or `None` when it is already so.
+    fn toggle_toward(
+        &self,
+        key: &str,
+        live: bool,
+        shown: Display,
+        action: Action,
+    ) -> Option<Action> {
+        let Action::Ensure(want) = action else {
+            return Some(action);
+        };
+        let record = self.records.get(key);
+        let park = record.and_then(|r| r.park);
+        let pinned = record.is_some_and(|r| r.pinned);
+        match want {
+            Want::Settled => (park != Some(Park::Settled)).then_some(Action::ToggleSettle),
+            Want::Unsettled => (park == Some(Park::Settled)).then_some(Action::ToggleSettle),
+            Want::Awake => matches!(park, Some(Park::Snoozed { .. })).then_some(Action::Wake),
+            Want::Open => (!live).then_some(Action::Reopen),
+            Want::Pinned => (!pinned).then_some(Action::TogglePin),
+            Want::Unpinned => pinned.then_some(Action::TogglePin),
+            Want::Read => shown.unseen().then_some(Action::ToggleUnread),
+            Want::Unread => (!shown.unseen()).then_some(Action::ToggleUnread),
+        }
     }
 
     pub fn ordered(&self, agents: &[Observed]) -> Vec<Row> {
@@ -1863,6 +1907,32 @@ mod tests {
             shown(&state, &used_again).1,
             None,
             "real activity after the restore unparks"
+        );
+    }
+
+    #[test]
+    fn a_state_already_reached_is_left_alone_where_a_toggle_would_undo_it() {
+        let agent = agent("k", Status::Idle, 3);
+        let mut state = State::default();
+        state.reconcile("g", std::slice::from_ref(&agent), 100);
+        for _ in 0..2 {
+            state
+                .apply("k", Some(&agent), Action::Ensure(Want::Pinned), 100)
+                .unwrap();
+            assert!(state.records["k"].pinned);
+        }
+        state
+            .apply("k", Some(&agent), Action::Ensure(Want::Unpinned), 100)
+            .unwrap();
+        assert!(!state.records["k"].pinned);
+        let woken = state.apply("k", Some(&agent), Action::Ensure(Want::Awake), 100);
+        assert_eq!(woken, Ok(After::Nothing));
+        assert_eq!(state.records["k"].park, None);
+        let reopened = state.apply("k", Some(&agent), Action::Ensure(Want::Open), 100);
+        assert_eq!(
+            reopened,
+            Ok(After::Nothing),
+            "a live thread is already open"
         );
     }
 

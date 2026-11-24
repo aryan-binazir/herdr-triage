@@ -173,8 +173,8 @@ time. It speaks MCP over stdin and stdout; there is no daemon, port or login. In
 | --- | --- |
 | `herdr_projects` | The projects open in Herdr, one per repository, with their workspaces and what a launch there starts |
 | `herdr_capabilities` | The agents it can launch and the models and efforts they default to |
-| `herdr_launch` | Start an agent in a project, in a new Git worktree (its own workspace) or, with `checkout: existing`, a new tab in the project's checkout; optionally with its first message |
-| `herdr_send` | Message an open thread's agent |
+| `herdr_launch` | Start an agent in a new Git worktree (its own workspace) of a project open in Herdr, optionally with its first message |
+| `herdr_send` | Message an open thread's agent between turns |
 | `herdr_read` | The recent text on a thread's terminal |
 | `herdr_wait` | Wait until a thread's agent stops working |
 | `herdr_threads` | Threads with their triage state, the caller's own first |
@@ -193,20 +193,23 @@ claude mcp add --scope user herdr -- ~/.local/state/herdr/plugins/ar.triage/herd
 codex mcp add herdr -- ~/.local/state/herdr/plugins/ar.triage/herdr-triage mcp
 ```
 
-Codex hides your environment from MCP servers, so also add this line to the
-`[mcp_servers.herdr]` table that `codex mcp add` wrote in `~/.codex/config.toml`. Without it the
-server cannot tell which pane is calling, and with `XDG_*` set it would read other settings and
-another triage database than the plugin's:
+Codex hides your environment from MCP servers, so also add these lines to the
+`[mcp_servers.herdr]` table that `codex mcp add` wrote in `~/.codex/config.toml`. Without
+`env_vars` the server cannot tell which pane is calling, and with `XDG_*` set it would read other
+settings and another triage database than the plugin's. The timeout leaves room for a large
+repository's worktree checkout (Codex allows 60 seconds otherwise):
 
 ```toml
 env_vars = ["HERDR_PANE_ID", "HERDR_SOCKET_PATH", "XDG_CONFIG_HOME", "XDG_STATE_HOME"]
+tool_timeout_sec = 120
 ```
 
 Any client that starts a stdio MCP server works the same way. Two environment variables matter:
 
-- `HERDR_PANE_ID`, which Herdr sets in every pane, tells the server which agent is calling. That
-  agent's launches are then its own (`mine`), and a launch with no `project` goes to the project
-  it runs in. A client outside Herdr is known by its client name instead and has to name a project.
+- `HERDR_PANE_ID`, which Herdr sets in every pane, tells the server which terminal is calling.
+  What it launches is then its own (`mine`), and a launch with no `project` goes to the project
+  it runs in. A client outside Herdr owns what it launches for as long as its session lasts, and
+  has to name a project.
 - `HERDR_SOCKET_PATH` picks the Herdr session to drive when you run more than the default one.
 
 ### What it launches
@@ -219,7 +222,7 @@ server writes this file with its defaults the first time it runs and reads it on
 default_harness: pi
 
 # Per agent: its model and effort, and any extra command-line arguments.
-# Leave `model` or `effort` out to use the agent's own default.
+# Left out, pi starts on claude-opus-5-5 at medium; claude and codex on their own defaults.
 harnesses:
   pi:
     model: claude-opus-5-5      # any pattern `pi --model` accepts
@@ -248,27 +251,27 @@ worktree:
   # base: origin/main
   # Prepended to the branch name made from the thread's title, e.g. `agent/`.
   branch_prefix: ""
-
-limits:
-  # Launches are refused while this many launched threads are open and not settled or snoozed.
-  max_open: 8
 ```
 
 The caller can name a `harness`, `model` or `effort` for one launch; otherwise the project's
-settings apply, then the harness's. They become `pi --model M --thinking E`,
+settings apply, then the harness's, then the built-in defaults above, so a file that only sets
+`worktree` still launches pi on Opus 5.5 at medium. They become `pi --model M --thinking E`,
 `claude --model M --effort E` or `codex --model M --config model_reasoning_effort=E`, followed by
 `args`. Put flags you always want there, such as a permission mode. A file that does not parse
 stops launches with the parse error, rather than launching something you did not ask for.
 
 ### What to expect
 
-- **Launching** asks Herdr for a worktree off the project's own checkout, on a branch named after
-  the title (or `branch`), starts the agent in the new workspace and types the message. Nothing
+- **Launching** asks Herdr for a worktree off the project's own checkout (or its repository root,
+  when only linked worktrees are open), on a new branch named after the title with a short random
+  suffix (or on `branch`), starts the agent in the new workspace and types the message. Nothing
   takes your focus. Herdr decides where worktrees go (`~/.herdr/worktrees/<repository>/<branch>`
   unless you configured it otherwise), and the new workspace is named after the repository, so the
-  picker shows the thread's title beside its project. The project can be a repository's name from
-  `herdr_projects`, a workspace id or label, or a path inside a repository, open in Herdr or not.
-- **A launch waits for the agent to come up**, usually a few seconds and at most a minute. If its
+  picker shows the thread's title beside its project.
+- **The project** must be open in Herdr. It can be a workspace id, a path inside the repository
+  (Herdr resolves it with Git), or a repository name or workspace label; a name two projects
+  answer to is refused rather than guessed.
+- **A launch waits for the agent to come up**, usually a few seconds and at most 40. If its
   command exits instead, for example on a flag it does not know, the error carries what the pane
   printed.
 - **A repository Herdr has not been told to trust** is not launched into: Herdr's refusal is passed
@@ -278,18 +281,24 @@ stops launches with the parse error, rather than launching something you did not
   answers an agent that is blocked on an approval or a question, and tells the calling agent to
   ask you.
 - **A launch that fails partway** leaves what it opened (the worktree, the workspace) in place and
-  names it in the error; nothing is deleted for you.
+  names it in the error, pane included; nothing is deleted for you. Retried with the same
+  `request_id`, it answers with that error again instead of opening more.
 - **Any thread can be messaged or triaged**, not only the caller's own, so one agent can pick up
   another's work when you ask. Threads the caller launched are marked `mine` and listed first, and
-  the tools tell agents to prefer them.
-- **Triage follows the rules above.** Settling or snoozing can close an agent's pane; a working or
-  blocked agent is refused, so an agent cannot close the pane it is running in. Reopening starts a
-  tab in the background. `undo` takes back the last change whoever made it, yours included.
+  the tools tell agents to prefer them. A message to an agent mid-turn is refused rather than
+  queued behind the turn, and a message holding control characters (other than line breaks and
+  tabs) is refused, since the terminal would act on them as keys.
+- **Triage follows the rules above**, with one difference: the caller names the state it wants, so
+  settling a settled thread changes nothing where the picker's key would unsettle it. Settling or
+  snoozing can close an agent's pane; settling a working or blocked agent is refused, so an agent
+  cannot close the pane it is running in. Reopening starts a tab in the background. `undo` takes
+  back the last change whoever made it, yours included.
 - **A thread launched into a worktree stays open when settled**, because its pane is the only one
-  in its workspace. It leaves the list and frees its place under `max_open`; closing the workspace
-  and removing the worktree are yours to do.
-- **Reading** returns the terminal's recent rows, not a transcript.
-- **Waiting** holds for 30 seconds by default (5 minutes at most) and then says the agent is still
+  in its workspace. It leaves the list; closing the workspace and removing the worktree are yours
+  to do.
+- **Reading** returns the terminal's recent rows, not a transcript; an agent showing a full-screen
+  dialog is read as it shows now.
+- **Waiting** holds for 30 seconds by default (50 at most) and then says the agent is still
   working. An agent stopped at a prompt Herdr does not recognize as one also reads as working, so
   the answer tells the caller to read the thread. The server answers one request at a time, so a
   wait delays a call made alongside it.

@@ -199,12 +199,20 @@ fn agent_api(
     opened: &mut i32,
 ) -> Value {
     match method {
+        // Git finds the repository a directory is in, through any of its worktrees.
         "worktree.list" => {
-            let workspace = params["workspace_id"].as_str().unwrap_or_default();
-            repositories
-                .get(workspace)
-                .cloned()
-                .unwrap_or(json!({"type": "ok"}))
+            let found = if let Some(cwd) = params["cwd"].as_str() {
+                repositories.values().find(|listing| {
+                    let source = listing["source"]["repo_root"].as_str().unwrap();
+                    let worktrees = listing["worktrees"].as_array().unwrap();
+                    std::iter::once(source)
+                        .chain(worktrees.iter().map(|w| w["path"].as_str().unwrap()))
+                        .any(|dir| std::path::Path::new(cwd).starts_with(dir))
+                })
+            } else {
+                repositories.get(params["workspace_id"].as_str().unwrap_or_default())
+            };
+            found.cloned().unwrap_or(json!({"type": "ok"}))
         }
         "worktree.create" => {
             *opened += 1;
@@ -256,7 +264,9 @@ fn agent_api(
                 || json!(pane.split(':').next()),
                 |a| a["workspace_id"].clone(),
             );
-            json!({"type": "pane_info", "pane": {"pane_id": pane, "workspace_id": workspace}})
+            json!({"type": "pane_info", "pane": {
+                "pane_id": pane, "workspace_id": workspace, "terminal_id": format!("t-{pane}"),
+            }})
         }
         "agent.wait" => json!({"type": "wait_matched"}),
         "agent.read" | "pane.read" => json!({"type": "pane_read", "read": {

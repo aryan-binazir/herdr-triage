@@ -359,8 +359,17 @@ impl Session {
             .map(|w| w.workspace_id.as_str())
             .collect();
         let launch = plan.launch(&self.herdr.server_generation(), &workspaces);
+        // A reopen moments ago already started it, if that tab is still there.
+        let focus_reopened = self.focus_reopened;
+        let started = |herdr: &mut Herdr, pane| {
+            if focus_reopened {
+                herdr.focus_pane(pane).is_ok()
+            } else {
+                herdr.has_pane(pane)
+            }
+        };
         if let Some(pane) = launch.focus
-            && (!self.focus_reopened || self.herdr.focus_pane(pane).is_ok())
+            && started(&mut self.herdr, pane)
         {
             return Ok(());
         }
@@ -549,9 +558,24 @@ fn view_label(rows: &[Row]) -> String {
     }
 }
 
+/// Herdr names the plugin's config directory to its own commands; a command an MCP client started
+/// finds it where Herdr keeps it.
 pub fn pin_icon() -> String {
-    let path = std::env::var_os("HERDR_PLUGIN_CONFIG_DIR")
-        .map(|dir| PathBuf::from(dir).join("config.toml"));
+    let dir = std::env::var_os("HERDR_PLUGIN_CONFIG_DIR")
+        .map(PathBuf::from)
+        .or_else(|| {
+            let config = std::env::var_os("XDG_CONFIG_HOME")
+                .map(PathBuf::from)
+                .or_else(|| {
+                    std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config"))
+                })?;
+            Some(
+                config
+                    .join("herdr/plugins/config")
+                    .join(crate::herdr::plugin_id()),
+            )
+        });
+    let path = dir.map(|dir| dir.join("config.toml"));
     path.and_then(|path| fs::read_to_string(path).ok())
         .and_then(|text| text.parse::<toml::Table>().ok())
         .and_then(|table| table.get("pin_icon")?.as_str().map(str::to_owned))
