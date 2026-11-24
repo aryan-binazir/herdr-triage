@@ -106,6 +106,7 @@ pub enum Section {
 #[serde(rename_all = "snake_case")]
 pub enum Unread {
     Manual,
+    Left,
     Woke,
 }
 
@@ -149,6 +150,7 @@ pub struct Record {
     pub title: Option<String>,
     #[serde(default)]
     pub launched_by: Option<String>,
+    pub settle_requested: Option<String>,
 }
 
 fn live_by_default() -> bool {
@@ -170,14 +172,99 @@ impl Record {
         self.thread.resume_argv().is_some()
     }
 
+    fn label(&self) -> &str {
+        match &self.title {
+            Some(title) => title,
+            None if self.thread.label.is_empty() => UNTITLED,
+            None => &self.thread.label,
+        }
+    }
+
+    fn close_for_good(
+        &mut self,
+        asked: u64,
+        seq: u64,
+        agent: Option<&Observed>,
+    ) -> Result<After, Refusal> {
+        if asked != seq {
+            return Err(Refusal("it has done something new since you asked".into()));
+        }
+        self.pinned = false;
+        let closing = agent.filter(|agent| agent.status != Status::Unknown);
+        Ok(park(self, seq, Park::Settled, closing))
+    }
+
+    fn settle(&mut self, seq: u64, shown: Display, agent: Option<&Observed>) -> After {
+        if self.settle_requested.take().is_some() {
+            return After::Nothing;
+        }
+        if shown == Display::Working {
+            self.settle_requested = agent.map(|agent| agent.terminal_id.clone());
+            return After::Nothing;
+        }
+        self.pinned = false;
+        let closing = self.resumable().then_some(agent).flatten();
+        park(self, seq, Park::Settled, closing)
+    }
+
+    fn settle_if_turn_ended(&mut self, agent: &Observed) -> Option<After> {
+        if self.settle_requested.as_deref()? != agent.terminal_id {
+            self.settle_requested = None;
+            return None;
+        }
+        match agent.status {
+            Status::Working | Status::Unknown => None,
+            Status::Blocked => {
+                self.settle_requested = None;
+                None
+            }
+            Status::Idle | Status::Done => {
+                self.pinned = false;
+                let closing = self.resumable().then_some(agent);
+                Some(park(self, agent.seq, Park::Settled, closing))
+            }
+        }
+    }
+
+    fn see(&mut self, agent: &Observed, any_focused: bool) {
+        match self.unread {
+            Some(Unread::Woke) if agent.focused => self.unread = None,
+            Some(Unread::Left) if agent.focused => {
+                self.unread = None;
+                self.ack_seq = Some(agent.seq);
+            }
+            Some(Unread::Manual) if !agent.focused && any_focused => {
+                self.unread = Some(Unread::Left);
+            }
+            _ => {}
+        }
+    }
+
+    fn wake_if_due(&mut self, now: i64) -> bool {
+        let due = matches!(self.park, Some(Park::Snoozed { until }) if until <= now);
+        if due {
+            self.park = None;
+            self.unread = Some(Unread::Woke);
+        }
+        due
+    }
+
     fn end_session(&mut self) {
         if self.park.is_none() && self.unread.is_none() {
             self.park = Some(Park::Settled);
         }
+        self.settle_requested = None;
         self.live = false;
         self.ended = true;
         self.missing_since = None;
     }
+}
+
+#[derive(Debug, Default)]
+pub struct Reconciled {
+    pub exit_checks: Vec<i64>,
+    pub woke: Vec<String>,
+    pub closes: Vec<Close>,
 }
 
 #[derive(Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -209,6 +296,8 @@ struct Triage {
     unread: Option<Unread>,
     ack_seq: Option<u64>,
     title: Option<String>,
+    #[serde(default)]
+    settle_requested: Option<String>,
 }
 
 impl Triage {
@@ -216,9 +305,10 @@ impl Triage {
         Self {
             pinned: record.pinned,
             park: record.park,
-            unread: record.unread,
+            unread: left_as_manual(record.unread),
             ack_seq: record.ack_seq,
             title: record.title.clone(),
+            settle_requested: record.settle_requested.clone(),
         }
     }
 
@@ -235,12 +325,28 @@ impl Triage {
         if !moved_on || unparks {
             undo(&mut record.park, self.park, &after.park);
         }
-        if !moved_on || marks_unread {
-            undo(&mut record.unread, self.unread, &after.unread);
+        let changed_unread = self.unread != after.unread;
+        if changed_unread
+            && (!moved_on || marks_unread)
+            && left_as_manual(record.unread) == after.unread
+        {
+            record.unread = self.unread;
         }
         if !moved_on {
             undo(&mut record.ack_seq, self.ack_seq, &after.ack_seq);
+            undo(
+                &mut record.settle_requested,
+                self.settle_requested,
+                &after.settle_requested,
+            );
         }
+    }
+}
+
+fn left_as_manual(unread: Option<Unread>) -> Option<Unread> {
+    match unread {
+        Some(Unread::Left) => Some(Unread::Manual),
+        other => other,
     }
 }
 
@@ -303,6 +409,8 @@ impl Rank {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Action {
     ToggleSettle,
+    SettleKeepingOpen,
+    CloseForGood { seq: u64 },
     Snooze(i64),
     Wake,
     ToggleUnread,
@@ -379,6 +487,10 @@ pub struct Launch<'a> {
 }
 
 impl ReopenPlan {
+    pub fn key(&self) -> &str {
+        &self.key
+    }
+
     pub fn launch<'a>(&'a self, generation: &str, workspaces: &[&str]) -> Launch<'a> {
         let focus = self
             .pending_pane
@@ -414,6 +526,9 @@ pub struct Row {
     pub park: Option<Park>,
     pub pinned: bool,
     pub changed_at: Option<i64>,
+    pub status: Status,
+    pub settle_pending: bool,
+    pub workspace_panes: usize,
     pub thread: Thread,
     pub title: Option<String>,
     pub launched_by: Option<String>,
@@ -451,6 +566,17 @@ impl Row {
         }
     }
 
+    pub fn can_close_for_good(&self) -> bool {
+        self.live()
+            && self.park != Some(Park::Settled)
+            && self.display != Display::Working
+            && !self.settle_pending
+            && self.workspace_panes > 1
+            && self.status != Status::Unknown
+            && self.thread.resume_argv().is_none()
+            && self.refusal(Action::ToggleSettle).is_none()
+    }
+
     /// Why triage would refuse `action` on this thread as shown. `None` does not promise
     /// success: a thread can still be gone, or have no session to resume.
     pub fn refusal(&self, action: Action) -> Option<Refusal> {
@@ -462,6 +588,7 @@ impl Row {
         match (self.live(), self.park) {
             (false, _) => format!("{text} · closed"),
             (true, Some(_)) => format!("{text} · stays open"),
+            (true, None) if self.settle_pending => format!("{text} · settles when done"),
             (true, None) => text,
         }
     }
@@ -471,7 +598,7 @@ impl Row {
         Tz::Offset: std::fmt::Display,
     {
         let triage = self.park_text(now, tz).or(match self.display {
-            Display::Unread(Unread::Manual) => Some("unread".into()),
+            Display::Unread(Unread::Manual | Unread::Left) => Some("unread".into()),
             Display::Unread(Unread::Woke) => Some("woke".into()),
             _ => None,
         });
@@ -499,7 +626,7 @@ impl Row {
                 Display::Blocked => "blocked",
                 Display::Working => "working",
                 Display::Done => "done",
-                Display::Unread(Unread::Manual) => return "unread".into(),
+                Display::Unread(Unread::Manual | Unread::Left) => return "unread".into(),
                 Display::Unread(Unread::Woke) => return "woke".into(),
                 Display::Idle => "idle",
                 Display::Unknown => "unknown",
@@ -600,7 +727,7 @@ impl SnoozePreset {
     }
 }
 
-pub fn snooze_presets<Tz: TimeZone>(now: i64, tz: &Tz) -> Vec<SnoozePreset> {
+pub fn snooze_presets<Tz: TimeZone>(now: i64, tz: &Tz) -> Vec<(SnoozePreset, bool)> {
     let evening_is_half_an_hour_away = SnoozePreset::ThisEvening.until(now, tz) - now >= 1_800;
     [
         SnoozePreset::OneHour,
@@ -610,23 +737,27 @@ pub fn snooze_presets<Tz: TimeZone>(now: i64, tz: &Tz) -> Vec<SnoozePreset> {
         SnoozePreset::NextWeek,
     ]
     .into_iter()
-    .filter(|preset| *preset != SnoozePreset::ThisEvening || evening_is_half_an_hour_away)
+    .map(|preset| {
+        let offered = preset != SnoozePreset::ThisEvening || evening_is_half_an_hour_away;
+        (preset, offered)
+    })
     .collect()
 }
 
 fn refusal(action: Action, shown: Display, live: bool) -> Option<Refusal> {
-    let verb = match action {
-        Action::Forget if live => {
-            return Some(Refusal("only closed threads can be forgotten".into()));
-        }
-        Action::ToggleSettle => "settle",
-        Action::ToggleUnread => "mark unread",
-        Action::Snooze(_) if shown == Display::Blocked => "snooze",
-        _ => return None,
-    };
+    if action == Action::Forget && live {
+        return Some(Refusal("only closed threads can be forgotten".into()));
+    }
     let busy = match shown {
         Display::Working => "working",
         Display::Blocked => "blocked",
+        _ => return None,
+    };
+    let verb = match action {
+        Action::ToggleSettle if shown == Display::Working => return None,
+        Action::ToggleSettle | Action::SettleKeepingOpen => "settle",
+        Action::CloseForGood { .. } => "close",
+        Action::ToggleUnread => "mark unread",
         _ => return None,
     };
     Some(Refusal(format!("can't {verb} a {busy} agent")))
@@ -654,10 +785,12 @@ fn closed_display(record: &Record) -> Display {
 }
 
 impl State {
-    /// Returns when agents that just went missing must be checked again, since nothing else may
-    /// sync once the exit grace period is over.
-    pub fn reconcile(&mut self, generation: &str, agents: &[Observed], now: i64) -> Vec<i64> {
+    pub fn reconcile(&mut self, generation: &str, agents: &[Observed], now: i64) -> Reconciled {
         let mut exit_checks = Vec::new();
+        let mut woke = Vec::new();
+        let mut closes = Vec::new();
+        let mut landed = Vec::new();
+        let any_focused = agents.iter().any(|agent| agent.focused);
         for agent in agents {
             self.adopt_previous_key(agent, generation, now);
             let existed = self.records.contains_key(&agent.key);
@@ -667,6 +800,7 @@ impl State {
                 .or_insert_with(|| Record {
                     generation: generation.to_owned(),
                     last_seq: agent.seq,
+                    changed_at: Some(now),
                     ..Record::default()
                 });
             // A thread that ended or is being reopened comes back by choice, not by Herdr's restore.
@@ -678,6 +812,7 @@ impl State {
             if record.generation != generation || agent.seq < record.last_seq {
                 generation.clone_into(&mut record.generation);
                 record.ack_seq = None;
+                record.settle_requested = None;
                 record.restored_at = (!returned_by_choice).then_some(now);
             } else if agent.seq > record.last_seq && !restoring {
                 let stays_snoozed = matches!(record.park, Some(Park::Snoozed { .. }))
@@ -697,13 +832,16 @@ impl State {
             record.reopen_pane = None;
             record.reopen_at = None;
             record.reopen_generation = None;
-            if matches!(record.park, Some(Park::Snoozed { until }) if until <= now) {
-                record.park = None;
-                record.unread = Some(Unread::Woke);
+            if let Some(after) = record.settle_if_turn_ended(agent) {
+                landed.push(agent.key.as_str());
+                if let After::ClosePane(close) = after {
+                    closes.push(close);
+                }
             }
-            if agent.focused && record.unread == Some(Unread::Woke) {
-                record.unread = None;
+            if record.wake_if_due(now) && !agent.focused {
+                woke.push(record.label().to_owned());
             }
+            record.see(agent, any_focused);
             if now.saturating_sub(record.touched_at) >= LIVE_TOUCH_INTERVAL_SECS {
                 record.touch(now);
             }
@@ -728,9 +866,8 @@ impl State {
             }
         }
         for record in self.records.values_mut() {
-            if matches!(record.park, Some(Park::Snoozed { until }) if until <= now) {
-                record.park = None;
-                record.unread = Some(Unread::Woke);
+            if record.wake_if_due(now) {
+                woke.push(record.label().to_owned());
             }
         }
         // Live threads are touched at most once a minute, so allow that minute: never forget early.
@@ -740,7 +877,26 @@ impl State {
                 || (record.resumable() && (record.pinned || now - record.touched_at <= retention))
         });
         self.drop_orphaned_undo();
-        exit_checks
+        for key in landed {
+            self.settle_landed(key);
+        }
+        Reconciled {
+            exit_checks,
+            woke,
+            closes,
+        }
+    }
+
+    fn settle_landed(&mut self, key: &str) {
+        let (Some(record), Some(undo)) = (self.records.get(key), self.undo.as_mut()) else {
+            return;
+        };
+        if undo.key == key
+            && undo.before.settle_requested.is_none()
+            && undo.after.settle_requested.is_some()
+        {
+            undo.after = Triage::of(record);
+        }
     }
 
     fn adopt_previous_key(&mut self, agent: &Observed, generation: &str, now: i64) {
@@ -801,6 +957,32 @@ impl State {
         }
     }
 
+    pub fn mark_left_if_elsewhere(&mut self, key: &str, agents: &[Observed]) {
+        let elsewhere = agents.iter().any(|agent| agent.focused && agent.key != key);
+        if let Some(record) = self.records.get_mut(key)
+            && record.unread == Some(Unread::Manual)
+            && elsewhere
+        {
+            record.unread = Some(Unread::Left);
+        }
+    }
+
+    pub fn awaits_reopen(&self, plan: &ReopenPlan) -> bool {
+        self.records
+            .get(&plan.key)
+            .is_some_and(|record| !record.live)
+    }
+
+    pub fn launched_reopen(&self, plan: &ReopenPlan, generation: &str, now: i64) -> Option<String> {
+        let record = self.records.get(&plan.key)?;
+        let recent = record
+            .reopen_at
+            .is_some_and(|at| now - at < REOPEN_PENDING_SECS);
+        (recent && record.reopen_generation.as_deref() == Some(generation))
+            .then(|| record.reopen_pane.clone())
+            .flatten()
+    }
+
     /// Decides, under the store lock, whether an intended close may still happen.
     pub fn confirm_close(
         &mut self,
@@ -826,20 +1008,29 @@ impl State {
         let resumable = record.resumable();
         let shown = look()?;
         let mut panes = shown.iter().filter(|agent| agent.key == close.key);
-        let quiet_since_action = match (panes.next(), panes.next()) {
-            (Some(pane), None) => {
-                pane.terminal_id == close.terminal_id
-                    && !matches!(pane.status, Status::Working | Status::Blocked)
-                    && (resumable || pane.status != Status::Unknown)
-                    && (pane.seq == close.seq || restoring)
-            }
-            _ => false,
+        let (Some(pane), None) = (panes.next(), panes.next()) else {
+            return Ok(Closing::Skip);
         };
+        let quiet_since_action = pane.terminal_id == close.terminal_id
+            && !matches!(pane.status, Status::Working | Status::Blocked)
+            && (resumable || pane.status != Status::Unknown)
+            && (pane.seq == close.seq || (restoring && resumable));
         if !quiet_since_action {
             return Ok(Closing::Skip);
         }
+        if pane.workspace_panes <= 1 {
+            return Ok(Closing::KeepOpen(
+                "kept open: it is the last pane in its workspace".into(),
+            ));
+        }
         // Closing the viewed pane can end the picker before it reports the close.
-        self.mark_undo_closed(&close.key, true);
+        if self
+            .undo
+            .as_ref()
+            .is_some_and(|undo| undo.after.park == Some(close.park))
+        {
+            self.mark_undo_closed(&close.key, true);
+        }
         let pane = close.pane_id.clone();
         Ok(if resumable {
             Closing::Close(pane)
@@ -911,6 +1102,39 @@ impl State {
         }
     }
 
+    pub fn undo_summary(&self) -> Option<(&'static str, String)> {
+        let undo = self.undo.as_ref()?;
+        let record = self.records.get(&undo.key)?;
+        let (before, after) = (&undo.before, &undo.after);
+        let verb = if before.title != after.title {
+            "rename"
+        } else if !before.pinned && after.pinned {
+            "pin"
+        } else if after.unread.is_some() && before.unread != after.unread {
+            "unread"
+        } else if before.park != after.park {
+            match (before.park, after.park) {
+                (_, Some(Park::Settled)) => "settle",
+                (_, Some(Park::Snoozed { .. })) => "snooze",
+                (Some(Park::Settled), None) => "unsettle",
+                _ => "wake",
+            }
+        } else if before.pinned && !after.pinned && before.park == after.park {
+            "unpin"
+        } else if before.settle_requested != after.settle_requested {
+            if after.settle_requested.is_some() {
+                "settle"
+            } else {
+                "unsettle"
+            }
+        } else if after.unread.is_some() {
+            "unread"
+        } else {
+            "read"
+        };
+        Some((verb, record.label().to_owned()))
+    }
+
     pub fn undo(&mut self, now: i64) -> Result<(String, After), Refusal> {
         let nothing = || Refusal("nothing to undo".into());
         let Undo {
@@ -964,7 +1188,7 @@ impl State {
             Some(agent) => display(agent, self.records.get(key)),
             None => closed_display(self.records.get(key).ok_or_else(gone)?),
         };
-        let Some(action) = self.toggle_toward(key, live_agent.is_some(), shown, action) else {
+        let Some(action) = self.toggle_toward(key, live_agent.is_some(), shown, action)? else {
             return Ok(After::Nothing);
         };
         let refused = refusal(action, shown, live_agent.is_some());
@@ -993,12 +1217,19 @@ impl State {
         if let Some(refusal) = refused {
             return Err(refusal);
         }
+        if matches!(action, Action::Snooze(until) if until <= now) {
+            return Err(Refusal("that time has passed".into()));
+        }
         let live = live_agent.is_some();
         let unpark = |record: &mut Record| {
             record.park = None;
+            record.settle_requested = None;
             if live {
                 Ok(After::Nothing)
             } else {
+                if record.unread == Some(Unread::Manual) {
+                    record.unread = Some(Unread::Left);
+                }
                 reopen_plan(key, record, now)
             }
         };
@@ -1006,26 +1237,25 @@ impl State {
             Action::TogglePin if record.park.is_some() => {
                 record.park = None;
                 record.pinned = true;
+                record.settle_requested = None;
                 Ok(After::Nothing)
             }
             Action::TogglePin => {
                 record.pinned = !record.pinned;
+                record.settle_requested = None;
                 Ok(After::Nothing)
             }
             Action::Wake | Action::Reopen => unpark(record),
             Action::ToggleSettle if record.park == Some(Park::Settled) => unpark(record),
-            Action::ToggleSettle => {
+            Action::ToggleSettle => Ok(record.settle(seq, shown, live_agent)),
+            Action::SettleKeepingOpen => {
                 record.pinned = false;
-                let resumable = record.resumable();
-                Ok(park(
-                    record,
-                    seq,
-                    Park::Settled,
-                    live_agent.filter(|agent| resumable || agent.status != Status::Unknown),
-                ))
+                Ok(park(record, seq, Park::Settled, None))
             }
+            Action::CloseForGood { seq: asked } => record.close_for_good(asked, seq, live_agent),
             Action::Snooze(until) => {
-                let wakeable = record.resumable() && shown != Display::Working;
+                let busy = matches!(shown, Display::Working | Display::Blocked);
+                let wakeable = record.resumable() && !busy;
                 Ok(park(
                     record,
                     seq,
@@ -1057,23 +1287,33 @@ impl State {
         live: bool,
         shown: Display,
         action: Action,
-    ) -> Option<Action> {
+    ) -> Result<Option<Action>, Refusal> {
         let Action::Ensure(want) = action else {
-            return Some(action);
+            return Ok(Some(action));
         };
+        // An agent naming the state it wants (MCP) can't queue the close of a working pane: it
+        // may be its own.
+        if want == Want::Settled && shown == Display::Working {
+            return Err(Refusal("can't settle a working agent".into()));
+        }
         let record = self.records.get(key);
         let park = record.and_then(|r| r.park);
         let pinned = record.is_some_and(|r| r.pinned);
-        match want {
-            Want::Settled => (park != Some(Park::Settled)).then_some(Action::ToggleSettle),
-            Want::Unsettled => (park == Some(Park::Settled)).then_some(Action::ToggleSettle),
+        let settling = record.is_some_and(|r| r.settle_requested.is_some());
+        Ok(match want {
+            Want::Settled => {
+                (park != Some(Park::Settled) && !settling).then_some(Action::ToggleSettle)
+            }
+            Want::Unsettled => {
+                (park == Some(Park::Settled) || settling).then_some(Action::ToggleSettle)
+            }
             Want::Awake => matches!(park, Some(Park::Snoozed { .. })).then_some(Action::Wake),
             Want::Open => (!live).then_some(Action::Reopen),
             Want::Pinned => (!pinned).then_some(Action::TogglePin),
             Want::Unpinned => pinned.then_some(Action::TogglePin),
             Want::Read => shown.unseen().then_some(Action::ToggleUnread),
             Want::Unread => (!shown.unseen()).then_some(Action::ToggleUnread),
-        }
+        })
     }
 
     pub fn ordered(&self, agents: &[Observed]) -> Vec<Row> {
@@ -1087,6 +1327,9 @@ impl State {
                 park: record.and_then(|r| r.park),
                 pinned: record.is_some_and(|r| r.pinned),
                 changed_at: record.and_then(|r| r.changed_at),
+                status: agent.status,
+                settle_pending: record.is_some_and(|r| r.settle_requested.is_some()),
+                workspace_panes: agent.workspace_panes,
                 thread: agent.thread.clone(),
                 title: record.and_then(|r| r.title.clone()),
                 launched_by: record.and_then(|r| r.launched_by.clone()),
@@ -1104,6 +1347,9 @@ impl State {
                 park: record.park,
                 pinned: record.pinned,
                 changed_at: record.changed_at,
+                status: Status::Unknown,
+                settle_pending: false,
+                workspace_panes: 0,
                 thread: record.thread.clone(),
                 title: record.title.clone(),
                 launched_by: record.launched_by.clone(),
@@ -1153,7 +1399,7 @@ fn reopen_plan(key: &str, record: &Record, now: i64) -> Result<After, Refusal> {
 pub fn next_attention<'a>(rows: &'a [Row], current: Option<&str>) -> Option<&'a Row> {
     let mut queue: Vec<&Row> = rows
         .iter()
-        .filter(|row| row.live() && row.attention().is_some())
+        .filter(|row| row.attention().is_some())
         .collect();
     queue.sort_by_key(|row| row.attention());
     let start = current
@@ -1170,6 +1416,7 @@ pub fn next_attention<'a>(rows: &'a [Row], current: Option<&str>) -> Option<&'a 
 
 fn park(record: &mut Record, seq: u64, park: Park, closing: Option<&Observed>) -> After {
     record.park = Some(park);
+    record.settle_requested = None;
     record.unread = None;
     record.ack_seq = Some(seq);
     closing.map_or(After::Nothing, |agent| {
@@ -1485,7 +1732,7 @@ mod tests {
     }
 
     #[test]
-    fn triage_refuses_to_settle_or_mark_busy_agents_snooze_blocked_ones_or_forget_live_ones() {
+    fn triage_refuses_to_settle_or_mark_busy_agents_or_forget_live_ones() {
         let agents = [
             agent("working", Status::Working, 3),
             agent("blocked", Status::Blocked, 2),
@@ -1512,8 +1759,7 @@ mod tests {
                 (
                     "working".into(),
                     vec![
-                        "can't settle a working agent".to_owned(),
-                        "can't mark unread a working agent".into(),
+                        "can't mark unread a working agent".to_owned(),
                         "only closed threads can be forgotten".into(),
                     ]
                 ),
@@ -1522,7 +1768,6 @@ mod tests {
                     vec![
                         "can't settle a blocked agent".to_owned(),
                         "can't mark unread a blocked agent".into(),
-                        "can't snooze a blocked agent".into(),
                         "only closed threads can be forgotten".into(),
                     ]
                 ),
@@ -1601,6 +1846,145 @@ mod tests {
             shown(&state, &done),
             (Display::Unread(Unread::Manual), None)
         );
+    }
+
+    #[test]
+    fn coming_back_to_an_agent_marked_unread_reads_it() {
+        let a = agent("a", Status::Idle, 4);
+        let b = agent("b", Status::Idle, 7);
+        let focus = |agent: &Observed, focused| Observed {
+            focused,
+            ..agent.clone()
+        };
+        let mut state = State::default();
+        state.reconcile(GEN, &[focus(&a, true), b.clone()], NOW);
+        act(&mut state, &a, Action::ToggleUnread).unwrap();
+        let unread = (Display::Unread(Unread::Manual), None);
+
+        state.reconcile(GEN, &[focus(&a, true), b.clone()], NOW + 1);
+        assert_eq!(shown(&state, &a), unread, "still on it after marking it");
+        state.reconcile(GEN, &[a.clone(), b.clone()], NOW + 2);
+        state.reconcile(GEN, &[focus(&a, true), b.clone()], NOW + 3);
+        assert_eq!(
+            shown(&state, &a),
+            unread,
+            "the picker had focus, not another agent"
+        );
+
+        state.reconcile(GEN, &[a.clone(), focus(&b, true)], NOW + 4);
+        assert_eq!(
+            shown(&state, &a),
+            (Display::Unread(Unread::Left), None),
+            "away on another agent"
+        );
+        assert_eq!(
+            state.ordered(std::slice::from_ref(&a))[0].status_text(NOW + 4),
+            "unread",
+            "it still reads as unread"
+        );
+        state.reconcile(GEN, &[focus(&a, true), b.clone()], NOW + 5);
+        assert_eq!(shown(&state, &a), (Display::Idle, None), "came back to it");
+    }
+
+    #[test]
+    fn a_blocked_agent_snoozes_with_its_pane_open_until_it_asks_again() {
+        let blocked = resumable("a", Status::Blocked, 4);
+        let mut state = State::default();
+        state.reconcile(GEN, std::slice::from_ref(&blocked), NOW);
+        assert_eq!(
+            act(&mut state, &blocked, Action::Snooze(NOW + 3600)),
+            Ok(After::Nothing),
+            "its pane stays open"
+        );
+        let snoozed = Some(Park::Snoozed { until: NOW + 3600 });
+        state.reconcile(GEN, std::slice::from_ref(&blocked), NOW + 1);
+        assert_eq!(shown(&state, &blocked), (Display::Blocked, snoozed));
+        let answered = resumable("a", Status::Working, 5);
+        state.reconcile(GEN, std::slice::from_ref(&answered), NOW + 2);
+        assert_eq!(shown(&state, &answered), (Display::Working, snoozed));
+        let asks_again = resumable("a", Status::Blocked, 6);
+        state.reconcile(GEN, std::slice::from_ref(&asks_again), NOW + 3);
+        assert_eq!(shown(&state, &asks_again), (Display::Blocked, None));
+    }
+
+    #[test]
+    fn a_working_agent_asked_to_settle_settles_when_its_turn_ends() {
+        let working = resumable("a", Status::Working, 4);
+        let mut state = State::default();
+        state.reconcile(GEN, std::slice::from_ref(&working), NOW);
+        assert_eq!(
+            act(&mut state, &working, Action::ToggleSettle),
+            Ok(After::Nothing)
+        );
+        let row = state.ordered(std::slice::from_ref(&working)).remove(0);
+        assert_eq!(
+            (row.rank(), row.status_text(NOW)),
+            (Rank::Open, "working <1m · settles when done".into())
+        );
+        assert!(
+            state
+                .reconcile(GEN, std::slice::from_ref(&working), NOW + 1)
+                .closes
+                .is_empty()
+        );
+
+        let done = resumable("a", Status::Done, 5);
+        let closes = state
+            .reconcile(GEN, std::slice::from_ref(&done), NOW + 2)
+            .closes;
+        assert_eq!(shown(&state, &done), (Display::Idle, Some(Park::Settled)));
+        assert_eq!(
+            closes
+                .iter()
+                .map(|close| close.pane_id.as_str())
+                .collect::<Vec<_>>(),
+            ["pane-a"]
+        );
+        assert!(
+            state
+                .reconcile(GEN, std::slice::from_ref(&done), NOW + 3)
+                .closes
+                .is_empty(),
+            "closes once"
+        );
+    }
+
+    type Step = fn(&mut State, &Observed);
+
+    #[test]
+    fn a_pending_settle_keeps_a_sessionless_pane_and_yields_to_a_block_s_or_snooze() {
+        let mut state = State::default();
+        let plain = agent("plain", Status::Working, 4);
+        state.reconcile(GEN, std::slice::from_ref(&plain), NOW);
+        act(&mut state, &plain, Action::ToggleSettle).unwrap();
+        let idle = agent("plain", Status::Idle, 5);
+        let landed = state.reconcile(GEN, std::slice::from_ref(&idle), NOW + 1);
+        assert!(landed.closes.is_empty(), "never closed for good unasked");
+        assert_eq!(shown(&state, &idle), (Display::Idle, Some(Park::Settled)));
+
+        let unpend: [(&str, Step); 3] = [
+            ("it blocks on you", |state, _| {
+                let blocked = resumable("a", Status::Blocked, 5);
+                state.reconcile(GEN, std::slice::from_ref(&blocked), NOW + 1);
+            }),
+            ("s again", |state, working| {
+                act(state, working, Action::ToggleSettle).unwrap();
+            }),
+            ("a snooze", |state, working| {
+                act(state, working, Action::Snooze(NOW + 60)).unwrap();
+            }),
+        ];
+        for (unpending, step) in unpend {
+            let working = resumable("a", Status::Working, 4);
+            let mut state = State::default();
+            state.reconcile(GEN, std::slice::from_ref(&working), NOW);
+            act(&mut state, &working, Action::ToggleSettle).unwrap();
+            step(&mut state, &working);
+            let done = resumable("a", Status::Done, 6);
+            let landed = state.reconcile(GEN, std::slice::from_ref(&done), NOW + 2);
+            assert!(landed.closes.is_empty(), "{unpending}");
+            assert_ne!(shown(&state, &done).1, Some(Park::Settled), "{unpending}");
+        }
     }
 
     #[test]
@@ -1747,7 +2131,11 @@ mod tests {
         assert_eq!(text("w"), "working 4m");
         assert_eq!(text("d"), "done 4m");
         assert_eq!(text("i"), "idle 4m");
-        assert_eq!(text("fresh"), "blocked");
+        assert_eq!(
+            text("fresh"),
+            "blocked 4m",
+            "aged from when triage first saw it"
+        );
     }
 
     #[test]
@@ -1801,7 +2189,8 @@ mod tests {
         let labels = |now| -> Vec<&str> {
             snooze_presets(now, &tz())
                 .iter()
-                .map(|p| p.label())
+                .filter(|(_, offered)| *offered)
+                .map(|(p, _)| p.label())
                 .collect()
         };
         assert_eq!(
@@ -1816,7 +2205,7 @@ mod tests {
         );
         let untils: Vec<i64> = snooze_presets(ONE_PM, &tz())
             .iter()
-            .map(|p| p.until(ONE_PM, &tz()))
+            .map(|(p, _)| p.until(ONE_PM, &tz()))
             .collect();
         assert_eq!(
             untils,
@@ -2041,7 +2430,7 @@ mod tests {
     }
 
     #[test]
-    fn settling_closes_any_agent_and_snoozing_only_a_resumable_one() {
+    fn settling_closes_a_resumable_agent_a_confirmed_close_any_and_snoozing_only_a_resumable_one() {
         let (a, b) = (
             resumable("a", Status::Idle, 1),
             resumable("b", Status::Done, 2),
@@ -2067,7 +2456,7 @@ mod tests {
             .unwrap();
         assert_eq!(row.status_text(NOW), "snoozed · 1m · stays open");
 
-        let close = intended_close(&mut state, &plain, Action::ToggleSettle);
+        let close = intended_close(&mut state, &plain, Action::CloseForGood { seq: 3 });
         assert_eq!(
             confirm(&mut state, &close, std::slice::from_ref(&plain), GEN, NOW),
             Closing::CloseForGood(plain.pane_id.clone())
@@ -2113,7 +2502,7 @@ mod tests {
         let mut state = State::default();
         state.reconcile(GEN, std::slice::from_ref(&idle), NOW);
         state.records.get_mut(&idle.key).unwrap().restored_at = Some(NOW);
-        let close = intended_close(&mut state, &idle, Action::ToggleSettle);
+        let close = intended_close(&mut state, &idle, Action::CloseForGood { seq: 2 });
         let restored_unknown = Observed {
             status: Status::Unknown,
             seq: 3,
@@ -2126,11 +2515,367 @@ mod tests {
     }
 
     #[test]
+    fn undo_names_the_change_it_would_take_back() {
+        let a = resumable("a", Status::Idle, 2);
+        let done = resumable("d", Status::Done, 2);
+        let mut state = State::default();
+        state.reconcile(GEN, &[a.clone(), done.clone()], NOW);
+        let summary = |state: &State| {
+            state
+                .undo_summary()
+                .map(|(verb, label)| format!("{verb} {label}"))
+        };
+        assert_eq!(summary(&state), None);
+        for (agent, action, expected) in [
+            (&a, Action::TogglePin, "pin thread a"),
+            (&a, Action::TogglePin, "unpin thread a"),
+            (&a, Action::ToggleSettle, "settle thread a"),
+            (&a, Action::ToggleSettle, "unsettle thread a"),
+            (&a, Action::Snooze(NOW + 60), "snooze thread a"),
+            (&a, Action::Wake, "wake thread a"),
+            (&a, Action::ToggleUnread, "unread thread a"),
+            (&done, Action::ToggleUnread, "read thread d"),
+        ] {
+            act(&mut state, agent, action).unwrap();
+            assert_eq!(summary(&state).as_deref(), Some(expected), "{action:?}");
+        }
+        state.rename("a", Some("renamed".into()), NOW);
+        assert_eq!(summary(&state).as_deref(), Some("rename renamed"));
+    }
+
+    #[test]
+    fn only_a_known_sessionless_agent_can_be_closed_for_good() {
+        let row = |agent: &Observed| {
+            let mut state = State::default();
+            state.reconcile(GEN, std::slice::from_ref(agent), NOW);
+            state.ordered(std::slice::from_ref(agent)).remove(0)
+        };
+        assert!(row(&agent("plain", Status::Idle, 2)).can_close_for_good());
+        assert!(row(&agent("done", Status::Done, 2)).can_close_for_good());
+        assert!(!row(&resumable("resumable", Status::Idle, 2)).can_close_for_good());
+        assert!(!row(&agent("unknown", Status::Unknown, 2)).can_close_for_good());
+        assert!(!row(&agent("working", Status::Working, 2)).can_close_for_good());
+    }
+
+    #[test]
+    fn a_plain_settle_never_closes_an_agent_for_good_only_a_confirmed_close_does() {
+        let idle = agent("terminal:t1", Status::Idle, 2);
+        let other = agent("terminal:t2", Status::Idle, 3);
+        let mut state = State::default();
+        state.reconcile(GEN, &[idle.clone(), other.clone()], NOW);
+        assert_eq!(
+            act(&mut state, &idle, Action::ToggleSettle),
+            Ok(After::Nothing),
+            "a settle that raced past the prompt keeps the pane"
+        );
+        let row = state.ordered(std::slice::from_ref(&idle)).remove(0);
+        assert_eq!(row.status_text(NOW), "settled · stays open");
+        assert!(!row.can_close_for_good(), "unsettling it closes nothing");
+
+        assert!(matches!(
+            act(&mut state, &other, Action::CloseForGood { seq: 3 }),
+            Ok(After::ClosePane(_))
+        ));
+        let working = agent("terminal:t2", Status::Working, 4);
+        assert_eq!(
+            act(&mut state, &working, Action::CloseForGood { seq: 4 }),
+            Err(Refusal("can't close a working agent".into())),
+            "a close confirmed before the agent got busy again waits for a new ask"
+        );
+    }
+
+    #[test]
+    fn a_pending_settle_ends_with_its_session_and_never_closes_a_reopened_thread() {
+        let working = resumable("a", Status::Working, 4);
+        let mut state = State::default();
+        state.reconcile(GEN, std::slice::from_ref(&working), NOW);
+        act(&mut state, &working, Action::ToggleSettle).unwrap();
+        state.reconcile(GEN, &[], NOW + 1);
+        state.reconcile(GEN, &[], NOW + 12);
+        assert_eq!(state.records["a"].settle_requested, None);
+        assert!(matches!(
+            state.apply("a", None, Action::Reopen, NOW + 20),
+            Ok(After::Reopen(_))
+        ));
+        let reopened = resumable("a", Status::Idle, 5);
+        let landed = state.reconcile(GEN, std::slice::from_ref(&reopened), NOW + 30);
+        assert!(landed.closes.is_empty());
+        assert_eq!(shown(&state, &reopened).1, None);
+
+        let mut state = State::default();
+        state.reconcile(GEN, std::slice::from_ref(&working), NOW);
+        act(&mut state, &working, Action::ToggleSettle).unwrap();
+        state.reconcile("g2", std::slice::from_ref(&working), NOW + 1);
+        assert_eq!(
+            state.records["a"].settle_requested, None,
+            "a Herdr restart relaunches it: that turn is not the one you asked about"
+        );
+    }
+
+    #[test]
+    fn undo_follows_an_unread_mark_after_you_leave_and_a_settle_after_it_lands() {
+        let a = agent("a", Status::Idle, 4);
+        let b = Observed {
+            focused: true,
+            ..agent("b", Status::Idle, 7)
+        };
+        let mut state = State::default();
+        state.reconcile(GEN, &[a.clone(), b.clone()], NOW);
+        act(&mut state, &a, Action::ToggleUnread).unwrap();
+        state.reconcile(GEN, &[a.clone(), b.clone()], NOW + 1);
+        assert_eq!(state.records["a"].unread, Some(Unread::Left));
+        assert!(state.undo(NOW + 2).is_ok());
+        assert_eq!(state.records["a"].unread, None, "undo takes the mark back");
+
+        let working = agent("w", Status::Working, 4);
+        state.reconcile(GEN, std::slice::from_ref(&working), NOW + 3);
+        act(&mut state, &working, Action::ToggleSettle).unwrap();
+        let idle = agent("w", Status::Idle, 5);
+        state.reconcile(GEN, std::slice::from_ref(&idle), NOW + 4);
+        assert_eq!(state.undo_summary().map(|(verb, _)| verb), Some("settle"));
+        state.undo(NOW + 5).unwrap();
+        assert_eq!(shown(&state, &idle).1, None, "undo unsettles what landed");
+    }
+
+    #[test]
+    fn undo_does_not_bring_back_a_settle_called_off_before_the_turn_ended() {
+        let working = resumable("a", Status::Working, 4);
+        let mut state = State::default();
+        state.reconcile(GEN, std::slice::from_ref(&working), NOW);
+        act(&mut state, &working, Action::ToggleSettle).unwrap();
+        act(&mut state, &working, Action::ToggleSettle).unwrap();
+        let done = resumable("a", Status::Done, 5);
+        state.reconcile(GEN, std::slice::from_ref(&done), NOW + 1);
+        let _ = state.undo(NOW + 2);
+        assert_eq!(state.records["a"].settle_requested, None);
+        let landed = state.reconcile(GEN, std::slice::from_ref(&done), NOW + 3);
+        assert!(landed.closes.is_empty());
+    }
+
+    #[test]
+    fn a_landed_settle_marks_only_its_own_undo_as_closing() {
+        let working = resumable("a", Status::Working, 4);
+        let mut state = State::default();
+        state.reconcile(GEN, std::slice::from_ref(&working), NOW);
+        act(&mut state, &working, Action::ToggleSettle).unwrap();
+        state.rename("a", Some("renamed".into()), NOW);
+        let done = resumable("a", Status::Done, 5);
+        let close = state
+            .reconcile(GEN, std::slice::from_ref(&done), NOW + 1)
+            .closes
+            .remove(0);
+        assert!(matches!(
+            confirm(
+                &mut state,
+                &close,
+                std::slice::from_ref(&done),
+                GEN,
+                NOW + 1
+            ),
+            Closing::Close(_)
+        ));
+        state.report_close(&close, true);
+        let (_, after) = state.undo(NOW + 2).unwrap();
+        assert_eq!(after, After::Nothing, "undoing the rename reopens nothing");
+    }
+
+    #[test]
+    fn keeping_a_pane_open_holds_even_once_the_agent_becomes_resumable() {
+        let idle = resumable("a", Status::Idle, 2);
+        let mut state = State::default();
+        state.reconcile(GEN, std::slice::from_ref(&idle), NOW);
+        assert_eq!(
+            act(&mut state, &idle, Action::SettleKeepingOpen),
+            Ok(After::Nothing)
+        );
+        assert_eq!(shown(&state, &idle).1, Some(Park::Settled));
+    }
+
+    #[test]
+    fn a_confirmed_close_holds_only_for_the_turn_it_was_asked_about() {
+        let idle = agent("t", Status::Idle, 2);
+        let mut state = State::default();
+        state.reconcile(GEN, std::slice::from_ref(&idle), NOW);
+        let newer = agent("t", Status::Idle, 3);
+        state.reconcile(GEN, std::slice::from_ref(&newer), NOW + 1);
+        assert_eq!(
+            act(&mut state, &newer, Action::CloseForGood { seq: 2 }),
+            Err(Refusal("it has done something new since you asked".into()))
+        );
+        assert!(matches!(
+            act(&mut state, &newer, Action::CloseForGood { seq: 3 }),
+            Ok(After::ClosePane(_))
+        ));
+    }
+
+    #[test]
+    fn a_pending_settle_belongs_to_the_terminal_that_was_working() {
+        let working = resumable("a", Status::Working, 4);
+        let mut state = State::default();
+        state.reconcile(GEN, std::slice::from_ref(&working), NOW);
+        act(&mut state, &working, Action::ToggleSettle).unwrap();
+        let elsewhere = Observed {
+            terminal_id: "term-other".into(),
+            pane_id: "pane-other".into(),
+            ..resumable("a", Status::Idle, 5)
+        };
+        let landed = state.reconcile(GEN, std::slice::from_ref(&elsewhere), NOW + 1);
+        assert!(landed.closes.is_empty());
+        assert_eq!(shown(&state, &elsewhere).1, None);
+        assert_eq!(state.records["a"].settle_requested, None);
+    }
+
+    #[test]
+    fn pinning_a_snoozed_agent_calls_off_its_pending_settle() {
+        let working = resumable("a", Status::Working, 4);
+        let mut state = State::default();
+        state.reconcile(GEN, std::slice::from_ref(&working), NOW);
+        act(&mut state, &working, Action::Snooze(NOW + 3600)).unwrap();
+        act(&mut state, &working, Action::ToggleSettle).unwrap();
+        act(&mut state, &working, Action::TogglePin).unwrap();
+        assert_eq!(state.records["a"].settle_requested, None);
+    }
+
+    #[test]
+    fn a_confirmed_close_for_good_is_not_waived_through_restore_grace() {
+        let idle = agent("terminal:t1", Status::Idle, 2);
+        let mut state = State::default();
+        state.reconcile(GEN, std::slice::from_ref(&idle), NOW);
+        state.records.get_mut(&idle.key).unwrap().restored_at = Some(NOW);
+        let close = intended_close(&mut state, &idle, Action::CloseForGood { seq: 2 });
+        let newer = Observed {
+            seq: 3,
+            ..idle.clone()
+        };
+        assert_eq!(
+            confirm(&mut state, &close, &[newer], GEN, NOW + 1),
+            Closing::Skip
+        );
+    }
+
+    #[test]
+    fn marking_unread_while_another_agent_has_focus_reads_it_on_the_next_visit() {
+        let a = agent("a", Status::Idle, 4);
+        let b = Observed {
+            focused: true,
+            ..agent("b", Status::Idle, 7)
+        };
+        let mut state = State::default();
+        state.reconcile(GEN, &[a.clone(), b.clone()], NOW);
+        act(&mut state, &a, Action::ToggleUnread).unwrap();
+        state.mark_left_if_elsewhere("a", &[a.clone(), b.clone()]);
+        let focused_a = Observed {
+            focused: true,
+            ..a.clone()
+        };
+        state.reconcile(GEN, &[focused_a, agent("b", Status::Idle, 7)], NOW + 1);
+        assert_eq!(shown(&state, &a), (Display::Idle, None));
+    }
+
+    #[test]
+    fn a_reopen_plan_is_stale_once_its_thread_was_adopted_under_a_new_session() {
+        let kept = resumable("a", Status::Idle, 4);
+        let mut state = State::default();
+        closed_settled(&mut state, &kept);
+        let Ok(After::Reopen(plan)) = state.apply("a", None, Action::Reopen, NOW + 20) else {
+            panic!("a reopen")
+        };
+        assert!(state.awaits_reopen(&plan));
+        state.report_reopen(&plan, "pane-new", GEN, NOW + 20);
+        let resumed = Observed {
+            pane_id: "pane-new".into(),
+            ..resumable("b", Status::Idle, 9)
+        };
+        state.reconcile(GEN, std::slice::from_ref(&resumed), NOW + 21);
+        assert!(state.records.contains_key("b") && !state.records.contains_key("a"));
+        assert!(
+            !state.awaits_reopen(&plan),
+            "adopted under its new session: launch nothing"
+        );
+    }
+
+    #[test]
+    fn a_reopen_already_launched_is_found_under_the_lock() {
+        let kept = resumable("a", Status::Idle, 4);
+        let mut state = State::default();
+        closed_settled(&mut state, &kept);
+        let Ok(After::Reopen(plan)) = state.apply("a", None, Action::Reopen, NOW) else {
+            panic!("a reopen")
+        };
+        assert_eq!(state.launched_reopen(&plan, GEN, NOW), None);
+        state.report_reopen(&plan, "pane-new", GEN, NOW);
+        assert_eq!(
+            state.launched_reopen(&plan, GEN, NOW + 5),
+            Some("pane-new".into())
+        );
+        assert_eq!(state.launched_reopen(&plan, "g2", NOW + 5), None);
+    }
+
+    #[test]
+    fn undoing_an_unrelated_change_keeps_the_unread_you_left() {
+        let a = agent("a", Status::Idle, 4);
+        let b = Observed {
+            focused: true,
+            ..agent("b", Status::Idle, 7)
+        };
+        let mut state = State::default();
+        state.reconcile(GEN, &[a.clone(), b.clone()], NOW);
+        act(&mut state, &a, Action::ToggleUnread).unwrap();
+        state.reconcile(GEN, &[a.clone(), b.clone()], NOW + 1);
+        state.rename("a", Some("x".into()), NOW + 2);
+        state.undo(NOW + 3).unwrap();
+        assert_eq!(state.records["a"].unread, Some(Unread::Left));
+    }
+
+    #[test]
+    fn a_snooze_time_already_past_is_refused() {
+        let idle = agent("a", Status::Idle, 4);
+        let mut state = State::default();
+        state.reconcile(GEN, std::slice::from_ref(&idle), NOW);
+        assert_eq!(
+            state.apply("a", Some(&idle), Action::Snooze(NOW), NOW),
+            Err(Refusal("that time has passed".into()))
+        );
+    }
+
+    #[test]
+    fn unpinning_names_itself_even_when_it_calls_off_a_settle() {
+        let working = resumable("a", Status::Working, 4);
+        let mut state = State::default();
+        state.reconcile(GEN, std::slice::from_ref(&working), NOW);
+        act(&mut state, &working, Action::TogglePin).unwrap();
+        act(&mut state, &working, Action::ToggleSettle).unwrap();
+        act(&mut state, &working, Action::TogglePin).unwrap();
+        assert_eq!(state.undo_summary().map(|(verb, _)| verb), Some("unpin"));
+    }
+
+    #[test]
+    fn the_last_pane_of_a_workspace_is_not_offered_a_close_for_good() {
+        let last = Observed {
+            workspace_panes: 1,
+            ..agent("a", Status::Idle, 2)
+        };
+        let mut state = State::default();
+        state.reconcile(GEN, std::slice::from_ref(&last), NOW);
+        assert!(!state.ordered(std::slice::from_ref(&last))[0].can_close_for_good());
+    }
+
+    #[test]
+    fn undo_of_marking_a_parked_thread_unread_says_unread() {
+        let idle = agent("a", Status::Idle, 4);
+        let mut state = State::default();
+        state.reconcile(GEN, std::slice::from_ref(&idle), NOW);
+        act(&mut state, &idle, Action::ToggleSettle).unwrap();
+        act(&mut state, &idle, Action::ToggleUnread).unwrap();
+        assert_eq!(state.undo_summary().map(|(verb, _)| verb), Some("unread"));
+    }
+
+    #[test]
     fn a_settle_does_not_close_a_pane_snoozed_since() {
         let idle = agent("terminal:t1", Status::Idle, 2);
         let mut state = State::default();
         state.reconcile(GEN, std::slice::from_ref(&idle), NOW);
-        let close = intended_close(&mut state, &idle, Action::ToggleSettle);
+        let close = intended_close(&mut state, &idle, Action::CloseForGood { seq: 2 });
         act(&mut state, &idle, Action::Snooze(NOW + 3600)).unwrap();
         assert_eq!(
             confirm(&mut state, &close, std::slice::from_ref(&idle), GEN, NOW),
@@ -3085,14 +3830,15 @@ mod tests {
         assert!(
             state
                 .reconcile(GEN, std::slice::from_ref(&idle), NOW)
+                .exit_checks
                 .is_empty()
         );
         assert_eq!(
-            state.reconcile(GEN, &[], NOW + 1),
+            state.reconcile(GEN, &[], NOW + 1).exit_checks,
             [NOW + 1 + EXIT_GRACE_SECS]
         );
         assert!(
-            state.reconcile(GEN, &[], NOW + 3).is_empty(),
+            state.reconcile(GEN, &[], NOW + 3).exit_checks.is_empty(),
             "armed once per disappearance"
         );
     }
@@ -3124,9 +3870,75 @@ mod tests {
         let mut state = State::default();
         state.reconcile(GEN, &agents, NOW);
         assert_eq!(
-            state.reconcile(GEN, &[], NOW + 1),
+            state.reconcile(GEN, &[], NOW + 1).exit_checks,
             [NOW + 1 + EXIT_GRACE_SECS]
         );
+    }
+
+    #[test]
+    fn reconcile_reports_each_snooze_that_comes_due_once() {
+        let live = resumable("live", Status::Idle, 4);
+        let closed = resumable("closed", Status::Idle, 5);
+        let mut state = State::default();
+        state.reconcile(GEN, &[live.clone(), closed.clone()], NOW);
+        act(&mut state, &live, Action::Snooze(NOW + 60)).unwrap();
+        act(&mut state, &closed, Action::Snooze(NOW + 60)).unwrap();
+        state.reconcile(GEN, std::slice::from_ref(&live), NOW + 1);
+        state.reconcile(GEN, std::slice::from_ref(&live), NOW + 20);
+        assert!(
+            state
+                .reconcile(GEN, std::slice::from_ref(&live), NOW + 59)
+                .woke
+                .is_empty()
+        );
+        let mut woke = state
+            .reconcile(GEN, std::slice::from_ref(&live), NOW + 60)
+            .woke;
+        woke.sort();
+        assert_eq!(woke, ["thread closed", "thread live"]);
+        assert!(
+            state
+                .reconcile(GEN, std::slice::from_ref(&live), NOW + 61)
+                .woke
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn a_snooze_coming_due_on_the_agent_you_are_on_is_not_announced() {
+        let idle = resumable("a", Status::Idle, 4);
+        let mut state = State::default();
+        state.reconcile(GEN, std::slice::from_ref(&idle), NOW);
+        act(&mut state, &idle, Action::Snooze(NOW + 60)).unwrap();
+        let focused = Observed {
+            focused: true,
+            ..idle.clone()
+        };
+        let woke = state
+            .reconcile(GEN, std::slice::from_ref(&focused), NOW + 60)
+            .woke;
+        assert!(woke.is_empty(), "{woke:?}");
+        assert_eq!(shown(&state, &idle), (Display::Idle, None));
+    }
+
+    #[test]
+    fn next_reopens_a_closed_thread_that_woke_after_live_agents_that_block() {
+        let blocked = resumable("blocked", Status::Blocked, 4);
+        let closed = resumable("closed", Status::Idle, 5);
+        let mut state = State::default();
+        state.reconcile(GEN, &[blocked.clone(), closed.clone()], NOW);
+        act(&mut state, &closed, Action::Snooze(NOW + 60)).unwrap();
+        state.reconcile(GEN, std::slice::from_ref(&blocked), NOW + 1);
+        state.reconcile(GEN, std::slice::from_ref(&blocked), NOW + 20);
+        state.reconcile(GEN, std::slice::from_ref(&blocked), NOW + 60);
+        let rows = state.ordered(std::slice::from_ref(&blocked));
+        let order: Vec<&str> = std::iter::successors(next_attention(&rows, None), |row| {
+            next_attention(&rows, Some(&row.key)).filter(|next| next.key != "blocked")
+        })
+        .map(|row| row.key.as_str())
+        .collect();
+        assert_eq!(order, ["blocked", "closed"]);
+        assert!(!rows.iter().find(|row| row.key == "closed").unwrap().live());
     }
 
     #[test]

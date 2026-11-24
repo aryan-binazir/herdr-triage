@@ -93,7 +93,7 @@ fn run_picker() -> io::Result<()> {
     let t3 = t3::Worker::start(&store::state_root());
     let mut t3_sent = Vec::new();
     let mut picker = Picker::new(shown.items(), focus.as_deref(), &shown.herdr.open_sections);
-    picker.set_undoable(shown.herdr.undoable);
+    picker.set_undo(shown.herdr.undo.clone());
 
     let mut terminal = ratatui::init();
     let started = Instant::now();
@@ -139,6 +139,7 @@ fn run_picker() -> io::Result<()> {
             Effect::Close => break Ok(Leave::Close),
             Effect::Focus(pane) => break Ok(Leave::Focus(pane)),
             Effect::OpenT3(link) => break Ok(Leave::OpenT3(link)),
+            Effect::NewAgent(agent) => break Ok(Leave::NewAgent(agent)),
             Effect::T3 { thread, op } => {
                 if t3.request(&thread, op) {
                     t3_sent.push(picker.sent(&t3::row_key(&thread)));
@@ -170,12 +171,19 @@ fn run_picker() -> io::Result<()> {
         }
     };
     ratatui::restore();
-    match outcome? {
+    leave(&mut session, outcome?)
+}
+
+fn leave(session: &mut Session, leave: Leave) -> io::Result<()> {
+    match leave {
         Leave::Close => Ok(()),
         Leave::Focus(pane) => session.focus(&pane),
         Leave::OpenT3(link) => {
             t3::open(&link).or_else(|error| session.notify(&format!("Could not open T3: {error}")))
         }
+        Leave::NewAgent(agent) => session.start_agent(&agent).or_else(|error| {
+            session.notify(&format!("Could not start {}: {error}", agent.command))
+        }),
     }
 }
 
@@ -207,6 +215,8 @@ fn apply(
     action: Action,
 ) -> Option<Leave> {
     let from = picker.selected_row().unwrap_or(0);
+    let pending = |item: &picker::Item| item.row.key == key && item.row.settle_pending;
+    let calls_off = action == Action::ToggleSettle && picker.items().iter().any(pending);
     match session.act(key, action) {
         Ok(Outcome::Reopened) => return Some(Leave::Close),
         Ok(Outcome::Refused(refusal)) => {
@@ -222,7 +232,18 @@ fn apply(
             if let Some(notice) = notice {
                 picker.inform(notice);
             }
-            if matches!(action, Action::ToggleSettle | Action::Snooze(_)) {
+            if action == Action::ToggleSettle && picker.items().iter().any(pending) {
+                picker.inform("settles when its turn ends".into());
+            } else if calls_off {
+                picker.inform("won't settle when its turn ends".into());
+            }
+            if matches!(
+                action,
+                Action::ToggleSettle
+                    | Action::SettleKeepingOpen
+                    | Action::CloseForGood { .. }
+                    | Action::Snooze(_)
+            ) {
                 picker.move_on_from(&key, from);
             }
             if let Some(error) = wake_failed {
@@ -266,6 +287,7 @@ enum Leave {
     Close,
     Focus(String),
     OpenT3(String),
+    NewAgent(picker::NewAgent),
 }
 
 struct Shown {
@@ -289,7 +311,7 @@ fn show(picker: &mut Picker, shown: &mut Shown, view: io::Result<View>) {
         Ok(view) => {
             shown.herdr = view;
             picker.refresh(shown.items(), &shown.herdr.open_sections);
-            picker.set_undoable(shown.herdr.undoable);
+            picker.set_undo(shown.herdr.undo.clone());
         }
         Err(error) => picker.notify(format!("herdr: {error}")),
     }

@@ -15,6 +15,7 @@ use serde_json::{Map, Value, json};
 use crate::triage::Status;
 
 const TIMEOUT: Duration = Duration::from_secs(3);
+const WORKTREE_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Agent {
@@ -102,6 +103,21 @@ pub struct Refused {
     pub message: String,
 }
 
+impl Workspace {
+    pub fn project_label(&self) -> String {
+        match &self.worktree {
+            Some(Checkout {
+                repo_name,
+                is_linked_worktree: true,
+                ..
+            }) if !self.label.starts_with(repo_name.as_str()) => {
+                format!("{repo_name}/{}", self.label)
+            }
+            _ => self.label.clone(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct Tab {
     pub tab_id: String,
@@ -141,7 +157,16 @@ impl Herdr {
     }
 
     fn call(&mut self, method: &str, params: &Value) -> io::Result<Value> {
-        self.request(method, params, TIMEOUT)?
+        self.call_within(method, params, TIMEOUT)
+    }
+
+    fn call_within(
+        &mut self,
+        method: &str,
+        params: &Value,
+        timeout: Duration,
+    ) -> io::Result<Value> {
+        self.request(method, params, timeout)?
             .map_err(|refused| io::Error::other(format!("{method}: {}", refused.message)))
     }
 
@@ -167,7 +192,7 @@ impl Herdr {
         // Herdr answers one request per connection, then closes it.
         let mut stream = UnixStream::connect(&self.path)?;
         stream.set_read_timeout(Some(timeout))?;
-        stream.set_write_timeout(Some(TIMEOUT))?;
+        stream.set_write_timeout(Some(timeout))?;
         let mut bytes = serde_json::to_vec(&request).map_err(io::Error::other)?;
         bytes.push(b'\n');
         stream.write_all(&bytes)?;
@@ -292,6 +317,24 @@ impl Herdr {
             .as_str()
             .map(str::to_owned)
             .ok_or_else(|| io::Error::other("tab.create returned no pane"))
+    }
+
+    pub fn repository_root(&mut self, workspace_id: Option<&str>) -> io::Result<String> {
+        let params = workspace_id.map_or_else(|| json!({}), |id| json!({"workspace_id": id}));
+        let result = self.call("worktree.list", &params)?;
+        result["source"]["repo_root"]
+            .as_str()
+            .map(str::to_owned)
+            .ok_or_else(|| io::Error::other("worktree.list returned no repository"))
+    }
+
+    pub fn create_worktree(&mut self, root: &str, branch: &str) -> io::Result<String> {
+        let params = json!({"cwd": root, "branch": branch, "focus": true});
+        let result = self.call_within("worktree.create", &params, WORKTREE_TIMEOUT)?;
+        result["root_pane"]["pane_id"]
+            .as_str()
+            .map(str::to_owned)
+            .ok_or_else(|| io::Error::other("worktree.create returned no pane"))
     }
 
     pub fn run_command(&mut self, pane_id: &str, command: &str) -> io::Result<()> {

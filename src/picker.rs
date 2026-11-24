@@ -36,6 +36,26 @@ pub enum Effect {
     Rename { key: String, title: Option<String> },
     Undo,
     ToggleSection(Section),
+    NewAgent(NewAgent),
+}
+
+pub const NEW_AGENTS: [&str; 4] = ["claude", "codex", "opencode", "pi"];
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewAgent {
+    pub workspace_id: Option<String>,
+    pub cwd: Option<String>,
+    pub branch: Option<String>,
+    pub command: &'static str,
+}
+
+#[derive(Debug, Clone)]
+pub struct NewAgentPrompt {
+    pub workspace_id: Option<String>,
+    pub label: String,
+    cwd: Option<String>,
+    pub branch: Option<String>,
+    pub typing_branch: Option<String>,
 }
 
 const T3_READ: &str = "T3 marks a thread read when you open it";
@@ -71,11 +91,19 @@ pub struct ForgetPrompt {
 }
 
 #[derive(Debug, Clone)]
+pub struct ClosePrompt {
+    pub key: String,
+    pub label: String,
+    seq: u64,
+}
+
+#[derive(Debug, Clone)]
 pub struct SnoozePrompt {
     pub key: String,
     t3_thread: Option<String>,
     pub label: String,
-    pub presets: Vec<SnoozePreset>,
+    pub presets: Vec<(SnoozePreset, bool)>,
+    shown_at: i64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -103,8 +131,10 @@ pub struct Picker {
     selected: usize,
     snooze: Option<SnoozePrompt>,
     forget: Option<ForgetPrompt>,
+    close: Option<ClosePrompt>,
     rename: Option<RenamePrompt>,
-    undoable: bool,
+    new_agent: Option<NewAgentPrompt>,
+    undo: Option<(&'static str, String)>,
     message: Option<String>,
     message_is_error: bool,
     offset: usize,
@@ -135,8 +165,10 @@ impl Picker {
             selected: 0,
             snooze: None,
             forget: None,
+            close: None,
             rename: None,
-            undoable: false,
+            new_agent: None,
+            undo: None,
             message: None,
             message_is_error: false,
             offset: 0,
@@ -211,33 +243,62 @@ impl Picker {
         if self.rename.is_some() {
             return self.rename_key(key, ctrl);
         }
+        if self.new_agent.is_some() {
+            return self.new_agent_key(key, ctrl);
+        }
+        if let Some(prompt) = self.close.take() {
+            let action = match key.code {
+                KeyCode::Char('y') if key.modifiers.is_empty() => {
+                    Action::CloseForGood { seq: prompt.seq }
+                }
+                KeyCode::Char('n') if key.modifiers.is_empty() => Action::SettleKeepingOpen,
+                _ => return Effect::None,
+            };
+            return Effect::Apply {
+                key: prompt.key,
+                action,
+            };
+        }
         if let Some(prompt) = self.forget.take() {
             return match key.code {
                 KeyCode::Char('y') => Effect::Apply {
                     key: prompt.key,
                     action: Action::Forget,
                 },
-                KeyCode::Char('q') => Effect::Close,
                 _ => Effect::None,
             };
         }
         if let Some(prompt) = &self.snooze {
             let choice = match key.code {
                 KeyCode::Char(c @ '1'..='9') => c as usize - '1' as usize,
-                KeyCode::Char('q') => return Effect::Close,
-                KeyCode::Esc => {
+                KeyCode::Esc | KeyCode::Char('q') => {
                     self.snooze = None;
                     return Effect::None;
                 }
                 _ => return Effect::None,
             };
-            let Some(until) = prompt
-                .presets
-                .get(choice)
-                .map(|preset| preset.until(now, tz))
-            else {
+            let Some(&(preset, offered)) = prompt.presets.get(choice) else {
                 return Effect::None;
             };
+            let from = match preset {
+                SnoozePreset::OneHour | SnoozePreset::ThreeHours => now,
+                SnoozePreset::ThisEvening
+                | SnoozePreset::TomorrowMorning
+                | SnoozePreset::NextWeek => prompt.shown_at,
+            };
+            let until = preset.until(from, tz);
+            let refused = if !offered {
+                Some("is under 30 minutes away")
+            } else if until <= now {
+                Some("has passed")
+            } else {
+                None
+            };
+            if let Some(why) = refused {
+                self.notify(format!("{} {why}", preset.label()));
+                self.snooze = None;
+                return Effect::None;
+            }
             let effect = match &prompt.t3_thread {
                 Some(thread) => Effect::T3 {
                     thread: thread.clone(),
@@ -295,7 +356,19 @@ impl Picker {
                     .get(row)
                     .map_or(Effect::None, |&i| self.open(i));
             }
-            KeyCode::Char('s') => return apply(self, Action::ToggleSettle),
+            KeyCode::Char('s') => {
+                if let Some(item) = self.selected()
+                    && item.row.can_close_for_good()
+                {
+                    self.close = Some(ClosePrompt {
+                        key: item.row.key.clone(),
+                        label: item.row.label().to_owned(),
+                        seq: item.row.seq,
+                    });
+                    return Effect::None;
+                }
+                return apply(self, Action::ToggleSettle);
+            }
             KeyCode::Char('u') => return apply(self, Action::ToggleUnread),
             KeyCode::Char('p') => return apply(self, Action::TogglePin),
             KeyCode::Char('U') => return Effect::Undo,
@@ -308,6 +381,7 @@ impl Picker {
                     });
                 }
             }
+            KeyCode::Char('n') => self.new_agent = Some(self.prompt_for_new_agent()),
             KeyCode::Char('D') => {
                 let Some(item) = self.selected() else {
                     return Effect::None;
@@ -338,6 +412,7 @@ impl Picker {
                     t3_thread: None,
                     label: item.row.label().to_owned(),
                     presets: snooze_presets(now, tz),
+                    shown_at: now,
                 });
             }
             _ => {}
@@ -368,6 +443,7 @@ impl Picker {
                     t3_thread: Some(thread),
                     label: item.row.label().to_owned(),
                     presets: snooze_presets(now, tz),
+                    shown_at: now,
                 });
                 return Some(Effect::None);
             }
@@ -538,7 +614,11 @@ impl Picker {
     }
 
     fn prompt_open(&self) -> bool {
-        self.snooze.is_some() || self.rename.is_some() || self.forget.is_some()
+        self.snooze.is_some()
+            || self.rename.is_some()
+            || self.forget.is_some()
+            || self.close.is_some()
+            || self.new_agent.is_some()
     }
 
     pub fn move_on_from(&mut self, key: &str, from: usize) {
@@ -554,10 +634,8 @@ impl Picker {
             .iter()
             .enumerate()
             .filter_map(|(at, &entry)| match entry {
-                Entry::Agent(i) if self.items[i].target != Target::Closed => {
-                    Some((self.items[i].row.attention()?, at))
-                }
-                _ => None,
+                Entry::Agent(i) => Some((self.items[i].row.attention()?, at)),
+                Entry::Section { .. } => None,
             })
             .min();
         self.selected = needs_you.map_or_else(
@@ -604,6 +682,77 @@ impl Picker {
         &self.filter
     }
 
+    fn prompt_for_new_agent(&self) -> NewAgentPrompt {
+        let item = self
+            .selected()
+            .filter(|item| !matches!(item.target, Target::T3 { .. }));
+        let thread = item.map(|item| &item.row.thread);
+        let workspace_id = thread.and_then(|thread| thread.workspace_id.clone());
+        let label = match (item, &workspace_id) {
+            (Some(item), Some(_)) => {
+                (item.row.thread.workspace_label.clone()).unwrap_or_else(|| item.location.clone())
+            }
+            _ => "this workspace".into(),
+        };
+        NewAgentPrompt {
+            label,
+            cwd: thread.and_then(|thread| thread.cwd.clone()),
+            workspace_id,
+            branch: None,
+            typing_branch: None,
+        }
+    }
+
+    fn new_agent_key(&mut self, key: KeyEvent, ctrl: bool) -> Effect {
+        let Some(prompt) = &mut self.new_agent else {
+            return Effect::None;
+        };
+        if let Some(text) = &mut prompt.typing_branch {
+            match key.code {
+                KeyCode::Enter => {
+                    let branch = text.trim().to_owned();
+                    prompt.branch = Some(branch).filter(|branch| !branch.is_empty());
+                    prompt.typing_branch = None;
+                }
+                KeyCode::Esc => prompt.typing_branch = None,
+                KeyCode::Backspace => drop(text.pop()),
+                KeyCode::Char('u') if ctrl => text.clear(),
+                KeyCode::Char(c) if !ctrl && !c.is_whitespace() => text.push(c),
+                _ => {}
+            }
+            return Effect::None;
+        }
+        match key.code {
+            KeyCode::Char(c @ '1'..='9') => {
+                let Some(&command) = NEW_AGENTS.get(c as usize - '1' as usize) else {
+                    return Effect::None;
+                };
+                let Some(prompt) = self.new_agent.take() else {
+                    return Effect::None;
+                };
+                Effect::NewAgent(NewAgent {
+                    workspace_id: prompt.workspace_id,
+                    cwd: prompt.cwd,
+                    branch: prompt.branch,
+                    command,
+                })
+            }
+            KeyCode::Char('w') => {
+                prompt.typing_branch = Some(prompt.branch.clone().unwrap_or_default());
+                Effect::None
+            }
+            KeyCode::Esc | KeyCode::Char('q') => {
+                self.new_agent = None;
+                Effect::None
+            }
+            _ => Effect::None,
+        }
+    }
+
+    pub fn new_agent_prompt(&self) -> Option<&NewAgentPrompt> {
+        self.new_agent.as_ref()
+    }
+
     fn rename_key(&mut self, key: KeyEvent, ctrl: bool) -> Effect {
         let Some(prompt) = &mut self.rename else {
             return Effect::None;
@@ -630,12 +779,14 @@ impl Picker {
         Effect::None
     }
 
-    pub fn set_undoable(&mut self, undoable: bool) {
-        self.undoable = undoable;
+    pub fn set_undo(&mut self, undo: Option<(&'static str, String)>) {
+        self.undo = undo;
     }
 
-    pub fn undoable(&self) -> bool {
-        self.undoable
+    pub fn undo(&self) -> Option<(&'static str, &str)> {
+        self.undo
+            .as_ref()
+            .map(|(verb, label)| (*verb, label.as_str()))
     }
 
     pub fn rename_prompt(&self) -> Option<&RenamePrompt> {
@@ -644,6 +795,10 @@ impl Picker {
 
     pub fn forget_prompt(&self) -> Option<&ForgetPrompt> {
         self.forget.as_ref()
+    }
+
+    pub fn close_prompt(&self) -> Option<&ClosePrompt> {
+        self.close.as_ref()
     }
 
     pub fn snooze_prompt(&self) -> Option<&SnoozePrompt> {
@@ -700,8 +855,7 @@ impl Item {
     }
 }
 
-pub fn combine(herdr: Vec<Item>, mut t3: Vec<Item>) -> Vec<Item> {
-    t3.sort_by_key(|item| Reverse(item.row.changed_at));
+pub fn combine(herdr: Vec<Item>, t3: Vec<Item>) -> Vec<Item> {
     let mut items = herdr;
     items.extend(t3);
     items.sort_by_key(|item| {
@@ -709,7 +863,12 @@ pub fn combine(herdr: Vec<Item>, mut t3: Vec<Item>) -> Vec<Item> {
             Some(Park::Snoozed { until }) => until,
             _ => 0,
         };
-        (item.row.rank(), wake)
+        (
+            item.row.rank(),
+            wake,
+            item.target == Target::Closed,
+            Reverse(item.row.changed_at),
+        )
     });
     items
 }
@@ -900,7 +1059,7 @@ mod tests {
     }
 
     #[test]
-    fn snooze_on_a_snoozed_agent_wakes_it_and_on_a_busy_one_explains_why_not() {
+    fn snooze_on_a_snoozed_agent_wakes_it_and_on_a_busy_one_asks_when() {
         let list = listed(&three(Status::Working).act("p3", Action::Snooze(NOW + 60)));
         let mut picker = Picker::new(list, Some("p3"), &BTreeSet::from([Section::Snoozed]));
         assert_eq!(
@@ -914,8 +1073,10 @@ mod tests {
         let blocked = listed(&three(Status::Blocked));
         let mut picker = Picker::new(blocked, Some("p1"), &closed_sections());
         assert_eq!(press(&mut picker, KeyCode::Char('z')), Effect::None);
-        assert!(picker.snooze_prompt().is_none());
-        assert_eq!(picker.message(), Some("can't snooze a blocked agent"));
+        assert!(
+            picker.snooze_prompt().is_some(),
+            "a blocked agent can be snoozed"
+        );
 
         let mut picker = Picker::new(items(), Some("p1"), &closed_sections());
         press(&mut picker, KeyCode::Char('z'));
@@ -935,7 +1096,7 @@ mod tests {
             &chrono::Utc,
         );
         let presets = &picker.snooze_prompt().unwrap().presets;
-        assert_eq!(presets[2].label(), "today 18:00");
+        assert_eq!(presets[2].0.label(), "today 18:00");
         let confirm = KeyEvent::new(KeyCode::Char('3'), KeyModifiers::NONE);
         let confirmed_at = shown_at + 20 * 60;
         assert_eq!(
@@ -948,12 +1109,200 @@ mod tests {
     }
 
     #[test]
-    fn escape_cancels_the_snooze_prompt() {
+    fn snooze_digits_keep_their_preset_after_the_evening_one_is_gone() {
+        let evening = NOW + 4 * 3_600 + 40 * 60;
         let mut picker = Picker::new(items(), Some("p2"), &closed_sections());
-        press(&mut picker, KeyCode::Char('z'));
-        assert_eq!(press(&mut picker, KeyCode::Esc), Effect::None);
+        let key = |c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE);
+        picker.key(key('z'), evening, &chrono::Utc);
+        assert_eq!(
+            picker.key(key('4'), evening, &chrono::Utc),
+            Effect::Apply {
+                key: "k-p2".into(),
+                action: Action::Snooze(NOW + 20 * 3_600)
+            },
+            "4 is still tomorrow 09:00"
+        );
+        picker.key(key('z'), evening, &chrono::Utc);
+        assert_eq!(picker.key(key('3'), evening, &chrono::Utc), Effect::None);
         assert!(picker.snooze_prompt().is_none());
-        assert_eq!(press(&mut picker, KeyCode::Esc), Effect::Close);
+        assert_eq!(
+            picker.message(),
+            Some("today 18:00 is under 30 minutes away")
+        );
+    }
+
+    #[test]
+    fn a_snooze_prompt_left_open_past_its_time_does_not_snooze_into_the_past() {
+        let shown_at = NOW + 4 * 3_600;
+        let mut picker = Picker::new(items(), Some("p2"), &closed_sections());
+        let key = |c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE);
+        picker.key(key('z'), shown_at, &chrono::Utc);
+        let past_six = NOW + 5 * 3_600 + 60;
+        assert_eq!(picker.key(key('3'), past_six, &chrono::Utc), Effect::None);
+        assert_eq!(picker.message(), Some("today 18:00 has passed"));
+    }
+
+    #[test]
+    fn settling_an_agent_that_cannot_be_resumed_asks_first() {
+        let sessionless = || {
+            let mut items = items();
+            for item in &mut items {
+                item.row.thread.session = None;
+            }
+            items
+        };
+        let settle = |answer| {
+            let mut picker = Picker::new(sessionless(), Some("p2"), &closed_sections());
+            assert_eq!(press(&mut picker, KeyCode::Char('s')), Effect::None);
+            assert_eq!(
+                picker.close_prompt().map(|p| p.label.as_str()),
+                Some("fix flaky test")
+            );
+            let effect = press(&mut picker, answer);
+            assert!(picker.close_prompt().is_none());
+            effect
+        };
+        let apply = |action| Effect::Apply {
+            key: "k-p2".into(),
+            action,
+        };
+        assert_eq!(
+            settle(KeyCode::Char('y')),
+            apply(Action::CloseForGood { seq: 2 })
+        );
+        assert_eq!(settle(KeyCode::Char('n')), apply(Action::SettleKeepingOpen));
+        assert_eq!(settle(KeyCode::Esc), Effect::None);
+        assert_eq!(settle(KeyCode::Char('q')), Effect::None);
+
+        let mut picker = Picker::new(items(), Some("p2"), &closed_sections());
+        assert_eq!(
+            press(&mut picker, KeyCode::Char('s')),
+            apply(Action::ToggleSettle),
+            "a resumable agent settles at once"
+        );
+    }
+
+    #[test]
+    fn n_starts_an_agent_where_the_selected_thread_lives() {
+        let mut items = items();
+        items[1].row.thread.cwd = Some("/work/api".into());
+        let mut picker = Picker::new(items, Some("p2"), &closed_sections());
+        assert_eq!(press(&mut picker, KeyCode::Char('n')), Effect::None);
+        assert_eq!(
+            picker.new_agent_prompt().map(|p| p.label.as_str()),
+            Some("acme-api")
+        );
+        assert_eq!(press(&mut picker, KeyCode::Char('9')), Effect::None);
+        assert_eq!(
+            press(&mut picker, KeyCode::Char('1')),
+            Effect::NewAgent(NewAgent {
+                workspace_id: Some("w1".into()),
+                cwd: Some("/work/api".into()),
+                branch: None,
+                command: "claude",
+            })
+        );
+        assert!(picker.new_agent_prompt().is_none());
+    }
+
+    #[test]
+    fn w_in_the_new_agent_prompt_asks_for_a_worktree_branch_first() {
+        let mut picker = Picker::new(items(), Some("p2"), &closed_sections());
+        press(&mut picker, KeyCode::Char('n'));
+        press(&mut picker, KeyCode::Char('w'));
+        for c in "fix/a b".chars() {
+            press(&mut picker, KeyCode::Char(c));
+        }
+        assert_eq!(
+            picker
+                .new_agent_prompt()
+                .and_then(|p| p.typing_branch.as_deref()),
+            Some("fix/ab"),
+            "a branch has no spaces"
+        );
+        press(&mut picker, KeyCode::Enter);
+        assert_eq!(
+            press(&mut picker, KeyCode::Char('2')),
+            Effect::NewAgent(NewAgent {
+                workspace_id: Some("w1".into()),
+                cwd: None,
+                branch: Some("fix/ab".into()),
+                command: "codex",
+            })
+        );
+
+        press(&mut picker, KeyCode::Char('n'));
+        press(&mut picker, KeyCode::Char('w'));
+        press(&mut picker, KeyCode::Char('x'));
+        press(&mut picker, KeyCode::Esc);
+        let prompt = picker.new_agent_prompt().unwrap();
+        assert!(
+            prompt.typing_branch.is_none() && prompt.branch.is_none(),
+            "esc goes back"
+        );
+        assert_eq!(press(&mut picker, KeyCode::Char('q')), Effect::None);
+        assert!(picker.new_agent_prompt().is_none());
+    }
+
+    #[test]
+    fn n_on_a_t3_thread_starts_the_agent_in_the_current_workspace() {
+        let mut picker = Picker::new(with_t3(), None, &closed_sections());
+        select(&mut picker, "t3-done");
+        press(&mut picker, KeyCode::Char('n'));
+        assert_eq!(
+            picker.new_agent_prompt().map(|p| p.label.as_str()),
+            Some("this workspace")
+        );
+        assert_eq!(
+            press(&mut picker, KeyCode::Char('4')),
+            Effect::NewAgent(NewAgent {
+                workspace_id: None,
+                cwd: None,
+                branch: None,
+                command: "pi",
+            })
+        );
+    }
+
+    #[test]
+    fn a_calendar_snooze_keeps_the_day_it_showed() {
+        let key = |c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE);
+        let sunday_evening = NOW + 5 * 86_400 + 7 * 3_600;
+        let monday_ten = NOW + 6 * 86_400 - 3 * 3_600;
+        let mut picker = Picker::new(items(), Some("p2"), &closed_sections());
+        picker.key(key('z'), sunday_evening, &chrono::Utc);
+        assert_eq!(picker.key(key('5'), monday_ten, &chrono::Utc), Effect::None);
+        assert_eq!(picker.message(), Some("next Mon 09:00 has passed"));
+
+        let tuesday_five = NOW + 4 * 3_600;
+        picker.key(key('z'), tuesday_five, &chrono::Utc);
+        let wednesday_ten = NOW + 86_400 - 3 * 3_600;
+        assert_eq!(
+            picker.key(key('3'), wednesday_ten, &chrono::Utc),
+            Effect::None
+        );
+        assert_eq!(picker.message(), Some("today 18:00 has passed"));
+
+        picker.key(key('z'), tuesday_five, &chrono::Utc);
+        assert_eq!(
+            picker.key(key('1'), tuesday_five + 600, &chrono::Utc),
+            Effect::Apply {
+                key: "k-p2".into(),
+                action: Action::Snooze(tuesday_five + 600 + 3_600)
+            },
+            "1h is an hour from when you pick it"
+        );
+    }
+
+    #[test]
+    fn escape_or_q_cancels_the_snooze_prompt() {
+        for cancel in [KeyCode::Esc, KeyCode::Char('q')] {
+            let mut picker = Picker::new(items(), Some("p2"), &closed_sections());
+            press(&mut picker, KeyCode::Char('z'));
+            assert_eq!(press(&mut picker, cancel), Effect::None);
+            assert!(picker.snooze_prompt().is_none());
+            assert_eq!(press(&mut picker, KeyCode::Esc), Effect::Close);
+        }
     }
 
     #[test]
@@ -1266,19 +1615,13 @@ mod tests {
     }
 
     #[test]
-    fn q_closes_the_picker_even_while_asking_to_forget() {
+    fn q_cancels_the_forget_prompt_and_keeps_the_picker_open() {
         let mut picker = Picker::new(with_closed(), None, &closed_sections());
         press(&mut picker, KeyCode::Char('j'));
         press(&mut picker, KeyCode::Char('D'));
         assert!(picker.forget_prompt().is_some());
-        assert_eq!(press(&mut picker, KeyCode::Char('q')), Effect::Close);
-    }
-
-    #[test]
-    fn q_closes_the_picker_from_the_snooze_prompt() {
-        let mut picker = Picker::new(items(), Some("p2"), &closed_sections());
-        press(&mut picker, KeyCode::Char('z'));
-        assert!(picker.snooze_prompt().is_some());
+        assert_eq!(press(&mut picker, KeyCode::Char('q')), Effect::None);
+        assert!(picker.forget_prompt().is_none());
         assert_eq!(press(&mut picker, KeyCode::Char('q')), Effect::Close);
     }
 
@@ -1563,7 +1906,7 @@ mod tests {
     }
 
     #[test]
-    fn t3_threads_follow_herdr_agents_of_the_same_rank_and_snoozes_wake_in_order() {
+    fn t3_threads_join_herdr_agents_of_the_same_rank_by_recency_and_snoozes_wake_in_order() {
         let t3 = |id: &str, updated_ago: i64, snoozed_for: Option<i64>, settled: bool| {
             crate::t3::T3Thread {
                 updated_at: NOW - updated_ago,
@@ -1576,14 +1919,19 @@ mod tests {
             environment_id: "env".into(),
             projects: std::collections::BTreeMap::new(),
             threads: vec![
-                t3("t3 settled", 60, None, true),
+                t3("t3 settled", 600, None, true),
+                t3("t3 settled just now", 1, None, true),
                 t3("t3 wakes late", 60, Some(600), false),
                 t3("t3 older", 7_200, None, false),
                 t3("t3 wakes soon", 60, Some(30), false),
                 t3("t3 newer", 60, None, false),
             ],
         };
-        let combined = combine(shelf(), crate::t3::items(&snapshot, NOW));
+        let mut herdr = shelf();
+        for item in &mut herdr {
+            item.row.changed_at = Some(NOW - 120);
+        }
+        let combined = combine(herdr, crate::t3::items(&snapshot, NOW));
         let labels: Vec<&str> = combined.iter().map(|item| item.row.label()).collect();
         assert_eq!(
             labels,
@@ -1594,11 +1942,76 @@ mod tests {
                 "t3 wakes soon",
                 "bench run",
                 "t3 wakes late",
+                "t3 settled just now",
                 "release notes",
                 "old spike",
                 "t3 settled",
             ]
         );
+    }
+
+    #[test]
+    fn t3_and_herdr_rows_share_one_recency_order_with_closed_herdr_threads_last() {
+        let herdr = Fixture::new(
+            NOW,
+            &[
+                ("p1", "changed long ago", Status::Idle),
+                ("p2", "just changed", Status::Idle),
+                ("p3", "closed recently", Status::Idle),
+            ],
+        )
+        .act("p3", Action::ToggleUnread)
+        .close("p3");
+        let mut items = listed(&herdr);
+        for (item, ago) in items.iter_mut().zip([100, 10, 5]) {
+            item.row.changed_at = Some(NOW - ago);
+        }
+        let snapshot = crate::t3::Snapshot {
+            environment_id: "env".into(),
+            projects: std::collections::BTreeMap::new(),
+            threads: vec![crate::t3::T3Thread {
+                updated_at: NOW - 50,
+                unseen: false,
+                ..t3_thread("t3 thread", "completed")
+            }],
+        };
+        let combined = combine(items, crate::t3::items(&snapshot, NOW));
+        let labels: Vec<&str> = combined.iter().map(|item| item.row.label()).collect();
+        assert_eq!(
+            labels,
+            [
+                "just changed",
+                "t3 thread",
+                "changed long ago",
+                "closed recently"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_t3_thread_that_just_blocked_comes_before_herdr_agents_idle_for_longer() {
+        let herdr = Fixture::new(
+            NOW,
+            &[
+                ("p1", "idle for a day", Status::Idle),
+                ("p2", "also idle", Status::Idle),
+            ],
+        );
+        let mut items = listed(&herdr);
+        for item in &mut items {
+            item.row.changed_at = Some(NOW - 86_400);
+        }
+        let snapshot = crate::t3::Snapshot {
+            environment_id: "env".into(),
+            projects: std::collections::BTreeMap::new(),
+            threads: vec![crate::t3::T3Thread {
+                updated_at: NOW - 30,
+                ..t3_thread("t3 blocked", "waiting")
+            }],
+        };
+        let combined = combine(items, crate::t3::items(&snapshot, NOW));
+        let labels: Vec<&str> = combined.iter().map(|item| item.row.label()).collect();
+        assert_eq!(labels, ["t3 blocked", "idle for a day", "also idle"]);
     }
 
     #[test]

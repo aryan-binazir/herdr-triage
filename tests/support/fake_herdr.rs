@@ -92,10 +92,7 @@ impl FakeHerdr {
                         json!({"type": "ok"})
                     }
                     "pane.close" => {
-                        agents
-                            .lock()
-                            .unwrap()
-                            .retain(|a| a["pane_id"] != params["pane_id"]);
+                        close_pane(&mut agents.lock().unwrap(), &workspaces, params);
                         json!({"type": "ok"})
                     }
                     "notification.show" => {
@@ -109,6 +106,7 @@ impl FakeHerdr {
                         &mut agents.lock().unwrap(),
                         &screen,
                         &worktree_lists.lock().unwrap(),
+                        &workspaces.lock().unwrap(),
                         &mut opened,
                     ),
                 };
@@ -192,6 +190,7 @@ fn agent_api(
     agents: &mut Vec<Value>,
     screen: &Mutex<String>,
     worktree_lists: &std::collections::BTreeMap<String, Value>,
+    workspaces: &[Value],
     opened: &mut i32,
 ) -> Value {
     match method {
@@ -207,7 +206,9 @@ fn agent_api(
             } else {
                 worktree_lists.get(params["workspace_id"].as_str().unwrap_or_default())
             };
-            found.cloned().unwrap_or(json!({"type": "ok"}))
+            found
+                .cloned()
+                .unwrap_or_else(|| worktree_source(workspaces, params))
         }
         "worktree.create" => {
             *opened += 1;
@@ -288,6 +289,35 @@ fn store_tokens(agents: &mut [Value], params: &Value) {
             tokens.insert(name.clone(), value.clone());
         }
     }
+}
+
+fn worktree_source(workspaces: &[Value], params: &Value) -> Value {
+    let active = workspaces.first();
+    let workspace = workspaces
+        .iter()
+        .find(|w| w["workspace_id"] == params["workspace_id"])
+        .or(active);
+    let root = workspace.map_or_else(String::new, |w| {
+        w["worktree"]["repo_root"].as_str().map_or_else(
+            || format!("/work/{}", w["label"].as_str().unwrap_or("")),
+            str::to_owned,
+        )
+    });
+    json!({"type": "worktree_list", "source": {"repo_root": root}, "worktrees": []})
+}
+
+fn close_pane(agents: &mut Vec<Value>, workspaces: &Mutex<Vec<Value>>, params: &Value) {
+    let closed = agents.iter().find(|a| a["pane_id"] == params["pane_id"]);
+    if let Some(workspace) = closed.map(|a| a["workspace_id"].clone()) {
+        for w in workspaces.lock().unwrap().iter_mut() {
+            if w["workspace_id"] == workspace
+                && let Some(count) = w["pane_count"].as_u64()
+            {
+                w["pane_count"] = json!(count.saturating_sub(1));
+            }
+        }
+    }
+    agents.retain(|a| a["pane_id"] != params["pane_id"]);
 }
 
 pub fn agent(pane: &str, status: &str, seq: u64) -> Value {

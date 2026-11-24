@@ -11,11 +11,11 @@ use chrono::Local;
 use serde_json::{Map, Value};
 
 use crate::herdr::{Agent, Herdr, Tab, Workspace};
-use crate::picker::{Item, Target};
+use crate::picker::{Item, NewAgent, Target};
 use crate::store::Store;
 use crate::triage::{
-    self, Action, After, CLOSED_FOR_GOOD, Close, Closing, Observed, Rank, Refusal, ReopenPlan, Row,
-    Section, SessionRef, State, Thread, UNTITLED,
+    self, Action, After, CLOSED_FOR_GOOD, Close, Closing, Observed, Rank, Reconciled, Refusal,
+    ReopenPlan, Row, Section, SessionRef, State, Thread, UNTITLED,
 };
 use crate::wakers;
 
@@ -35,7 +35,7 @@ pub struct Session {
 pub struct View {
     pub items: Vec<Item>,
     pub open_sections: BTreeSet<Section>,
-    pub undoable: bool,
+    pub undo: Option<(&'static str, String)>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -58,7 +58,7 @@ struct Snapshot {
     tabs: Vec<Tab>,
     rows: Vec<Row>,
     open_sections: BTreeSet<Section>,
-    undoable: bool,
+    undo: Option<(&'static str, String)>,
     wake_failed: Option<String>,
 }
 
@@ -181,8 +181,22 @@ impl Session {
             })
             .map(Agent::key);
         let next = triage::next_attention(&snapshot.rows, current.as_deref());
-        match next.and_then(|row| row.agent_index) {
-            Some(index) => self.herdr.focus(&snapshot.agents[index].pane_id),
+        match next {
+            Some(Row {
+                agent_index: Some(index),
+                ..
+            }) => self.herdr.focus(&snapshot.agents[*index].pane_id),
+            Some(closed) => match self.act(&closed.key, Action::Reopen)? {
+                Outcome::Refused(refusal) => self.herdr.notify(&refusal).map(drop),
+                Outcome::Reopened => Ok(()),
+                Outcome::Done { key, .. } => {
+                    let came_back = self.herdr.agents()?.into_iter().find(|a| a.key() == key);
+                    match came_back {
+                        Some(agent) => self.herdr.focus(&agent.pane_id),
+                        None => Ok(()),
+                    }
+                }
+            },
             None => self.herdr.notify("Nothing needs you").map(drop),
         }
     }
@@ -207,6 +221,7 @@ impl Session {
             let key = current_key(observed, key);
             let agent = observed.iter().find(|agent| agent.key == key);
             let after = state.apply(key, agent, action, now)?;
+            state.mark_left_if_elsewhere(key, observed);
             Ok((key.to_owned(), after))
         })
     }
@@ -219,6 +234,26 @@ impl Session {
         self.herdr.focus(pane)
     }
 
+    pub fn start_agent(&mut self, agent: &NewAgent) -> io::Result<()> {
+        let workspaces = self.herdr.workspaces()?;
+        let open_workspace = workspaces
+            .iter()
+            .map(|w| w.workspace_id.as_str())
+            .find(|&id| agent.workspace_id.as_deref() == Some(id));
+        let pane = if let Some(branch) = &agent.branch {
+            // Herdr branches a new worktree from the repository's own checkout, never from a
+            // linked worktree.
+            let repository = self.herdr.repository_root(open_workspace)?;
+            self.herdr.create_worktree(&repository, branch)?
+        } else {
+            let cwd = open_workspace
+                .and(agent.cwd.as_deref())
+                .filter(|dir| Path::new(dir).is_dir());
+            self.herdr.create_tab(open_workspace, cwd, true)?
+        };
+        self.herdr.run_command(&pane, agent.command)
+    }
+
     pub fn notify(&mut self, title: &str) -> io::Result<()> {
         self.herdr.notify(title).map(drop)
     }
@@ -228,7 +263,7 @@ impl Session {
         Ok(View {
             items: items(&snapshot, (self.clock)()),
             open_sections: snapshot.open_sections,
-            undoable: snapshot.undoable,
+            undo: snapshot.undo,
         })
     }
 
@@ -245,9 +280,9 @@ impl Session {
         let outcome = match after {
             Err(Refusal(refusal)) => Ok(Outcome::Refused(refusal)),
             Ok((key, After::Nothing)) => Ok(done(key, None)),
-            Ok((key, After::ClosePane(close))) => self
-                .close_session(&snapshot, &close)
-                .map(|notice| done(key, notice)),
+            Ok((key, After::ClosePane(close))) => {
+                self.close_session(&close).map(|notice| done(key, notice))
+            }
             Ok((_, After::Reopen(plan))) => {
                 self.reopen(&snapshot, &plan).map(|()| Outcome::Reopened)
             }
@@ -295,11 +330,21 @@ impl Session {
             held.store.take_sync_request();
             sync_locked(held, state, fetch_tabs, edit)
         })?;
-        let Some(((exit_checks, synced), wake_failed)) = synced else {
+        let Some(((reconciled, synced), wake_failed)) = synced else {
             return Ok(None);
         };
-        for at in exit_checks {
+        for at in reconciled.exit_checks {
             let _ = (self.waker)(at);
+        }
+        if let Some(title) = woke_notice(&reconciled.woke) {
+            let _ = self.herdr.notify(&title);
+        }
+        for close in &reconciled.closes {
+            if let Err(error) = self.close_session(close) {
+                let _ = self
+                    .herdr
+                    .notify(&format!("A settled agent's pane didn't close: {error}"));
+            }
         }
         Ok(Some(synced.map(|(snapshot, edited)| {
             let wake_failed = wake_failed.map(|error| error.to_string());
@@ -353,14 +398,16 @@ impl Session {
         Ok(Some((result, failure)))
     }
 
-    fn close_session(&mut self, snapshot: &Snapshot, close: &Close) -> io::Result<Option<String>> {
+    fn close_session(&mut self, close: &Close) -> io::Result<Option<String>> {
+        let closing_alone = self.store.close_lock()?;
         let closing = self.locked(|held, state| {
             let generation = held.herdr.server_generation();
             state.confirm_close(close, &generation, held.now(), || {
                 let agents = held.herdr.agents()?;
+                let workspaces = held.herdr.workspaces()?;
                 Ok(agents
                     .iter()
-                    .map(|agent| observe(agent, &snapshot.workspaces))
+                    .map(|agent| observe(agent, &workspaces))
                     .collect())
             })
         })??;
@@ -371,6 +418,7 @@ impl Session {
             Closing::Skip => return Ok(None),
         };
         let closed = self.herdr.close_pane(&pane);
+        drop(closing_alone);
         let announced =
             closed.is_ok() && for_good && matches!(self.herdr.notify(CLOSED_FOR_GOOD), Ok(true));
         self.locked(|_, state| state.report_close(close, closed.is_ok()))?;
@@ -398,7 +446,20 @@ impl Session {
         let cwd = launch.cwd.filter(|dir| Path::new(dir).is_dir());
         let focus = self.focus_reopened;
         self.locked(|held, state| {
+            let now = held.now();
             let herdr = &mut *held.herdr;
+            if let Some(pane) = state.launched_reopen(plan, &herdr.server_generation(), now)
+                && Some(pane.as_str()) != launch.focus
+                && herdr.focus_pane(&pane).is_ok()
+            {
+                return Ok(());
+            }
+            if !state.awaits_reopen(plan) {
+                return match herdr.agents()?.iter().find(|a| a.key() == plan.key()) {
+                    Some(agent) => herdr.focus(&agent.pane_id),
+                    None => Ok(()),
+                };
+            }
             let pane = herdr.create_tab(launch.workspace, cwd, focus)?;
             let launched = match launch.session_to_report {
                 Some((agent, session)) => herdr.report_session(&pane, agent, session),
@@ -409,7 +470,6 @@ impl Session {
                 let _ = herdr.close_pane(&pane);
                 return Err(error);
             }
-            let now = (held.clock)();
             state.report_reopen(plan, &pane, &herdr.server_generation(), now);
             Ok(())
         })?
@@ -447,7 +507,7 @@ fn sync_locked<R>(
     state: &mut State,
     fetch_tabs: bool,
     edit: impl FnOnce(&mut State, &[Observed], i64) -> R,
-) -> (Vec<i64>, Synced<R>) {
+) -> (Reconciled, Synced<R>) {
     let HerdrView {
         generation,
         agents,
@@ -455,11 +515,11 @@ fn sync_locked<R>(
         tabs,
     } = match read_herdr(held.herdr, fetch_tabs) {
         Ok(view) => view,
-        Err(error) => return (Vec::new(), Err(error)),
+        Err(error) => return (Reconciled::default(), Err(error)),
     };
     let observed: Vec<Observed> = agents.iter().map(|a| observe(a, &workspaces)).collect();
     let now = held.now();
-    let exit_checks = state.reconcile(&generation, &observed, now);
+    let reconciled = state.reconcile(&generation, &observed, now);
     let edited = edit(state, &observed, now);
     let rows = state.ordered(&observed);
     let published = publish(held.herdr, &agents, &rows, now);
@@ -469,10 +529,10 @@ fn sync_locked<R>(
         tabs,
         rows,
         open_sections: state.open_sections.clone(),
-        undoable: state.undo.is_some(),
+        undo: state.undo_summary(),
         wake_failed: None,
     };
-    (exit_checks, published.map(|()| (snapshot, edited)))
+    (reconciled, published.map(|()| (snapshot, edited)))
 }
 
 struct HerdrView {
@@ -531,7 +591,7 @@ fn observe(agent: &Agent, workspaces: &[Workspace]) -> Observed {
                 .or_else(|| agent.agent.clone()),
             cwd: agent.cwd.clone(),
             workspace_id: Some(agent.workspace_id.clone()),
-            workspace_label: workspace.map(|w| w.label.clone()),
+            workspace_label: workspace.map(Workspace::project_label),
             session: session.map(|s| SessionRef {
                 source: s.source.clone(),
                 kind: s.kind.clone(),
@@ -566,6 +626,14 @@ fn publish(herdr: &mut Herdr, agents: &[Agent], rows: &[Row], now: i64) -> io::R
     }
     let view = herdr.set_view(&view_label(rows), &Rank::hidden_tokens());
     failure.map_or(view, Err)
+}
+
+fn woke_notice(woke: &[String]) -> Option<String> {
+    match woke {
+        [] => None,
+        [one] => Some(format!("Woke: {one}")),
+        [first, rest @ ..] => Some(format!("Woke: {first} and {} more", rest.len())),
+    }
 }
 
 fn view_label(rows: &[Row]) -> String {
@@ -694,11 +762,12 @@ fn location(agent: &Agent, workspaces: &[Workspace], tabs: &[Tab]) -> String {
         return "-".into();
     };
     let tab = tabs.iter().find(|t| t.tab_id == agent.tab_id);
+    let project = workspace.project_label();
     match tab {
         Some(tab) if workspace.tab_count > 1 || tab.label != tab.number.to_string() => {
-            format!("{} · {}", workspace.label, tab.label)
+            format!("{project} · {}", tab.label)
         }
-        _ => workspace.label.clone(),
+        _ => project,
     }
 }
 
@@ -787,6 +856,7 @@ mod tests {
             resumable_agent("w1:p2", "idle", 4),
             fake_herdr::agent("w1:p3", "working", 5),
         ]);
+        fake.workspaces.lock().unwrap()[0]["pane_count"] = json!(3);
         let (mut session, _) = connect(&fake);
         let (list, view_set, report) = ("agent.list", "agent.view.set", "pane.report_metadata");
         let read = [list, "workspace.list"];
@@ -796,10 +866,10 @@ mod tests {
         assert_eq!(methods(&fake), first_view);
 
         assert_eq!(session.act(KEY, Action::ToggleSettle).unwrap(), done(KEY));
-        let closing = [&read[..], &[report, view_set, list, "pane.close"]].concat();
+        let closing = [&read[..], &[report, view_set], &read[..], &["pane.close"]].concat();
         assert_eq!(methods(&fake), closing);
 
-        let refused = session.act("terminal:t-w1:p3", Action::ToggleSettle);
+        let refused = session.act("terminal:t-w1:p3", Action::ToggleUnread);
         assert!(matches!(refused, Ok(Outcome::Refused(_))));
         assert_eq!(methods(&fake), [&read[..], &[view_set]].concat());
 
@@ -833,6 +903,54 @@ mod tests {
                 .is_err()
         );
         assert_eq!(methods(&fake), closing);
+    }
+
+    #[test]
+    fn a_linked_worktree_shows_which_project_it_belongs_to() {
+        let fake = FakeHerdr::start(vec![
+            fake_herdr::agent("w1:p1", "idle", 3),
+            fake_herdr::agent("w2:p1", "idle", 4),
+            fake_herdr::agent("w3:p1", "idle", 5),
+        ]);
+        {
+            let mut agents = fake.agents.lock().unwrap();
+            agents[1]["workspace_id"] = json!("w2");
+            agents[2]["workspace_id"] = json!("w3");
+        }
+        let worktree = |linked| {
+            json!({"repo_key": "/work/acme-api/.git", "repo_name": "acme-api",
+                   "repo_root": "/work/acme-api", "checkout_path": "/work/acme-api",
+                   "is_linked_worktree": linked})
+        };
+        *fake.workspaces.lock().unwrap() = vec![
+            json!({"workspace_id": "w1", "label": "acme-api", "tab_count": 1, "pane_count": 2,
+                   "worktree": worktree(false)}),
+            json!({"workspace_id": "w2", "label": "auth-fix", "tab_count": 1, "pane_count": 2,
+                   "worktree": worktree(true)}),
+            json!({"workspace_id": "w3", "label": "acme-api-perf", "tab_count": 1, "pane_count": 2,
+                   "worktree": worktree(true)}),
+        ];
+        let (mut session, _) = connect(&fake);
+        let view = session.view().unwrap();
+        let mut locations: Vec<&str> = view.items.iter().map(|i| i.location.as_str()).collect();
+        locations.sort_unstable();
+        assert_eq!(
+            locations,
+            ["acme-api", "acme-api-perf", "acme-api/auth-fix"]
+        );
+        let stored = store(&fake)
+            .transact(|state| {
+                state.records["terminal:t-w2:p1"]
+                    .thread
+                    .workspace_label
+                    .clone()
+            })
+            .unwrap();
+        assert_eq!(
+            stored.as_deref(),
+            Some("acme-api/auth-fix"),
+            "a closed thread keeps it"
+        );
     }
 
     #[test]
@@ -971,7 +1089,7 @@ mod tests {
             .unwrap();
         assert!(keys.contains(&"terminal:t-w1:p1".to_owned()), "{keys:?}");
         session
-            .act("terminal:t-w1:p1", Action::ToggleSettle)
+            .act("terminal:t-w1:p1", Action::CloseForGood { seq: 3 })
             .unwrap();
         assert_eq!(fake.take("pane.close"), [json!({"pane_id": "w1:p1"})]);
         let kept = store(&fake)
@@ -1177,7 +1295,10 @@ mod tests {
                 "a snooze keeps a pane it could not reopen to wake"
             );
             methods(&fake);
-            assert_eq!(session.act(key, Action::ToggleSettle).unwrap(), done(key));
+            assert_eq!(
+                session.act(key, Action::CloseForGood { seq: 3 }).unwrap(),
+                done(key)
+            );
             let calls: Vec<Value> = fake
                 .requests
                 .lock()
@@ -1210,7 +1331,7 @@ mod tests {
         let (mut session, _) = connect(&fake);
         let key = "terminal:t-w1:p1";
         *fake.fail_method.lock().unwrap() = Some("pane.close".into());
-        assert!(session.act(key, Action::ToggleSettle).is_err());
+        assert!(session.act(key, Action::CloseForGood { seq: 3 }).is_err());
         assert!(fake.take("notification.show").is_empty());
         let kept = store(&fake)
             .transact(|state| state.records.contains_key(key))
@@ -1230,7 +1351,7 @@ mod tests {
             let kept = store.transact(|state| state.records.contains_key(key));
             *seen.lock().unwrap() = kept.ok();
         });
-        session.act(key, Action::ToggleSettle).unwrap();
+        session.act(key, Action::CloseForGood { seq: 3 }).unwrap();
         assert_eq!(
             *unreported.lock().unwrap(),
             Some(true),
@@ -1246,7 +1367,7 @@ mod tests {
         let key = "terminal:t-w1:p1";
         *fake.notification_shown.lock().unwrap() = false;
         assert_eq!(
-            session.act(key, Action::ToggleSettle).unwrap(),
+            session.act(key, Action::CloseForGood { seq: 3 }).unwrap(),
             Outcome::Done {
                 key: key.into(),
                 notice: Some("closed for good: it has no session to resume".into()),
@@ -1263,7 +1384,7 @@ mod tests {
         let key = "terminal:t-w1:p1";
         *fake.fail_method.lock().unwrap() = Some("notification.show".into());
         assert_eq!(
-            session.act(key, Action::ToggleSettle).unwrap(),
+            session.act(key, Action::CloseForGood { seq: 3 }).unwrap(),
             Outcome::Done {
                 key: key.into(),
                 notice: Some("closed for good: it has no session to resume".into()),
@@ -1280,13 +1401,24 @@ mod tests {
             let fake = opencode_and_claude();
             fake.agents.lock().unwrap()[0]["agent_status"] = json!(status);
             let (mut session, _) = connect(&fake);
-            assert!(matches!(
-                session.act(key, Action::ToggleSettle).unwrap(),
-                Outcome::Refused(_)
-            ));
-            let outcome = session.act(key, Action::Snooze(NOW + 3600)).unwrap();
-            assert_eq!(matches!(outcome, Outcome::Refused(_)), status == "blocked");
+            let settled = session.act(key, Action::ToggleSettle).unwrap();
+            assert_eq!(
+                matches!(settled, Outcome::Refused(_)),
+                status == "blocked",
+                "a working agent settles when its turn ends"
+            );
             assert!(fake.take("pane.close").is_empty());
+            if status == "working" {
+                session.act(key, Action::ToggleSettle).unwrap();
+            }
+            assert_eq!(
+                session.act(key, Action::Snooze(NOW + 3600)).unwrap(),
+                done(key)
+            );
+            assert!(
+                fake.take("pane.close").is_empty(),
+                "a busy agent snoozes with its pane open"
+            );
         }
         for shared in [false, true] {
             let fake = opencode_and_claude();
@@ -1420,15 +1552,285 @@ mod tests {
     }
 
     #[test]
+    fn a_snooze_that_comes_due_says_so_once_and_next_reopens_its_closed_thread() {
+        let fake = two_resumable_agents();
+        let now = Rc::new(std::cell::Cell::new(NOW));
+        let clock = now.clone();
+        let mut session = Session::new(
+            Herdr::at(&fake.socket).unwrap(),
+            store(&fake),
+            move || clock.get(),
+            |_| Ok(()),
+        );
+        session.act(KEY, Action::Snooze(NOW + 3600)).unwrap();
+        assert_eq!(fake.take("pane.close"), [json!({"pane_id": "w1:p1"})]);
+        now.set(NOW + 30);
+        session.sync().unwrap();
+        session.next(Some("w1:p2")).unwrap();
+        assert_eq!(
+            fake.take("notification.show"),
+            [json!({"title": "Nothing needs you"})]
+        );
+
+        now.set(NOW + 3600);
+        session.sync().unwrap();
+        session.sync().unwrap();
+        assert_eq!(
+            fake.take("notification.show"),
+            [json!({"title": "Woke: Untitled thread"})],
+            "once"
+        );
+
+        session.next(Some("w1:p2")).unwrap();
+        assert!(fake.take("notification.show").is_empty());
+        assert_eq!(
+            fake.take("pane.send_input")[0]["text"],
+            "claude --resume id-w1:p1"
+        );
+    }
+
+    #[test]
+    fn settling_a_working_agent_closes_its_pane_once_its_turn_ends() {
+        let fake = FakeHerdr::start(vec![
+            resumable_agent("w1:p1", "working", 3),
+            resumable_agent("w1:p2", "idle", 4),
+        ]);
+        let (mut session, _) = connect(&fake);
+        assert_eq!(session.act(KEY, Action::ToggleSettle).unwrap(), done(KEY));
+        assert!(fake.take("pane.close").is_empty());
+        session.sync().unwrap();
+        assert!(fake.take("pane.close").is_empty());
+        {
+            let mut agents = fake.agents.lock().unwrap();
+            agents[0]["agent_status"] = json!("done");
+            agents[0]["state_change_seq"] = json!(5);
+        }
+        session.sync().unwrap();
+        assert_eq!(fake.take("pane.close"), [json!({"pane_id": "w1:p1"})]);
+        let view = session.view().unwrap();
+        let row = &view
+            .items
+            .iter()
+            .find(|item| item.row.key == KEY)
+            .unwrap()
+            .row;
+        assert_eq!(row.status_text(NOW), "settled · closed");
+    }
+
+    #[test]
+    fn a_new_agent_starts_in_a_new_tab_or_a_new_worktree() {
+        let fake = FakeHerdr::start(vec![]);
+        let (mut session, _) = connect(&fake);
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().to_str().unwrap().to_owned();
+        let agent = |branch: Option<&str>, cwd: Option<String>| NewAgent {
+            workspace_id: Some("w1".into()),
+            cwd,
+            branch: branch.map(str::to_owned),
+            command: "claude",
+        };
+        session
+            .start_agent(&agent(None, Some(cwd.clone())))
+            .unwrap();
+        assert_eq!(
+            fake.take("tab.create")[0],
+            json!({"workspace_id": "w1", "cwd": cwd, "focus": true})
+        );
+        assert_eq!(
+            fake.take("pane.send_input")[0],
+            json!({"pane_id": "w1:p91", "text": "claude", "keys": ["Enter"]})
+        );
+
+        session
+            .start_agent(&agent(None, Some("/no/such/dir".into())))
+            .unwrap();
+        assert_eq!(fake.take("tab.create")[0]["cwd"], Value::Null);
+        fake.take("pane.send_input");
+
+        session
+            .start_agent(&agent(Some("fix/flaky"), Some(cwd)))
+            .unwrap();
+        assert!(fake.take("tab.create").is_empty());
+        assert_eq!(fake.take("worktree.list")[0], json!({"workspace_id": "w1"}));
+        assert_eq!(
+            fake.take("worktree.create")[0],
+            json!({"cwd": "/work/acme-api", "branch": "fix/flaky", "focus": true})
+        );
+        assert_eq!(fake.take("pane.send_input")[0]["pane_id"], "w93:p1");
+    }
+
+    #[test]
+    fn settles_landing_together_never_close_the_last_pane_of_a_workspace() {
+        let fake = FakeHerdr::start(vec![
+            resumable_agent("w1:p1", "working", 3),
+            resumable_agent("w1:p2", "working", 4),
+        ]);
+        let (mut session, _) = connect(&fake);
+        session.act(KEY, Action::ToggleSettle).unwrap();
+        session
+            .act("session:claude:id:id-w1:p2", Action::ToggleSettle)
+            .unwrap();
+        for agent in fake.agents.lock().unwrap().iter_mut() {
+            agent["agent_status"] = json!("idle");
+            agent["state_change_seq"] = json!(9);
+        }
+        session.sync().unwrap();
+        assert_eq!(
+            fake.take("pane.close").len(),
+            1,
+            "the workspace keeps a pane"
+        );
+    }
+
+    #[test]
+    fn a_close_waits_for_another_process_closing_in_the_same_workspace() {
+        let fake = two_resumable_agents();
+        let held = store(&fake).close_lock().unwrap();
+        let socket = fake.socket.clone();
+        let state = fake.state_dir();
+        let settling = std::thread::spawn(move || {
+            let mut session = Session::new(
+                Herdr::at(&socket).unwrap(),
+                Store::at(state),
+                || NOW,
+                |_| Ok(()),
+            );
+            session.act(KEY, Action::ToggleSettle).unwrap()
+        });
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert!(fake.take("pane.close").is_empty(), "it waits for the lock");
+        Herdr::at(&fake.socket)
+            .unwrap()
+            .close_pane("w1:p2")
+            .unwrap();
+        fake.take("pane.close");
+        drop(held);
+        let outcome = settling.join().unwrap();
+        assert!(fake.take("pane.close").is_empty(), "{outcome:?}");
+        assert!(
+            matches!(
+                outcome,
+                Outcome::Done {
+                    notice: Some(_),
+                    ..
+                }
+            ),
+            "kept open as the workspace's last pane: {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn a_landed_settle_closes_its_pane_even_when_publishing_fails() {
+        let fake = FakeHerdr::start(vec![
+            resumable_agent("w1:p1", "working", 3),
+            resumable_agent("w1:p2", "idle", 4),
+        ]);
+        let (mut session, _) = connect(&fake);
+        session.act(KEY, Action::ToggleSettle).unwrap();
+        {
+            let mut agents = fake.agents.lock().unwrap();
+            agents[0]["agent_status"] = json!("idle");
+            agents[0]["state_change_seq"] = json!(9);
+        }
+        *fake.fail_method.lock().unwrap() = Some("pane.report_metadata".into());
+        assert!(session.sync().is_err());
+        *fake.fail_method.lock().unwrap() = None;
+        assert_eq!(fake.take("pane.close"), [json!({"pane_id": "w1:p1"})]);
+    }
+
+    #[test]
+    fn a_new_agent_falls_back_from_a_gone_workspace_and_branches_from_the_repo() {
+        let fake = FakeHerdr::start(vec![]);
+        fake.workspaces.lock().unwrap().push(json!({
+            "workspace_id": "w2", "label": "auth-fix", "tab_count": 1, "pane_count": 1,
+            "worktree": {"repo_key": "/work/acme-api/.git", "repo_name": "acme-api",
+                         "repo_root": "/work/acme-api", "checkout_path": "/wt/auth-fix",
+                         "is_linked_worktree": true}
+        }));
+        let (mut session, _) = connect(&fake);
+        let agent = |workspace: &str, branch: Option<&str>| NewAgent {
+            workspace_id: Some(workspace.into()),
+            cwd: None,
+            branch: branch.map(str::to_owned),
+            command: "pi",
+        };
+        session.start_agent(&agent("w-gone", None)).unwrap();
+        assert_eq!(fake.take("tab.create")[0]["workspace_id"], Value::Null);
+
+        session.start_agent(&agent("w2", Some("fix/x"))).unwrap();
+        assert_eq!(
+            fake.take("worktree.create")[0],
+            json!({"cwd": "/work/acme-api", "branch": "fix/x", "focus": true}),
+            "a worktree starts from its repository, not from another worktree"
+        );
+        assert_eq!(fake.take("worktree.list")[0], json!({"workspace_id": "w2"}));
+        session
+            .start_agent(&agent("w-gone", Some("fix/y")))
+            .unwrap();
+        assert_eq!(
+            fake.take("worktree.list"),
+            [json!({})],
+            "a gone workspace: the active one's repository"
+        );
+        assert_eq!(
+            fake.take("worktree.create")[0],
+            json!({"cwd": "/work/acme-api", "branch": "fix/y", "focus": true})
+        );
+    }
+
+    #[test]
+    fn a_new_agent_in_the_current_workspace_drops_a_gone_workspaces_directory() {
+        let fake = FakeHerdr::start(vec![]);
+        let (mut session, _) = connect(&fake);
+        let dir = tempfile::tempdir().unwrap();
+        let gone = NewAgent {
+            workspace_id: Some("w-gone".into()),
+            cwd: Some(dir.path().to_str().unwrap().to_owned()),
+            branch: None,
+            command: "claude",
+        };
+        session.start_agent(&gone).unwrap();
+        assert_eq!(
+            fake.take("tab.create")[0],
+            json!({"workspace_id": null, "cwd": null, "focus": true}),
+            "the gone workspace's directory may be another project's"
+        );
+    }
+
+    #[test]
+    fn a_settled_agent_whose_pane_will_not_close_says_so() {
+        let fake = FakeHerdr::start(vec![
+            resumable_agent("w1:p1", "working", 3),
+            resumable_agent("w1:p2", "idle", 4),
+        ]);
+        let (mut session, _) = connect(&fake);
+        session.act(KEY, Action::ToggleSettle).unwrap();
+        {
+            let mut agents = fake.agents.lock().unwrap();
+            agents[0]["agent_status"] = json!("idle");
+            agents[0]["state_change_seq"] = json!(9);
+        }
+        *fake.fail_method.lock().unwrap() = Some("pane.close".into());
+        session.sync().unwrap();
+        let notices = fake.take("notification.show");
+        assert!(
+            notices.iter().any(|n| n["title"]
+                .as_str()
+                .is_some_and(|t| t.starts_with("A settled agent's pane didn't close"))),
+            "{notices:?}"
+        );
+    }
+
+    #[test]
     fn a_snooze_arms_its_wake_only_once_triage_accepts_it() {
-        let fake = FakeHerdr::start(vec![fake_herdr::agent("w1:p1", "blocked", 3)]);
+        let fake = FakeHerdr::start(vec![fake_herdr::agent("w1:p1", "idle", 3)]);
         let (mut session, armed) = connect(&fake);
         let key = "terminal:t-w1:p1";
-        let refused = session.act(key, Action::Snooze(NOW + 3600)).unwrap();
+        let gone = "terminal:t-w1:p9";
+        let refused = session.act(gone, Action::Snooze(NOW + 3600)).unwrap();
         assert!(matches!(refused, Outcome::Refused(_)), "{refused:?}");
         assert!(armed.borrow().is_empty());
 
-        fake.agents.lock().unwrap()[0]["agent_status"] = json!("idle");
         let snoozed = session.act(key, Action::Snooze(NOW + 3600)).unwrap();
         assert_eq!(snoozed, done(key));
         session.view().unwrap();
@@ -1532,6 +1934,9 @@ mod tests {
             park,
             pinned: false,
             changed_at: None,
+            status: triage::Status::Idle,
+            settle_pending: false,
+            workspace_panes: 0,
             title: None,
             launched_by: None,
             thread: Thread::default(),

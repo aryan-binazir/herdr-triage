@@ -7,7 +7,7 @@ use rusqlite::{Connection, OptionalExtension, Transaction, params};
 
 use crate::triage::{Park, Record, Section, SessionRef, State, Status, Thread, Unread};
 
-const SCHEMA_VERSION: i32 = 6;
+const SCHEMA_VERSION: i32 = 7;
 
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS threads (
@@ -38,7 +38,8 @@ CREATE TABLE IF NOT EXISTS threads (
     reopen_generation TEXT,
     restored_at INTEGER,
     title TEXT,
-    launched_by TEXT
+    launched_by TEXT,
+    settle_requested TEXT
 );
 CREATE TABLE IF NOT EXISTS settings (name TEXT PRIMARY KEY, value TEXT NOT NULL);
 ";
@@ -133,6 +134,17 @@ impl Store {
         self.dir.join("sync.requested")
     }
 
+    pub fn close_lock(&self) -> io::Result<fs::File> {
+        fs::create_dir_all(&self.dir)?;
+        let lock = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(self.dir.join("close.lock"))?;
+        lock.lock()?;
+        Ok(lock)
+    }
+
     fn lock_file(&self) -> io::Result<fs::File> {
         fs::create_dir_all(&self.dir)?;
         OpenOptions::new()
@@ -210,12 +222,13 @@ impl std::fmt::Display for DatabaseError {
 
 impl std::error::Error for DatabaseError {}
 
-const LATER_COLUMNS: [(&str, &str); 5] = [
+const LATER_COLUMNS: [(&str, &str); 6] = [
     ("ended", "INTEGER NOT NULL DEFAULT 0"),
     ("reopen_generation", "TEXT"),
     ("restored_at", "INTEGER"),
     ("title", "TEXT"),
     ("launched_by", "TEXT"),
+    ("settle_requested", "TEXT"),
 ];
 
 fn add_missing_columns(connection: &Connection) -> rusqlite::Result<()> {
@@ -246,7 +259,8 @@ fn load(tx: &Transaction) -> rusqlite::Result<State> {
         "SELECT key, pinned, park, snooze_until, unread, ack_seq, generation, last_seq, \
          changed_at, touched_at, live, ended, missing_since, last_status, label, agent, cwd, \
          workspace_id, workspace_label, session_source, session_kind, session_value, \
-         reopen_pane, reopen_at, reopen_generation, restored_at, title, launched_by FROM threads",
+         reopen_pane, reopen_at, reopen_generation, restored_at, title, launched_by, \
+         settle_requested FROM threads",
     )?;
     let rows = threads.query_map([], |row| {
         let park = match (row.get::<_, Option<String>>(2)?.as_deref(), row.get(3)?) {
@@ -267,6 +281,7 @@ fn load(tx: &Transaction) -> rusqlite::Result<State> {
             park,
             unread: match row.get::<_, Option<String>>(4)?.as_deref() {
                 Some("manual") => Some(Unread::Manual),
+                Some("left") => Some(Unread::Left),
                 Some("woke") => Some(Unread::Woke),
                 _ => None,
             },
@@ -295,6 +310,7 @@ fn load(tx: &Transaction) -> rusqlite::Result<State> {
             restored_at: row.get(25)?,
             title: row.get(26)?,
             launched_by: row.get(27)?,
+            settle_requested: row.get(28)?,
         };
         Ok((row.get::<_, String>(0)?, record))
     })?;
@@ -346,9 +362,9 @@ fn save(tx: &Transaction, state: &State, before: &State) -> rusqlite::Result<()>
         "INSERT OR REPLACE INTO threads (key, pinned, park, snooze_until, unread, ack_seq, generation, \
          last_seq, changed_at, touched_at, live, ended, missing_since, last_status, label, agent, \
          cwd, workspace_id, workspace_label, session_source, session_kind, session_value, \
-         reopen_pane, reopen_at, reopen_generation, restored_at, title, launched_by) VALUES (?1, ?2, ?3, ?4, ?5, \
-         ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, \
-         ?26, ?27, ?28)",
+         reopen_pane, reopen_at, reopen_generation, restored_at, title, launched_by, settle_requested) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, \
+         ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29)",
     )?;
     for (key, r) in &state.records {
         if before.records.get(key) == Some(r) {
@@ -361,6 +377,7 @@ fn save(tx: &Transaction, state: &State, before: &State) -> rusqlite::Result<()>
         };
         let unread = r.unread.map(|unread| match unread {
             Unread::Manual => "manual",
+            Unread::Left => "left",
             Unread::Woke => "woke",
         });
         let session = r.thread.session.as_ref();
@@ -393,6 +410,7 @@ fn save(tx: &Transaction, state: &State, before: &State) -> rusqlite::Result<()>
             r.restored_at,
             r.title,
             r.launched_by,
+            r.settle_requested,
         ])?;
     }
     if before.open_sections != state.open_sections {
@@ -459,9 +477,9 @@ mod tests {
             "INSERT INTO threads (key, pinned, park, snooze_until, unread, ack_seq, generation, \
              last_seq, changed_at, touched_at, live, ended, missing_since, last_status, label, agent, \
              cwd, workspace_id, workspace_label, session_source, session_kind, session_value, \
-             reopen_pane, reopen_at, reopen_generation, restored_at, title, launched_by) VALUES (?1, ?2, ?3, ?4, \
-             ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, \
-             ?25, ?26, ?27, ?28)",
+             reopen_pane, reopen_at, reopen_generation, restored_at, title, launched_by, settle_requested) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, \
+             ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29)",
         )?;
         for (key, r) in &state.records {
             let (park, until) = match r.park {
@@ -471,6 +489,7 @@ mod tests {
             };
             let unread = r.unread.map(|unread| match unread {
                 Unread::Manual => "manual",
+                Unread::Left => "left",
                 Unread::Woke => "woke",
             });
             let session = r.thread.session.as_ref();
@@ -503,6 +522,7 @@ mod tests {
                 r.restored_at,
                 r.title,
                 r.launched_by,
+                r.settle_requested,
             ])?;
         }
         let sections: Vec<&str> = state
@@ -561,6 +581,7 @@ mod tests {
             restored_at: Some(1_300),
             title: Some("checkout flow".into()),
             launched_by: Some("client:claude-code".into()),
+            settle_requested: Some("term-7".into()),
         }
     }
 
@@ -579,7 +600,7 @@ mod tests {
                 .pragma_query_value(None, "user_version", |r| r.get::<_, i32>(0))
                 .unwrap()
         };
-        assert_eq!(version(), 6);
+        assert_eq!(version(), SCHEMA_VERSION);
         observer.pragma_update(None, "user_version", 99).unwrap();
         store.transact(|_| ()).unwrap();
         assert_eq!(version(), 99);

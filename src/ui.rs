@@ -8,8 +8,8 @@ use ratatui::widgets::{
     Block, BorderType, Cell, HighlightSpacing, Padding, Paragraph, Row, Table, TableState,
 };
 
-use crate::picker::{Item, ListRow, Mode, Picker, Target};
-use crate::triage::{Action, Attention, Display, Section, Unread};
+use crate::picker::{Item, ListRow, Mode, NEW_AGENTS, NewAgentPrompt, Picker, Target};
+use crate::triage::{Action, Attention, Display, Section};
 
 const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const HIGHLIGHT: &str = "▎ ";
@@ -450,7 +450,7 @@ fn row<'a>(
         Display::Working => Style::new().yellow(),
         Display::Blocked => Style::new().red(),
         Display::Done => Style::new().cyan(),
-        Display::Unread(Unread::Manual | Unread::Woke) => Style::new().cyan().bold(),
+        Display::Unread(_) => Style::new().cyan().bold(),
         Display::Idle | Display::Unknown => Style::new().dim(),
     };
     let row_cells = [
@@ -516,7 +516,9 @@ fn draw_empty(frame: &mut Frame, picker: &Picker, area: Rect) {
     frame.render_widget(Paragraph::new(text).alignment(Alignment::Center), rect);
 }
 
-fn hints(pairs: &[(&'static str, &'static str)]) -> Line<'static> {
+type Hint = (&'static str, Cow<'static, str>);
+
+fn hints(pairs: &[Hint]) -> Line<'static> {
     let mut spans = vec![Span::raw(" ")];
     for (i, (key, action)) in pairs.iter().enumerate() {
         if i > 0 {
@@ -529,11 +531,7 @@ fn hints(pairs: &[(&'static str, &'static str)]) -> Line<'static> {
 }
 
 /// Hints that fit `width`, dropping whole pairs in `droppable` order rather than cutting one.
-fn fitted_hints(
-    mut pairs: Vec<(&'static str, &'static str)>,
-    droppable: &[&str],
-    width: usize,
-) -> Line<'static> {
+fn fitted_hints(mut pairs: Vec<Hint>, droppable: &[&str], width: usize) -> Line<'static> {
     for key in droppable {
         if hints(&pairs).width() <= width {
             break;
@@ -593,7 +591,7 @@ fn rename_line(text: &str, room: usize) -> Line<'static> {
 fn labelled_prompt(
     verb: Span<'static>,
     label: &str,
-    punct: &'static str,
+    punct: &str,
     options: Vec<Span<'static>>,
     width: usize,
 ) -> Line<'static> {
@@ -613,7 +611,7 @@ fn labelled_prompt(
     if let Some(label) = quoted {
         spans.push(Span::raw(format!(" “{label}”")));
     }
-    spans.push(Span::raw(punct));
+    spans.push(Span::raw(punct.to_owned()));
     spans.extend(options);
     if Line::from(spans.clone()).width() + cancel.iter().map(Span::width).sum::<usize>() <= width {
         spans.extend(cancel);
@@ -621,8 +619,48 @@ fn labelled_prompt(
     Line::from(spans)
 }
 
+fn new_agent_line(prompt: &NewAgentPrompt, width: usize) -> (Line<'static>, Option<usize>) {
+    if let Some(text) = &prompt.typing_branch {
+        let head = " new worktree on branch: ";
+        let room = width.saturating_sub(cells(head) + cells("  enter ok  esc back"));
+        let text = tail(text, room);
+        let line = Line::from(vec![
+            Span::raw(" new worktree").cyan().bold(),
+            Span::raw(format!(" on branch: {text}")),
+            Span::raw("  enter"),
+            Span::from(" ok").dim(),
+            Span::raw("  esc"),
+            Span::from(" back").dim(),
+        ]);
+        return (line, Some(cells(head) + cells(&text)));
+    }
+    let mut options: Vec<Span<'static>> = NEW_AGENTS
+        .iter()
+        .enumerate()
+        .flat_map(|(i, agent)| {
+            [
+                Span::raw(format!("  {}", i + 1)),
+                Span::from(format!(" {agent}")).dim(),
+            ]
+        })
+        .collect();
+    options.extend([Span::raw("  w"), Span::from(" new worktree").dim()]);
+    let punct = match &prompt.branch {
+        Some(branch) => format!(" on new worktree {branch}"),
+        None => String::new(),
+    };
+    let verb = Span::from("new agent in").cyan().bold();
+    (
+        labelled_prompt(verb, &prompt.label, &punct, options, width),
+        None,
+    )
+}
+
 /// The footer prompt, if one is open, and where the typing cursor sits in it.
 fn prompt_line(picker: &Picker, width: usize) -> Option<(Line<'static>, Option<usize>)> {
+    if let Some(prompt) = picker.new_agent_prompt() {
+        return Some(new_agent_line(prompt, width));
+    }
     if let Some(prompt) = picker.rename_prompt() {
         let room = width.saturating_sub(cells(" rename: ") + cells("  enter save  esc cancel"));
         let text = tail(&prompt.text, room);
@@ -637,16 +675,38 @@ fn prompt_line(picker: &Picker, width: usize) -> Option<(Line<'static>, Option<u
             None,
         ));
     }
+    if let Some(prompt) = picker.close_prompt() {
+        let options = vec![
+            Span::raw("  y"),
+            Span::from(" close").dim(),
+            Span::raw("  n"),
+            Span::from(" settle, keep it open").dim(),
+        ];
+        let verb = Span::from("close").red().bold();
+        return Some((
+            labelled_prompt(
+                verb,
+                &prompt.label,
+                " for good? (can't resume)",
+                options,
+                width,
+            ),
+            None,
+        ));
+    }
     if let Some(prompt) = picker.snooze_prompt() {
         let options = prompt
             .presets
             .iter()
             .enumerate()
-            .flat_map(|(i, preset)| {
-                [
-                    Span::raw(format!("  {}", i + 1)),
-                    Span::from(format!(" {}", preset.label())).dim(),
-                ]
+            .flat_map(|(i, &(preset, offered))| {
+                let digit = Span::raw(format!("  {}", i + 1));
+                let label = Span::from(format!(" {}", preset.label())).dim();
+                if offered {
+                    [digit, label]
+                } else {
+                    [digit.dim().crossed_out(), label.crossed_out()]
+                }
             })
             .collect();
         let verb = Span::from("snooze").yellow().bold();
@@ -674,6 +734,12 @@ fn footer_line(picker: &Picker, width: usize) -> (Line<'static>, Option<usize>) 
         return (Line::from(mark), None);
     }
     let mut pairs: Vec<(&str, &str)> = enter_hint(picker).into_iter().collect();
+    let owned = |pairs: Vec<(&'static str, &'static str)>| -> Vec<Hint> {
+        pairs
+            .into_iter()
+            .map(|(k, a)| (k, Cow::Borrowed(a)))
+            .collect()
+    };
     let line = match picker.mode() {
         Mode::Navigate => {
             pairs.extend([("j/k", "move"), ("/", "search")]);
@@ -685,6 +751,8 @@ fn footer_line(picker: &Picker, width: usize) -> (Line<'static>, Option<usize>) 
                         "s",
                         if parked(Section::Settled) {
                             "unsettle"
+                        } else if item.row.settle_pending {
+                            "cancel settle"
                         } else {
                             "settle"
                         },
@@ -711,16 +779,26 @@ fn footer_line(picker: &Picker, width: usize) -> (Line<'static>, Option<usize>) 
                     }
                 }
             }
-            if picker.undoable() {
-                pairs.push(("U", "undo"));
-            }
+            let undo_at = pairs.len();
             if picker.filter().is_empty() {
                 pairs.push(("esc/q", "close"));
             } else {
                 pairs.extend([("esc", "clear search"), ("q", "close")]);
             }
-            pairs.push(("1-9/0", "open"));
-            fitted_hints(pairs, &["1-9/0", "j/k", "/", "r", "p", "u", "U"], width)
+            pairs.extend([("n", "new agent"), ("1-9/0", "open")]);
+            let mut pairs = owned(pairs);
+            if let Some((verb, label)) = picker.undo() {
+                let label = ellipsize(label, MIN_LABEL * 3);
+                pairs.insert(undo_at, ("U", format!("undo {verb} “{label}”").into()));
+                if hints(&pairs).width() > width {
+                    pairs[undo_at].1 = Cow::Borrowed("undo");
+                }
+            }
+            fitted_hints(
+                pairs,
+                &["1-9/0", "n", "j/k", "/", "r", "p", "u", "U"],
+                width,
+            )
         }
         Mode::Search => {
             pairs.push(("esc", "done"));
@@ -728,7 +806,7 @@ fn footer_line(picker: &Picker, width: usize) -> (Line<'static>, Option<usize>) 
                 pairs.push(("^j/^k", "move"));
             }
             pairs.extend([("^u", "clear"), ("^w", "delete word")]);
-            fitted_hints(pairs, &["^w", "^u", "^j/^k"], width)
+            fitted_hints(owned(pairs), &["^w", "^u", "^j/^k"], width)
         }
     };
     (line, None)
@@ -869,6 +947,78 @@ mod tests {
             lines[13].contains(
                 "snooze “fix flaky test”  1 1h  2 3h  3 today 18:00  4 tomorrow 09:00  5 next Mon 09:00  esc cancel"
             )
+        );
+    }
+
+    #[test]
+    fn an_evening_preset_too_close_to_offer_stays_in_place_crossed_out() {
+        let mut picker = picker();
+        let evening = NOW + 4 * 3_600 + 40 * 60;
+        picker.key(
+            KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE),
+            evening,
+            &chrono::Utc,
+        );
+        let (lines, buffer) = render(&mut picker, 120, 14);
+        assert!(
+            lines[13].contains("3 today 18:00  4 tomorrow 09:00"),
+            "{}",
+            lines[13]
+        );
+        let x = |text: &str| {
+            let byte = lines[13].find(text).unwrap();
+            u16::try_from(lines[13][..byte].chars().count()).unwrap()
+        };
+        let crossed = |x| buffer[(x, 13)].modifier.contains(Modifier::CROSSED_OUT);
+        assert!(crossed(x("today")) && crossed(x("3 today")));
+        assert!(!crossed(x("tomorrow")) && !crossed(x("4 tomorrow")));
+    }
+
+    #[test]
+    fn settling_an_agent_that_cannot_be_resumed_asks_in_the_footer() {
+        let fixture = Fixture::new(NOW, &[("p1", "fix flaky test", Status::Done)]);
+        let mut items = listed(&fixture);
+        items[0].row.thread.session = None;
+        let mut picker = Picker::new(items, Some("p1"), &BTreeSet::new());
+        press(&mut picker, KeyCode::Char('s'));
+        let (lines, _) = render(&mut picker, 120, 14);
+        assert!(
+            lines[13].contains(
+                "close “fix flaky test” for good? (can't resume)  y close  n settle, keep it open  esc cancel"
+            ),
+            "{}",
+            lines[13]
+        );
+    }
+
+    #[test]
+    fn the_new_agent_prompt_offers_agents_and_a_worktree() {
+        let mut picker = picker();
+        press(&mut picker, KeyCode::Char('n'));
+        let (lines, _) = render(&mut picker, 120, 14);
+        assert!(
+            lines[13].contains(
+                "new agent in “acme-api”  1 claude  2 codex  3 opencode  4 pi  w new worktree  esc cancel"
+            ),
+            "{}",
+            lines[13]
+        );
+        press(&mut picker, KeyCode::Char('w'));
+        for c in "fix/x".chars() {
+            press(&mut picker, KeyCode::Char(c));
+        }
+        let (lines, _) = render(&mut picker, 120, 14);
+        assert!(
+            lines[13].contains("new worktree on branch: fix/x  enter ok  esc back"),
+            "{}",
+            lines[13]
+        );
+        press(&mut picker, KeyCode::Enter);
+        let (lines, _) = render(&mut picker, 120, 14);
+        assert!(
+            lines[13].contains("new agent in “acme-api” on new worktree fix/x  1 claude"),
+            "{}",
+            lines[13]
         );
     }
 
@@ -1135,13 +1285,27 @@ mod tests {
     }
 
     #[test]
-    fn undo_is_offered_only_when_there_is_something_to_undo() {
+    fn undo_is_offered_only_when_there_is_something_to_undo_and_names_it() {
         let mut picker = picker();
         let (lines, _) = render(&mut picker, 160, 14);
         assert!(!lines[13].contains("U undo"), "{}", lines[13]);
-        picker.set_undoable(true);
+        picker.set_undo(Some(("settle", "docs pass".into())));
         let (lines, _) = render(&mut picker, 160, 14);
-        assert!(lines[13].contains("r rename  U undo"), "{}", lines[13]);
+        assert!(
+            lines[13].contains("r rename  U undo settle “docs pass”"),
+            "{}",
+            lines[13]
+        );
+        picker.set_undo(Some((
+            "snooze",
+            "a very long thread title that goes on and on".into(),
+        )));
+        let (lines, _) = render(&mut picker, 160, 14);
+        assert!(
+            lines[13].contains("U undo snooze “a very long thread titl…”"),
+            "{}",
+            lines[13]
+        );
     }
 
     #[test]
@@ -1242,7 +1406,7 @@ mod tests {
     #[test]
     fn narrow_footers_drop_whole_hints_but_keep_the_triage_keys_and_close() {
         let mut picker = picker();
-        picker.set_undoable(true);
+        picker.set_undo(Some(("settle", "docs pass".into())));
         let (lines, _) = render(&mut picker, 80, 14);
         let footer = lines[13].trim_end();
         assert!(
@@ -1378,7 +1542,7 @@ mod tests {
         let mut list = listed(&fixture);
         assert_eq!(
             [list[0].status.as_str(), list[1].status.as_str()],
-            ["working", "snoozed · 3h · stays open"]
+            ["working 1m", "snoozed · 3h · stays open"]
         );
         list[0].focused = true;
         "mobile · api".clone_into(&mut list[1].location);
@@ -1498,7 +1662,7 @@ mod tests {
         let (lines, buffer) = render(&mut picker, 100, 14);
         let shown = |label: &str| lines.iter().position(|l| l.contains(label)).unwrap();
         for (label, status) in [
-            ("api refactor", "blocked"),
+            ("api refactor", "blocked 1m"),
             ("old spike", "unread · closed"),
             ("bench run", "snoozed · 1h · stays open"),
             ("release notes", "settled · stays open"),

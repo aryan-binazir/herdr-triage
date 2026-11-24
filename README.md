@@ -61,24 +61,28 @@ rows = [
 | `enter` | focus agent · reopen closed thread · open/close section | same |
 | `1`–`9`, `0` | open row 1–10 on screen | typed |
 | `/` | search (edits the kept search) | — |
-| `s` | settle / unsettle | typed |
+| `s` | settle / unsettle (asks first if it would close an agent for good) | typed |
 | `z` | snooze (1h, 3h, today 18:00, tomorrow 09:00, next Mon 09:00; press the digit shown beside one) / wake | typed |
 | `u` | mark read / unread | typed |
 | `p` | pin / unpin | typed |
 | `r` | rename the thread (`enter` saves; an empty title restores the automatic one) | typed |
-| `U` | undo the last triage change or rename | typed |
+| `U` | undo the last triage change or rename (the footer names it, e.g. `U undo settle “docs pass”`) | typed |
+| `n` | new agent where the selected thread lives: `1`–`4` start claude, codex, opencode or pi in a new tab; `w` first asks for a branch and starts it in a new worktree | typed |
 | `D` | forget a closed thread (asks `y`) | typed |
 | `esc` | clear the search, else close | leave search, keeping it |
-| `q` | close | typed |
+| `q` | close (cancels an open prompt) | typed |
 | `^u` / `^w` | — | clear / delete word |
 
-The picker opens on the agent you invoked it from. Agents busy working (unless pinned) collect in a
+The picker opens on the agent you invoked it from. The Workspace column names each thread's project:
+a Herdr worktree workspace leads with its repository (`acme-api/auth-fix`), a T3 thread shows its T3
+project. Agents busy working (unless pinned) collect in a
 `▸ working · N` section below the threads that need you; snoozed and settled threads collect in
 `▸ snoozed · N` and `▸ settled · N` sections at the bottom. Sections stay collapsed until you open
 them, and the picker remembers which are open. A search looks inside them too. After you settle or
 snooze a thread, the cursor moves on to the next one that needs you: blocked first, then done or
-unread. `z` swaps the footer for a snooze prompt; pick a time with the digit beside it. `today 18:00`
-is offered until 30 minutes before, so later in the day the digits after it shift down:
+unread. `z` swaps the footer for a snooze prompt; pick a time with the digit beside it, or `esc`/`q`
+to cancel. Each time keeps its digit: from 30 minutes before 18:00, `today 18:00` is crossed out
+and refused. A time that has passed while the prompt was open is refused too:
 
 ![The snooze prompt in the picker footer: 1 1h, 2 3h, 3 today 18:00, 4 tomorrow 09:00, 5 next Mon 09:00, esc cancel](docs/snooze.png)
 
@@ -93,13 +97,15 @@ is offered until 30 minutes before, so later in the day the digits after it shif
   counter advancing).
 - **Snooze** (`z`) parks it until the chosen time; then it returns marked *woke*. The picker shows
   the time left (`snoozed · 45m`). An agent that blocks on you wakes early; other activity, including
-  a snoozed agent finishing its work, does not. Viewing the agent clears *woke*.
+  a snoozed agent finishing its work, does not. Herdr shows a notification when a snooze comes due
+  (`Woke: <thread>`). Viewing the agent clears *woke*.
 - **Closing:** settling an agent closes its pane. If Herdr can resume its session (Claude, Codex,
   OpenCode or Pi with Herdr's integration), the thread stays listed as closed and snoozing closes
-  it too. An agent with no session to resume is closed for good when settled: Herdr notifies you,
-  the thread leaves the picker and undo can't bring it back. Snoozing one, or settling one whose
+  it too. Settling an agent with no session to resume first asks: `y` closes it for good (Herdr
+  notifies you, the thread leaves the picker and undo can't bring it back), `n` settles it and
+  keeps its pane open. Snoozing one, or settling one whose
   state Herdr can't tell (`unknown`), leaves it open, as does snoozing an agent that is still
-  working, and so does the last pane of a workspace; these are marked `stays open`. Codex only reports its session to Herdr when it runs without its shared
+  working or blocked, and so does the last pane of a workspace; these are marked `stays open`. Codex only reports its session to Herdr when it runs without its shared
   app-server: start it with `codex --no-daemon` (or alias `codex` to that).
 - **After a Herdr restart,** Herdr relaunches restored agents; state changes in the first 20 seconds
   are not treated as new activity, so parked threads stay parked.
@@ -111,19 +117,23 @@ is offered until 30 minutes before, so later in the day the digits after it shif
   Herdr accepting the launch command does not guarantee that the application starts successfully;
   application errors remain visible in the new tab.
 - **Unread** (`u`) on a done or unread thread marks it read without visiting it; on any other it marks
-  it unread until you press `u` again or the agent's next turn. Marking a parked thread unread brings
-  it back without reopening it.
+  it unread until you press `u` again, the agent's next turn, or you read it: go to another agent and
+  come back to it, or reopen it if it was closed. Marking a parked thread unread brings it back
+  without reopening it.
 - A thread whose session ends some other way settles as closed, even if you hadn't seen its result,
   unless you marked it unread or a snooze woke it: then it stays open as `unread · closed` or
-  `woke · closed`. Settle and unread are refused while an agent is working or blocked;
-  snooze only while it is blocked.
+  `woke · closed`. Settling a working agent settles it when its turn ends (`working · settles
+  when done`, closing its pane then if it can be resumed; `s` again calls it off), unless the turn
+  ends blocked on you. Settle is refused while an agent is blocked, unread while it is working or
+  blocked; snooze works in any state.
 - **Undo** (`U`) takes back the last settle, snooze, wake, unread, pin or rename, once. It never closes
   a pane; undoing a settle or snooze that closed a session reopens it, unless it closed for good.
   Once the agent has done
   something new, undo can still bring a thread back but won't park it again. Forgetting a thread
   can't be undone.
 - **Rename** (`r`) gives a thread its own title in the picker; search still finds the automatic one.
-- **`next`** focuses blocked agents first, then done or unread ones, skipping parked and closed threads.
+- **`next`** focuses blocked agents first, then done, unread or woke ones, reopening a closed thread
+  among them; it skips parked threads.
 
 Closed threads are forgotten after 30 days untouched unless pinned; `D` forgets one now. Agents
 without a resumable session are forgotten once they exit.
@@ -138,8 +148,8 @@ points at it, and `enter` (or its digit) opens it in the T3 desktop app through 
 - Rows show T3's own state in the picker's words: running is *working*, waiting on you is
   *blocked*, a finished run you haven't opened since is *done*, otherwise *idle*. T3's settles,
   snoozes and pins place the row as Herdr's do; working threads join the `working` section.
-- T3 rows follow the Herdr rows of the same rank, newest first; snoozed rows of either kind wake
-  in order. Settled T3 threads untouched for 30 days are left out. Subagent and side-chat
+- T3 rows mix with Herdr's by rank and most recent change, ahead of closed Herdr threads of the
+  same rank; snoozed rows of either kind wake in order. Settled T3 threads untouched for 30 days are left out. Subagent and side-chat
   threads stay under their parent, as in T3.
 - `s`, `z`, `p` and `u` on a T3 row have T3 settle or unsettle, snooze (same presets) or wake,
   pin or unpin, and mark unread the thread; the row moves once T3 has done it. T3 decides what it
