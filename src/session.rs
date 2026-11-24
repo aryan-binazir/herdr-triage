@@ -394,10 +394,11 @@ impl Session {
             {
                 return Ok(());
             }
-            if state.is_live(plan)
-                && let Some(agent) = herdr.agents()?.iter().find(|a| a.key() == plan.key())
-            {
-                return herdr.focus(&agent.pane_id);
+            if !state.awaits_reopen(plan) {
+                return match herdr.agents()?.iter().find(|a| a.key() == plan.key()) {
+                    Some(agent) => herdr.focus(&agent.pane_id),
+                    None => Ok(()),
+                };
             }
             let pane = herdr.create_tab(launch.workspace, cwd)?;
             let launched = match launch.session_to_report {

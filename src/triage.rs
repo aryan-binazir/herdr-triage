@@ -970,10 +970,12 @@ impl State {
         }
     }
 
-    pub fn is_live(&self, plan: &ReopenPlan) -> bool {
+    /// The thread `plan` reopens is still closed: not live again, nor adopted by a resumed
+    /// session under a new key.
+    pub fn awaits_reopen(&self, plan: &ReopenPlan) -> bool {
         self.records
             .get(&plan.key)
-            .is_some_and(|record| record.live)
+            .is_some_and(|record| !record.live)
     }
 
     /// The pane a reopen of `plan`'s thread launched moments ago on this server, if one did since
@@ -2721,6 +2723,28 @@ mod tests {
         };
         state.reconcile(GEN, &[focused_a, agent("b", Status::Idle, 7)], NOW + 1);
         assert_eq!(shown(&state, &a), (Display::Idle, None));
+    }
+
+    #[test]
+    fn a_reopen_plan_is_stale_once_its_thread_was_adopted_under_a_new_session() {
+        let kept = resumable("a", Status::Idle, 4);
+        let mut state = State::default();
+        closed_settled(&mut state, &kept);
+        let Ok(After::Reopen(plan)) = state.apply("a", None, Action::Reopen, NOW + 20) else {
+            panic!("a reopen")
+        };
+        assert!(state.awaits_reopen(&plan));
+        state.report_reopen(&plan, "pane-new", GEN, NOW + 20);
+        let resumed = Observed {
+            pane_id: "pane-new".into(),
+            ..resumable("b", Status::Idle, 9)
+        };
+        state.reconcile(GEN, std::slice::from_ref(&resumed), NOW + 21);
+        assert!(state.records.contains_key("b") && !state.records.contains_key("a"));
+        assert!(
+            !state.awaits_reopen(&plan),
+            "adopted under its new session: launch nothing"
+        );
     }
 
     #[test]
