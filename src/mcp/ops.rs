@@ -509,17 +509,18 @@ pub fn launch_tool(call: &mut Call, args: &LaunchArgs) -> Done {
         ));
     }
     let workspaces = call.workspaces()?;
-    let own_workspace = || {
-        let own = threads
-            .items
-            .iter()
-            .find(|item| item.row.key == threads.caller)?;
-        own.row.thread.workspace_id.as_deref()
+    // The caller's pane says where it runs, whether or not Herdr knows it as an agent.
+    let own_workspace = match &call.env.caller_pane {
+        Some(pane) => call
+            .ask("pane.get", &json!({"pane_id": pane}), QUICK)
+            .ok()
+            .and_then(|found| found["pane"]["workspace_id"].as_str().map(str::to_owned)),
+        None => None,
     };
     let query = args
         .project
         .as_deref()
-        .or_else(own_workspace)
+        .or(own_workspace.as_deref())
         .ok_or_else(|| {
             Failure::new(
                 "project_required",

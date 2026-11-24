@@ -758,6 +758,14 @@ mod tests {
     }
 
     #[test]
+    fn a_caller_herdr_does_not_list_as_an_agent_still_launches_in_its_own_project() {
+        let mut rig = rig(vec![], Some("w3:p7"));
+        rig.ok("herdr_launch", json!({"title": "From a script"}));
+        assert_eq!(rig.fake.take("worktree.create")[0]["workspace_id"], "w3");
+        assert_eq!(rig.threads()[0]["mine"], true);
+    }
+
+    #[test]
     fn launches_stop_at_the_configured_number_of_open_threads() {
         let mut rig = rig(vec![], None);
         fs::write(&rig.server.env.config, "limits: {max_open: 1}\n").unwrap();

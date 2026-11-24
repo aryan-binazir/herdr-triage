@@ -249,6 +249,15 @@ fn agent_api(
             }
             json!({"type": "agent_info", "agent": found})
         }
+        "pane.get" => {
+            // A pane with no agent in it is in the workspace its id names.
+            let pane = params["pane_id"].as_str().unwrap();
+            let workspace = agents.iter().find(|a| a["pane_id"] == pane).map_or_else(
+                || json!(pane.split(':').next()),
+                |a| a["workspace_id"].clone(),
+            );
+            json!({"type": "pane_info", "pane": {"pane_id": pane, "workspace_id": workspace}})
+        }
         "agent.wait" => json!({"type": "wait_matched"}),
         "agent.read" | "pane.read" => json!({"type": "pane_read", "read": {
             "pane_id": params["target"], "text": *screen.lock().unwrap(), "truncated": false,
