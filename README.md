@@ -131,9 +131,11 @@ and refused. A time that has passed while the prompt was open is refused too:
   Once the agent has done
   something new, undo can still bring a thread back but won't park it again. Forgetting a thread
   can't be undone.
-- **Rename** (`r`) gives a thread its own title, in the picker and as the agent's name in Herdr, so
-  the sidebar shows it too; search still finds the automatic one. Clearing the title clears only the
-  name triage gave, not one you set in Herdr since.
+- **Rename** (`r`) gives a thread its own title in the picker, and names the agent after it in
+  Herdr so the sidebar shows it too, in the form Herdr accepts (`Fix flaky test` → `fix-flaky-test`).
+  Herdr refusing the name (another agent has it) leaves the sidebar as it was. A name you give the
+  agent in Herdr afterwards stays, and clearing the title clears only a name triage gave. Search
+  still finds the automatic title.
 - **`next`** focuses blocked agents first, then done, unread or woke ones, reopening a closed thread
   among them; it skips parked threads.
 

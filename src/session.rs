@@ -511,32 +511,21 @@ fn publish(herdr: &mut Herdr, agents: &[Agent], rows: &[Row], now: i64) -> io::R
             continue;
         };
         let agent = &agents[index];
-        // The name triage last gave the agent in Herdr, so clearing a title clears only that.
-        let pushed = agent.tokens.get("triage_name");
-        let rename = match (&row.title, pushed) {
-            (Some(title), _) if agent.name.as_ref() != Some(title) => Some(Some(title.as_str())),
-            (None, Some(pushed)) if agent.name.as_ref() == Some(pushed) => Some(None),
-            _ => None,
-        };
-        if let Some(name) = rename
-            && let Err(error) = herdr.rename_agent(&agent.pane_id, name)
-        {
-            failure.get_or_insert(error);
-        }
+        let pushed = agent.tokens.get(NAME_TOKEN);
+        let name = name_agent(herdr, agent, row.title.as_deref());
         let rank = row.rank().token().to_owned();
         let label = row.sidebar_label(&pin_icon, now, &Local);
         if agent.tokens.get("triage_rank") == Some(&rank)
             && agent.tokens.get("triage") == label.as_ref()
-            && pushed == row.title.as_ref()
+            && pushed == name.as_ref()
         {
             continue;
         }
         let mut tokens = Map::new();
         tokens.insert("triage_rank".into(), Value::String(rank));
         tokens.insert("triage".into(), label.map_or(Value::Null, Value::String));
-        if row.title.is_some() || pushed.is_some() {
-            let name = row.title.clone().map_or(Value::Null, Value::String);
-            tokens.insert("triage_name".into(), name);
+        if name.is_some() || pushed.is_some() {
+            tokens.insert(NAME_TOKEN.into(), name.map_or(Value::Null, Value::String));
         }
         // A pane can close between the snapshot and here; the others still need their tokens.
         if let Err(error) = herdr.report_tokens(&agent.pane_id, &tokens) {
@@ -545,6 +534,54 @@ fn publish(herdr: &mut Herdr, agents: &[Agent], rows: &[Row], now: i64) -> io::R
     }
     let view = herdr.set_view(&view_label(rows), &Rank::hidden_tokens());
     failure.map_or(view, Err)
+}
+
+/// The pane token remembering the Herdr name triage last gave the agent for its title: `name`
+/// when triage set it, `!name` when Herdr refused it or the agent already had it. Triage pushes a
+/// name only when the title changes, so a name given in Herdr since stays, and clears only a
+/// name it set.
+const NAME_TOKEN: &str = "triage_name";
+
+/// Names the agent in Herdr after its title, best effort, and returns the token to keep.
+fn name_agent(herdr: &mut Herdr, agent: &Agent, title: Option<&str>) -> Option<String> {
+    let pushed = agent.tokens.get(NAME_TOKEN);
+    let owned = pushed.filter(|name| !name.starts_with('!'));
+    let tried = pushed.map(|name| name.trim_start_matches('!'));
+    match title.and_then(agent_name) {
+        Some(name) if tried == Some(name.as_str()) => pushed.cloned(),
+        Some(name) if agent.name.as_ref() == Some(&name) => Some(format!("!{name}")),
+        Some(name) => match herdr.rename_agent(&agent.pane_id, Some(&name)) {
+            Ok(()) => Some(name),
+            Err(_) => Some(format!("!{name}")),
+        },
+        None => match owned {
+            Some(name) if agent.name.as_ref() == Some(name) => herdr
+                .rename_agent(&agent.pane_id, None)
+                .err()
+                .and(pushed.cloned()),
+            _ => None,
+        },
+    }
+}
+
+/// A title as Herdr accepts an agent name: `[a-z][a-z0-9_-]{0,31}`.
+fn agent_name(title: &str) -> Option<String> {
+    let mut name = String::new();
+    for c in title.chars().flat_map(char::to_lowercase) {
+        if c.is_ascii_lowercase() || c.is_ascii_digit() {
+            name.push(c);
+        } else if !name.is_empty() && !name.ends_with('-') {
+            name.push('-');
+        }
+    }
+    if name.is_empty() {
+        return None;
+    }
+    if !name.starts_with(|c: char| c.is_ascii_lowercase()) {
+        name.insert_str(0, "t-");
+    }
+    name.truncate(32);
+    Some(name.trim_end_matches('-').to_owned())
 }
 
 /// One notice for every snooze that came due in a sync.
@@ -611,14 +648,10 @@ fn items(snapshot: &Snapshot, now: i64) -> Vec<Item> {
                 .or_else(|| row.thread.agent.clone())
                 .unwrap_or_else(|| "-".into());
             let cwd = row.thread.cwd.as_deref().unwrap_or_default();
-            // Once triage names an agent in Herdr, its terminal title is the automatic one.
-            let terminal_title = agent
-                .and_then(|agent| agent.terminal_title_stripped.as_deref())
-                .unwrap_or_default();
             Item {
                 target: agent.map_or(Target::Closed, |agent| Target::Pane(agent.pane_id.clone())),
                 search: format!(
-                    "{kind} {} {} {terminal_title} {location} {cwd}",
+                    "{kind} {} {} {location} {cwd}",
                     row.label(),
                     row.thread.label
                 ),
@@ -633,11 +666,12 @@ fn items(snapshot: &Snapshot, now: i64) -> Vec<Item> {
 }
 
 fn thread_label(agent: &Agent) -> String {
+    let given_by_triage = agent.tokens.get(NAME_TOKEN);
     if let Some(name) = agent
         .name
         .as_deref()
         .map(str::trim)
-        .filter(|name| !name.is_empty())
+        .filter(|name| !name.is_empty() && given_by_triage.map(String::as_str) != Some(*name))
     {
         return name.to_owned();
     }
@@ -817,47 +851,86 @@ mod tests {
     }
 
     #[test]
-    fn a_title_names_the_agent_in_herdr_and_clearing_it_clears_only_that_name() {
+    fn a_title_names_the_agent_in_herdr_as_herdr_allows() {
         let fake = FakeHerdr::start(vec![
             fake_herdr::agent("w1:p1", "idle", 3),
             fake_herdr::agent("w1:p2", "idle", 4),
         ]);
-        fake.agents.lock().unwrap()[1]["name"] = json!("named in herdr");
+        fake.agents.lock().unwrap()[0]["terminal_title_stripped"] = json!("claude: auto title");
         let (mut session, _) = connect(&fake);
         let renames = || fake.take("agent.rename");
-        session.view().unwrap();
-        assert!(
-            renames().is_empty(),
-            "a name Herdr already has is left alone"
-        );
-
         let key = "terminal:t-w1:p1";
-        let view = session.rename(key, Some("checkout flow".into())).unwrap();
+        let view = session
+            .rename(key, Some("Fix flaky test (#2)".into()))
+            .unwrap();
         assert_eq!(
             renames(),
-            [json!({"target": "w1:p1", "name": "checkout flow"})]
+            [json!({"target": "w1:p1", "name": "fix-flaky-test-2"})]
         );
-        assert!(
-            view.items
-                .iter()
-                .any(|item| item.row.label() == "checkout flow")
-        );
-        session.view().unwrap();
+        let row = &view.items.iter().find(|i| i.row.key == key).unwrap().row;
+        assert_eq!(row.label(), "Fix flaky test (#2)");
+        let view = session.view().unwrap();
         assert!(renames().is_empty(), "named once");
+        let row = &view.items.iter().find(|i| i.row.key == key).unwrap().row;
+        assert_eq!(row.thread.label, "auto title", "the automatic title stays");
 
         session.rename(key, None).unwrap();
         assert_eq!(renames(), [json!({"target": "w1:p1", "name": null})]);
         session.view().unwrap();
         assert!(renames().is_empty());
+    }
 
-        session.rename(key, Some("mine".into())).unwrap();
-        renames();
-        fake.agents.lock().unwrap()[0]["name"] = json!("renamed in herdr since");
-        session.undo().unwrap();
+    #[test]
+    fn titles_become_names_herdr_accepts() {
+        assert_eq!(
+            agent_name("Fix flaky test").as_deref(),
+            Some("fix-flaky-test")
+        );
+        assert_eq!(agent_name("  --API v2!! ").as_deref(), Some("api-v2"));
+        assert_eq!(agent_name("2026 plan").as_deref(), Some("t-2026-plan"));
+        assert_eq!(agent_name("決済の再試行"), None);
+        let long = agent_name("a very long title that keeps going well past it").unwrap();
+        assert!(long.len() <= 32 && !long.ends_with('-'), "{long}");
+    }
+
+    #[test]
+    fn a_name_herdr_refuses_or_already_has_never_breaks_a_sync_or_gets_cleared() {
+        let fake = FakeHerdr::start(vec![
+            fake_herdr::agent("w1:p1", "idle", 3),
+            fake_herdr::agent("w1:p2", "idle", 4),
+            fake_herdr::agent("w1:p3", "idle", 5),
+        ]);
+        fake.agents.lock().unwrap()[1]["name"] = json!("docs");
+        fake.agents.lock().unwrap()[2]["name"] = json!("mine");
+        let (mut session, _) = connect(&fake);
+        let renames = || fake.take("agent.rename");
+
+        session
+            .rename("terminal:t-w1:p1", Some("Docs".into()))
+            .unwrap();
+        assert_eq!(renames().len(), 1, "taken by p2: Herdr refuses");
+        session.view().unwrap();
+        assert!(renames().is_empty(), "a refused name is not retried");
+
+        session
+            .rename("terminal:t-w1:p3", Some("mine".into()))
+            .unwrap();
+        assert!(renames().is_empty(), "already named so");
+        session.rename("terminal:t-w1:p3", None).unwrap();
+        assert!(renames().is_empty(), "a name triage did not give stays");
+
+        session
+            .rename("terminal:t-w1:p1", Some("checkout".into()))
+            .unwrap();
+        assert_eq!(renames().len(), 1);
+        fake.agents.lock().unwrap()[0]["name"] = json!("renamed-in-herdr");
+        session.view().unwrap();
         assert!(
             renames().is_empty(),
-            "undoing the title keeps a name given in Herdr since"
+            "a name you give in Herdr is not overwritten"
         );
+        session.rename("terminal:t-w1:p1", None).unwrap();
+        assert!(renames().is_empty(), "nor cleared");
     }
 
     #[test]
