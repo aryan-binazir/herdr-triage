@@ -502,14 +502,14 @@ fn publish(herdr: &mut Herdr, agents: &[Agent], rows: &[Row], now: i64) -> io::R
 }
 
 fn view_label(rows: &[Row]) -> String {
-    let count = |rank| rows.iter().filter(|row| row.rank() == rank).count();
-    let (snoozed, settled) = (count(Rank::Snoozed), count(Rank::Settled));
-    // Herdr right-aligns the label after its own "agents" title, so it has to stay short.
-    match (snoozed, settled) {
-        (0, 0) => "triage".into(),
-        (n, 0) => format!("{n} snoozed"),
-        (0, n) => format!("{n} settled"),
-        (a, b) => format!("{} parked", a + b),
+    // Settled threads pile up for a month, so only snoozed ones, which come back, are counted.
+    match rows
+        .iter()
+        .filter(|row| row.rank() == Rank::Snoozed)
+        .count()
+    {
+        0 => "triage".into(),
+        n => format!("{n} snoozed"),
     }
 }
 
@@ -1428,7 +1428,7 @@ mod tests {
     }
 
     #[test]
-    fn the_sidebar_header_counts_parked_threads_within_herdrs_limit() {
+    fn the_sidebar_header_counts_only_snoozed_threads_within_herdrs_limit() {
         let row = |park| Row {
             agent_index: None,
             key: String::new(),
@@ -1440,26 +1440,14 @@ mod tests {
             title: None,
             thread: Thread::default(),
         };
+        let snoozed = || row(Some(Park::Snoozed { until: 0 }));
         assert_eq!(view_label(&[row(None)]), "triage");
+        assert_eq!(view_label(&[row(Some(Park::Settled))]), "triage");
         assert_eq!(
-            view_label(&[row(Some(Park::Settled)), row(Some(Park::Settled))]),
-            "2 settled"
+            view_label(&[row(Some(Park::Settled)), snoozed(), snoozed()]),
+            "2 snoozed"
         );
-        let many: Vec<Row> = (0..1000)
-            .map(|i| {
-                row(Some(if i % 2 == 0 {
-                    Park::Settled
-                } else {
-                    Park::Snoozed { until: 0 }
-                }))
-            })
-            .collect();
-        assert_eq!(view_label(&many), "1000 parked");
-        let both = [
-            row(Some(Park::Settled)),
-            row(Some(Park::Snoozed { until: 0 })),
-        ];
-        assert_eq!(view_label(&both), "2 parked");
+        let many: Vec<Row> = (0..1000).map(|_| snoozed()).collect();
         assert!(
             view_label(&many).chars().count() <= 16,
             "fits beside Herdr's 'agents' title"

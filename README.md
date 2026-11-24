@@ -164,7 +164,8 @@ points at it, and `enter` (or its digit) opens it in the T3 desktop app through 
 ## Sidebar
 
 The plugin owns Herdr's Agents view while it is enabled. It hides snoozed and settled agents and
-counts them in the header (`3 settled`, `2 snoozed`, or `5 parked` when both); the picker lists them. Herdr's sort toggle is
+counts the snoozed ones in the header (`2 snoozed`); settled ones pile up for 30 days, so they are not
+counted there. The picker lists both. Herdr's sort toggle is
 disabled until the plugin is disabled. Each agent pane gets two tokens:
 
 | Token | Values |
