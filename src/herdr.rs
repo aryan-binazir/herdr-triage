@@ -15,7 +15,6 @@ use serde_json::{Map, Value, json};
 use crate::triage::Status;
 
 const TIMEOUT: Duration = Duration::from_secs(3);
-/// Creating a worktree checks out a branch, which can take a while in a big repository.
 const WORKTREE_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Clone, Deserialize)]
@@ -97,8 +96,6 @@ pub struct WorkspaceWorktree {
 }
 
 impl Workspace {
-    /// The workspace's label, led by its repository's name when it is a linked worktree whose
-    /// label does not already say which project it belongs to.
     pub fn project_label(&self) -> String {
         match &self.worktree {
             Some(WorkspaceWorktree {
@@ -279,7 +276,6 @@ impl Herdr {
             .ok_or_else(|| io::Error::other("tab.create returned no pane"))
     }
 
-    /// The root of the repository `workspace_id` (the current workspace if `None`) belongs to.
     pub fn repository_root(&mut self, workspace_id: Option<&str>) -> io::Result<String> {
         let params = workspace_id.map_or_else(|| json!({}), |id| json!({"workspace_id": id}));
         let result = self.call("worktree.list", &params)?;
@@ -289,8 +285,6 @@ impl Herdr {
             .ok_or_else(|| io::Error::other("worktree.list returned no repository"))
     }
 
-    /// Creates a worktree on `branch` of the repository at `root`, opens it as a focused
-    /// workspace, and returns its first pane.
     pub fn create_worktree(&mut self, root: &str, branch: &str) -> io::Result<String> {
         let params = json!({"cwd": root, "branch": branch, "focus": true});
         let result = self.call_within("worktree.create", &params, WORKTREE_TIMEOUT)?;

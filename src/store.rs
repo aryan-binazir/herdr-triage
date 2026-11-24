@@ -130,8 +130,6 @@ impl Store {
         self.dir.join("sync.requested")
     }
 
-    /// Held from deciding a pane may close until Herdr closed it, so two processes closing panes
-    /// of one workspace can't both see a pane to spare. Released on drop.
     pub fn close_lock(&self) -> io::Result<fs::File> {
         fs::create_dir_all(&self.dir)?;
         let lock = OpenOptions::new()

@@ -619,9 +619,8 @@ fn labelled_prompt(
     Line::from(spans)
 }
 
-/// The new-agent prompt: pick an agent, or type a branch for a new worktree first.
 fn new_agent_line(prompt: &NewAgentPrompt, width: usize) -> (Line<'static>, Option<usize>) {
-    if let Some(text) = &prompt.typing {
+    if let Some(text) = &prompt.typing_branch {
         let head = " new worktree on branch: ";
         let room = width.saturating_sub(cells(head) + cells("  enter ok  esc back"));
         let text = tail(text, room);

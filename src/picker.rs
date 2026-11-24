@@ -39,11 +39,8 @@ pub enum Effect {
     NewAgent(NewAgent),
 }
 
-/// The agents `n` offers, by the digit beside each, and the command that starts it.
 pub const NEW_AGENTS: [&str; 4] = ["claude", "codex", "opencode", "pi"];
 
-/// An agent to start in a new tab of `workspace_id` (the current workspace if `None`), or in a
-/// new worktree of it on `branch`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NewAgent {
     pub workspace_id: Option<String>,
@@ -58,8 +55,7 @@ pub struct NewAgentPrompt {
     pub label: String,
     cwd: Option<String>,
     pub branch: Option<String>,
-    /// The branch being typed for a new worktree.
-    pub typing: Option<String>,
+    pub typing_branch: Option<String>,
 }
 
 const T3_READ: &str = "T3 marks a thread read when you open it";
@@ -94,12 +90,10 @@ pub struct ForgetPrompt {
     pub label: String,
 }
 
-/// Asks before a settle closes an agent that has no session to resume.
 #[derive(Debug, Clone)]
 pub struct ClosePrompt {
     pub key: String,
     pub label: String,
-    /// Herdr's change counter for the agent when asked; `y` holds only for that turn.
     seq: u64,
 }
 
@@ -108,7 +102,6 @@ pub struct SnoozePrompt {
     pub key: String,
     t3_thread: Option<String>,
     pub label: String,
-    /// Each preset and whether it was offered when the prompt opened.
     pub presets: Vec<(SnoozePreset, bool)>,
     shown_at: i64,
 }
@@ -287,10 +280,11 @@ impl Picker {
             let Some(&(preset, offered)) = prompt.presets.get(choice) else {
                 return Effect::None;
             };
-            // A time of day means the day the prompt showed; a duration runs from now.
             let from = match preset {
                 SnoozePreset::OneHour | SnoozePreset::ThreeHours => now,
-                _ => prompt.shown_at,
+                SnoozePreset::ThisEvening
+                | SnoozePreset::TomorrowMorning
+                | SnoozePreset::NextWeek => prompt.shown_at,
             };
             let until = preset.until(from, tz);
             let refused = if !offered {
@@ -688,8 +682,6 @@ impl Picker {
         &self.filter
     }
 
-    /// Starts where the selected thread lives: its Herdr workspace and directory, or the current
-    /// workspace for a T3 thread or no selection.
     fn prompt_for_new_agent(&self) -> NewAgentPrompt {
         let item = self
             .selected()
@@ -707,7 +699,7 @@ impl Picker {
             cwd: thread.and_then(|thread| thread.cwd.clone()),
             workspace_id,
             branch: None,
-            typing: None,
+            typing_branch: None,
         }
     }
 
@@ -715,14 +707,14 @@ impl Picker {
         let Some(prompt) = &mut self.new_agent else {
             return Effect::None;
         };
-        if let Some(text) = &mut prompt.typing {
+        if let Some(text) = &mut prompt.typing_branch {
             match key.code {
                 KeyCode::Enter => {
                     let branch = text.trim().to_owned();
                     prompt.branch = Some(branch).filter(|branch| !branch.is_empty());
-                    prompt.typing = None;
+                    prompt.typing_branch = None;
                 }
-                KeyCode::Esc => prompt.typing = None,
+                KeyCode::Esc => prompt.typing_branch = None,
                 KeyCode::Backspace => drop(text.pop()),
                 KeyCode::Char('u') if ctrl => text.clear(),
                 KeyCode::Char(c) if !ctrl && !c.is_whitespace() => text.push(c),
@@ -746,7 +738,7 @@ impl Picker {
                 })
             }
             KeyCode::Char('w') => {
-                prompt.typing = Some(prompt.branch.clone().unwrap_or_default());
+                prompt.typing_branch = Some(prompt.branch.clone().unwrap_or_default());
                 Effect::None
             }
             KeyCode::Esc | KeyCode::Char('q') => {
@@ -791,7 +783,6 @@ impl Picker {
         self.undo = undo;
     }
 
-    /// What `U` would undo: its verb and thread, e.g. `settle` and `docs pass`.
     pub fn undo(&self) -> Option<(&'static str, &str)> {
         self.undo
             .as_ref()
@@ -864,8 +855,6 @@ impl Item {
     }
 }
 
-/// Orders Herdr's rows and T3's threads together: by rank, then wake time, then most recent
-/// change, with closed Herdr threads after the live ones of their rank, as Herdr orders them.
 pub fn combine(herdr: Vec<Item>, t3: Vec<Item>) -> Vec<Item> {
     let mut items = herdr;
     items.extend(t3);
@@ -1225,7 +1214,9 @@ mod tests {
             press(&mut picker, KeyCode::Char(c));
         }
         assert_eq!(
-            picker.new_agent_prompt().and_then(|p| p.typing.as_deref()),
+            picker
+                .new_agent_prompt()
+                .and_then(|p| p.typing_branch.as_deref()),
             Some("fix/ab"),
             "a branch has no spaces"
         );
@@ -1246,7 +1237,7 @@ mod tests {
         press(&mut picker, KeyCode::Esc);
         let prompt = picker.new_agent_prompt().unwrap();
         assert!(
-            prompt.typing.is_none() && prompt.branch.is_none(),
+            prompt.typing_branch.is_none() && prompt.branch.is_none(),
             "esc goes back"
         );
         assert_eq!(press(&mut picker, KeyCode::Char('q')), Effect::None);

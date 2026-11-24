@@ -32,7 +32,6 @@ pub struct Session {
 pub struct View {
     pub items: Vec<Item>,
     pub open_sections: BTreeSet<Section>,
-    /// What undo would take back, if anything: its verb and thread.
     pub undo: Option<(&'static str, String)>,
 }
 
@@ -109,8 +108,7 @@ impl Session {
         self.sync()
     }
 
-    /// Focuses the next agent that needs you after the one in `invoked_from` (else the focused
-    /// one), reopening it if it was closed.
+    /// Focuses the next agent that needs you after the one in `invoked_from` (else the focused one).
     pub fn next(&mut self, invoked_from: Option<&str>) -> io::Result<()> {
         let (snapshot, ()) = self.sync_and_serve(false, |_, _, _| ())?;
         let current = snapshot
@@ -130,9 +128,9 @@ impl Session {
             Some(closed) => match self.act(&closed.key, Action::Reopen)? {
                 Outcome::Refused(refusal) => self.herdr.notify(&refusal).map(drop),
                 Outcome::Reopened => Ok(()),
-                // It came back on its own since: go to it.
                 Outcome::Done { key, .. } => {
-                    match self.herdr.agents()?.iter().find(|a| a.key() == key) {
+                    let came_back = self.herdr.agents()?.into_iter().find(|a| a.key() == key);
+                    match came_back {
                         Some(agent) => self.herdr.focus(&agent.pane_id),
                         None => Ok(()),
                     }
@@ -175,25 +173,22 @@ impl Session {
         self.herdr.focus(pane)
     }
 
-    /// Starts an agent in a new tab of its workspace, or in a new worktree of its repository,
-    /// which Herdr focuses. A workspace that is gone falls back to the current one.
     pub fn start_agent(&mut self, agent: &NewAgent) -> io::Result<()> {
         let workspaces = self.herdr.workspaces()?;
-        let workspace = workspaces
+        let open_workspace = workspaces
             .iter()
-            .find(|w| agent.workspace_id.as_deref() == Some(w.workspace_id.as_str()));
+            .map(|w| w.workspace_id.as_str())
+            .find(|&id| agent.workspace_id.as_deref() == Some(id));
         let pane = if let Some(branch) = &agent.branch {
             // Herdr branches a new worktree from the repository's own checkout, never from a
-            // linked worktree, and knows which that is for any workspace.
-            let id = workspace.map(|w| w.workspace_id.as_str());
-            let repository = self.herdr.repository_root(id)?;
+            // linked worktree.
+            let repository = self.herdr.repository_root(open_workspace)?;
             self.herdr.create_worktree(&repository, branch)?
         } else {
-            // A gone workspace's directory may belong to another project than the current one.
-            let cwd =
-                (agent.cwd.as_deref()).filter(|dir| workspace.is_some() && Path::new(dir).is_dir());
-            let id = workspace.map(|w| w.workspace_id.as_str());
-            self.herdr.create_tab(id, cwd)?
+            let cwd = open_workspace
+                .and(agent.cwd.as_deref())
+                .filter(|dir| Path::new(dir).is_dir());
+            self.herdr.create_tab(open_workspace, cwd)?
         };
         self.herdr.run_command(&pane, agent.command)
     }
@@ -386,8 +381,6 @@ impl Session {
         self.locked(|held, state| {
             let now = held.now();
             let herdr = &mut *held.herdr;
-            // Another process may have launched it since the plan was made, and Herdr may even
-            // have registered it already.
             if let Some(pane) = state.launched_reopen(plan, &herdr.server_generation(), now)
                 && Some(pane.as_str()) != launch.focus
                 && herdr.focus_pane(&pane).is_ok()
@@ -568,7 +561,6 @@ fn publish(herdr: &mut Herdr, agents: &[Agent], rows: &[Row], now: i64) -> io::R
     failure.map_or(view, Err)
 }
 
-/// One notice for every snooze that came due in a sync.
 fn woke_notice(woke: &[String]) -> Option<String> {
     match woke {
         [] => None,

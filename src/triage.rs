@@ -106,7 +106,6 @@ pub enum Section {
 #[serde(rename_all = "snake_case")]
 pub enum Unread {
     Manual,
-    /// Marked unread, and you have since been on another agent: coming back to it reads it.
     Left,
     Woke,
 }
@@ -149,8 +148,6 @@ pub struct Record {
     pub restored_at: Option<i64>,
     #[serde(default)]
     pub title: Option<String>,
-    /// The terminal that was working when you asked to settle it; it settles once that
-    /// terminal's turn ends.
     #[serde(default)]
     pub settle_requested: Option<String>,
 }
@@ -182,9 +179,6 @@ impl Record {
         }
     }
 
-    /// Settles the thread, closing its pane only if Herdr can resume it: closing one for good
-    /// takes `Action::CloseForGood`. A working agent settles once its turn ends instead; asking
-    /// again takes that back.
     fn settle(&mut self, seq: u64, shown: Display, agent: Option<&Observed>) -> After {
         if self.settle_requested.take().is_some() {
             return After::Nothing;
@@ -198,8 +192,6 @@ impl Record {
         park(self, seq, Park::Settled, closing)
     }
 
-    /// Settles a thread asked to settle while it worked once its turn ends, unless it ends
-    /// blocked on you. Returns what the settle needs done if it landed.
     fn settle_if_turn_ended(&mut self, agent: &Observed) -> Option<After> {
         if self.settle_requested.as_deref()? != agent.terminal_id {
             self.settle_requested = None;
@@ -219,8 +211,6 @@ impl Record {
         }
     }
 
-    /// Focusing a woken agent reads it, as does coming back to one marked unread after
-    /// another agent had focus.
     fn see(&mut self, agent: &Observed, any_focused: bool) {
         match self.unread {
             Some(Unread::Woke) if agent.focused => self.unread = None,
@@ -235,7 +225,6 @@ impl Record {
         }
     }
 
-    /// A snooze that has come due wakes the thread as unread.
     fn wake_if_due(&mut self, now: i64) -> bool {
         let due = matches!(self.park, Some(Park::Snoozed { until }) if until <= now);
         if due {
@@ -256,15 +245,10 @@ impl Record {
     }
 }
 
-/// What a reconcile leaves for the caller to do.
 #[derive(Debug, Default)]
 pub struct Reconciled {
-    /// When agents that just went missing must be checked again, since nothing else may sync
-    /// once the exit grace period is over.
     pub exit_checks: Vec<i64>,
-    /// Threads whose snooze came due, by title.
     pub woke: Vec<String>,
-    /// Panes of agents that settled as their turn ended, to close as a settle would.
     pub closes: Vec<Close>,
 }
 
@@ -306,7 +290,7 @@ impl Triage {
         Self {
             pinned: record.pinned,
             park: record.park,
-            unread: same_mark(record.unread),
+            unread: left_as_manual(record.unread),
             ack_seq: record.ack_seq,
             title: record.title.clone(),
             settle_requested: record.settle_requested.clone(),
@@ -327,7 +311,9 @@ impl Triage {
             undo(&mut record.park, self.park, &after.park);
         }
         let changed_unread = self.unread != after.unread;
-        if changed_unread && (!moved_on || marks_unread) && same_mark(record.unread) == after.unread
+        if changed_unread
+            && (!moved_on || marks_unread)
+            && left_as_manual(record.unread) == after.unread
         {
             record.unread = self.unread;
         }
@@ -342,8 +328,7 @@ impl Triage {
     }
 }
 
-/// Undo sees an unread mark the same before and after you leave the agent.
-fn same_mark(unread: Option<Unread>) -> Option<Unread> {
+fn left_as_manual(unread: Option<Unread>) -> Option<Unread> {
     match unread {
         Some(Unread::Left) => Some(Unread::Manual),
         other => other,
@@ -409,13 +394,8 @@ impl Rank {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Action {
     ToggleSettle,
-    /// Settles without closing the agent's pane, as answered to the close-for-good prompt.
     SettleKeepingOpen,
-    /// Settles an agent with no session to resume and closes its pane for good, as confirmed
-    /// while Herdr's change counter for it read `seq`.
-    CloseForGood {
-        seq: u64,
-    },
+    CloseForGood { seq: u64 },
     Snooze(i64),
     Wake,
     ToggleUnread,
@@ -518,11 +498,8 @@ pub struct Row {
     pub park: Option<Park>,
     pub pinned: bool,
     pub changed_at: Option<i64>,
-    /// Herdr's own state for a live agent; `Unknown` otherwise.
     pub status: Status,
-    /// It settles once its turn ends.
     pub settle_pending: bool,
-    /// Panes in the agent's workspace; 0 when closed or not listed.
     pub workspace_panes: usize,
     pub thread: Thread,
     pub title: Option<String>,
@@ -560,8 +537,6 @@ impl Row {
         }
     }
 
-    /// Settling this agent may close its pane for good if you confirm: it has no session to
-    /// resume and Herdr can tell its state.
     pub fn can_close_for_good(&self) -> bool {
         self.live()
             && self.park != Some(Park::Settled)
@@ -723,8 +698,6 @@ impl SnoozePreset {
     }
 }
 
-/// Every preset in a fixed order, so each keeps its digit, paired with whether it is offered:
-/// `today 18:00` is offered until half an hour before.
 pub fn snooze_presets<Tz: TimeZone>(now: i64, tz: &Tz) -> Vec<(SnoozePreset, bool)> {
     let evening_is_half_an_hour_away = SnoozePreset::ThisEvening.until(now, tz) - now >= 1_800;
     [
@@ -752,7 +725,6 @@ fn refusal(action: Action, shown: Display, live: bool) -> Option<Refusal> {
         _ => return None,
     };
     let verb = match action {
-        // A working agent settles once its turn ends.
         Action::ToggleSettle if shown == Display::Working => return None,
         Action::ToggleSettle | Action::SettleKeepingOpen => "settle",
         Action::CloseForGood { .. } => "close",
@@ -837,7 +809,6 @@ impl State {
                     closes.push(close);
                 }
             }
-            // You are on the agent already: there is nothing to tell you.
             if record.wake_if_due(now) && !agent.focused {
                 woke.push(record.label().to_owned());
             }
@@ -887,7 +858,6 @@ impl State {
         }
     }
 
-    /// A settle asked for while the agent worked has landed: undo now takes back the settle.
     fn settle_landed(&mut self, key: &str) {
         let (Some(record), Some(undo)) = (self.records.get(key), self.undo.as_mut()) else {
             return;
@@ -958,8 +928,6 @@ impl State {
         }
     }
 
-    /// A thread marked unread while another agent has focus is already left: going to it reads
-    /// it.
     pub fn mark_left_if_elsewhere(&mut self, key: &str, agents: &[Observed]) {
         let elsewhere = agents.iter().any(|agent| agent.focused && agent.key != key);
         if let Some(record) = self.records.get_mut(key)
@@ -970,16 +938,12 @@ impl State {
         }
     }
 
-    /// The thread `plan` reopens is still closed: not live again, nor adopted by a resumed
-    /// session under a new key.
     pub fn awaits_reopen(&self, plan: &ReopenPlan) -> bool {
         self.records
             .get(&plan.key)
             .is_some_and(|record| !record.live)
     }
 
-    /// The pane a reopen of `plan`'s thread launched moments ago on this server, if one did since
-    /// the plan was made.
     pub fn launched_reopen(&self, plan: &ReopenPlan, generation: &str, now: i64) -> Option<String> {
         let record = self.records.get(&plan.key)?;
         let recent = record
@@ -1021,13 +985,10 @@ impl State {
         let quiet_since_action = pane.terminal_id == close.terminal_id
             && !matches!(pane.status, Status::Working | Status::Blocked)
             && (resumable || pane.status != Status::Unknown)
-            // A close you confirmed for one turn must not take a later one, even while Herdr
-            // relaunches restored agents.
             && (pane.seq == close.seq || (restoring && resumable));
         if !quiet_since_action {
             return Ok(Closing::Skip);
         }
-        // Another close since the action may have left this the workspace's last pane.
         if pane.workspace_panes <= 1 {
             return Ok(Closing::KeepOpen(
                 "kept open: it is the last pane in its workspace".into(),
@@ -1112,7 +1073,6 @@ impl State {
         }
     }
 
-    /// What `undo` would take back: the change's verb and the thread's title.
     pub fn undo_summary(&self) -> Option<(&'static str, String)> {
         let undo = self.undo.as_ref()?;
         let record = self.records.get(&undo.key)?;
@@ -1235,7 +1195,6 @@ impl State {
             if live {
                 Ok(After::Nothing)
             } else {
-                // Reopening a thread is going to read it.
                 if record.unread == Some(Unread::Manual) {
                     record.unread = Some(Unread::Left);
                 }
