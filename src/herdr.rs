@@ -7,7 +7,7 @@ use std::io::{self, BufRead, BufReader, Write};
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
@@ -115,6 +115,8 @@ pub struct Tab {
 pub struct Herdr {
     path: PathBuf,
     next_id: u64,
+    /// No request waits past this; one asked for after it fails with `TimedOut`.
+    pub deadline: Option<Instant>,
 }
 
 impl Herdr {
@@ -127,6 +129,7 @@ impl Herdr {
         Ok(Self {
             path: path.to_owned(),
             next_id: 0,
+            deadline: None,
         })
     }
 
@@ -152,6 +155,16 @@ impl Herdr {
         params: &Value,
         timeout: Duration,
     ) -> io::Result<Result<Value, Refused>> {
+        let timeout = match self.deadline {
+            None => timeout,
+            Some(deadline) => {
+                let left = deadline.saturating_duration_since(Instant::now());
+                if left.is_zero() {
+                    return Err(io::Error::new(io::ErrorKind::TimedOut, "out of time"));
+                }
+                timeout.min(left)
+            }
+        };
         self.next_id += 1;
         let id = format!("triage-{}", self.next_id);
         let request = json!({"id": id, "method": method, "params": params});

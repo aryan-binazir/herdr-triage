@@ -104,8 +104,21 @@ impl Session {
 
     /// Records that the agent in `pane` was launched by `by`, under `title`. `None` when Herdr
     /// does not list an agent there.
-    /// Waits for the store no later than `deadline`, then fails with `TimedOut`.
+    /// Done by `deadline`, store lock and Herdr requests included, or fails with `TimedOut`.
     pub fn stamp_launch(
+        &mut self,
+        pane: &str,
+        by: &str,
+        title: &str,
+        deadline: Instant,
+    ) -> io::Result<Option<String>> {
+        self.herdr.deadline = Some(deadline);
+        let stamped = self.stamp_by(pane, by, title, deadline);
+        self.herdr.deadline = None;
+        stamped
+    }
+
+    fn stamp_by(
         &mut self,
         pane: &str,
         by: &str,
@@ -125,8 +138,10 @@ impl Session {
                 Some(key)
             };
             if let Some(synced) = self.sync_once(false, false, stamp)? {
+                // A hook that asked for a sync meanwhile is served even when this one failed.
+                let served = self.serve_sync_requests();
                 let (_, key) = synced?;
-                self.serve_sync_requests()?;
+                served?;
                 return Ok(key);
             }
             if Instant::now() >= deadline {
@@ -1499,6 +1514,21 @@ mod tests {
             shell_command(&argv),
             "pi --session '/s/it'\\''s here.jsonl'"
         );
+    }
+
+    #[test]
+    fn stamping_a_launch_out_of_time_asks_herdr_nothing_and_leaves_no_deadline_behind() {
+        let fake = two_resumable_agents();
+        let (mut session, _) = connect(&fake);
+        let late = session.stamp_launch("w1:p1", "client:c", "t", Instant::now());
+        assert_eq!(late.unwrap_err().kind(), io::ErrorKind::TimedOut);
+        assert!(methods(&fake).is_empty());
+        let later = Instant::now() + Duration::from_secs(5);
+        let stamped = session
+            .stamp_launch("w1:p1", "client:c", "t", later)
+            .unwrap();
+        assert_eq!(stamped.as_deref(), Some(KEY));
+        assert!(session.herdr.deadline.is_none());
     }
 
     #[test]

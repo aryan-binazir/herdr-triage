@@ -184,7 +184,8 @@ time. It speaks MCP over stdin and stdout; there is no daemon, port or login. In
 
 The server is the plugin's own binary. Each plugin update installs it in a new directory, so
 Herdr's hooks keep a link to the current one at `~/.local/state/herdr/plugins/ar.triage/herdr-triage`
-(under `$XDG_STATE_HOME` if you set it). It appears the first time one of the plugin's hooks runs
+(under `$XDG_STATE_HOME` if you set it to an absolute path; a relative one is ignored, so leave
+it out of the commands below). It appears the first time one of the plugin's hooks runs
 after an install, such as when you switch panes.
 Register it once:
 
