@@ -203,6 +203,8 @@ fn apply(
     action: Action,
 ) -> Option<Leave> {
     let from = picker.selected_row().unwrap_or(0);
+    let pending = |item: &picker::Item| item.row.key == key && item.row.settle_pending;
+    let calls_off = action == Action::ToggleSettle && picker.items().iter().any(pending);
     match session.act(key, action) {
         Ok(Outcome::Reopened) => return Some(Leave::Close),
         Ok(Outcome::Refused(refusal)) => {
@@ -218,9 +220,10 @@ fn apply(
             if let Some(notice) = notice {
                 picker.inform(notice);
             }
-            let pending = |item: &picker::Item| item.row.key == key && item.row.settle_pending;
             if action == Action::ToggleSettle && picker.items().iter().any(pending) {
                 picker.inform("settles when its turn ends".into());
+            } else if calls_off {
+                picker.inform("won't settle when its turn ends".into());
             }
             if matches!(
                 action,

@@ -819,7 +819,8 @@ impl State {
                     closes.push(close);
                 }
             }
-            if record.wake_if_due(now) {
+            // You are on the agent already: there is nothing to tell you.
+            if record.wake_if_due(now) && !agent.focused {
                 woke.push(record.label().to_owned());
             }
             record.see(agent, any_focused);
@@ -3608,6 +3609,23 @@ mod tests {
                 .woke
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn a_snooze_coming_due_on_the_agent_you_are_on_is_not_announced() {
+        let idle = resumable("a", Status::Idle, 4);
+        let mut state = State::default();
+        state.reconcile(GEN, std::slice::from_ref(&idle), NOW);
+        act(&mut state, &idle, Action::Snooze(NOW + 60)).unwrap();
+        let focused = Observed {
+            focused: true,
+            ..idle.clone()
+        };
+        let woke = state
+            .reconcile(GEN, std::slice::from_ref(&focused), NOW + 60)
+            .woke;
+        assert!(woke.is_empty(), "{woke:?}");
+        assert_eq!(shown(&state, &idle), (Display::Idle, None));
     }
 
     #[test]
