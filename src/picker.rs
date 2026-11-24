@@ -700,17 +700,30 @@ impl Item {
     }
 }
 
+/// Merges T3's threads into Herdr's ordered rows by rank, then wake time, then recency, keeping
+/// Herdr's own order among its rows.
 pub fn combine(herdr: Vec<Item>, mut t3: Vec<Item>) -> Vec<Item> {
-    t3.sort_by_key(|item| Reverse(item.row.changed_at));
-    let mut items = herdr;
-    items.extend(t3);
-    items.sort_by_key(|item| {
+    fn place(item: &Item) -> (crate::triage::Rank, i64, Reverse<i64>) {
         let wake = match item.row.park {
             Some(Park::Snoozed { until }) => until,
             _ => 0,
         };
-        (item.row.rank(), wake)
-    });
+        (
+            item.row.rank(),
+            wake,
+            Reverse(item.row.changed_at.unwrap_or(0)),
+        )
+    }
+    t3.sort_by_key(place);
+    let mut items = Vec::with_capacity(herdr.len() + t3.len());
+    let mut t3 = t3.into_iter().peekable();
+    for row in herdr {
+        while let Some(thread) = t3.next_if(|thread| place(thread) < place(&row)) {
+            items.push(thread);
+        }
+        items.push(row);
+    }
+    items.extend(t3);
     items
 }
 
@@ -1563,7 +1576,7 @@ mod tests {
     }
 
     #[test]
-    fn t3_threads_follow_herdr_agents_of_the_same_rank_and_snoozes_wake_in_order() {
+    fn t3_threads_join_herdr_agents_of_the_same_rank_by_recency_and_snoozes_wake_in_order() {
         let t3 = |id: &str, updated_ago: i64, snoozed_for: Option<i64>, settled: bool| {
             crate::t3::T3Thread {
                 updated_at: NOW - updated_ago,
@@ -1576,14 +1589,19 @@ mod tests {
             environment_id: "env".into(),
             projects: std::collections::BTreeMap::new(),
             threads: vec![
-                t3("t3 settled", 60, None, true),
+                t3("t3 settled", 600, None, true),
+                t3("t3 settled just now", 1, None, true),
                 t3("t3 wakes late", 60, Some(600), false),
                 t3("t3 older", 7_200, None, false),
                 t3("t3 wakes soon", 60, Some(30), false),
                 t3("t3 newer", 60, None, false),
             ],
         };
-        let combined = combine(shelf(), crate::t3::items(&snapshot, NOW));
+        let mut herdr = shelf();
+        for item in &mut herdr {
+            item.row.changed_at = Some(NOW - 120);
+        }
+        let combined = combine(herdr, crate::t3::items(&snapshot, NOW));
         let labels: Vec<&str> = combined.iter().map(|item| item.row.label()).collect();
         assert_eq!(
             labels,
@@ -1594,11 +1612,38 @@ mod tests {
                 "t3 wakes soon",
                 "bench run",
                 "t3 wakes late",
+                "t3 settled just now",
                 "release notes",
                 "old spike",
                 "t3 settled",
             ]
         );
+    }
+
+    #[test]
+    fn a_t3_thread_that_just_blocked_comes_before_herdr_agents_idle_for_longer() {
+        let herdr = Fixture::new(
+            NOW,
+            &[
+                ("p1", "idle for a day", Status::Idle),
+                ("p2", "also idle", Status::Idle),
+            ],
+        );
+        let mut items = listed(&herdr);
+        for item in &mut items {
+            item.row.changed_at = Some(NOW - 86_400);
+        }
+        let snapshot = crate::t3::Snapshot {
+            environment_id: "env".into(),
+            projects: std::collections::BTreeMap::new(),
+            threads: vec![crate::t3::T3Thread {
+                updated_at: NOW - 30,
+                ..t3_thread("t3 blocked", "waiting")
+            }],
+        };
+        let combined = combine(items, crate::t3::items(&snapshot, NOW));
+        let labels: Vec<&str> = combined.iter().map(|item| item.row.label()).collect();
+        assert_eq!(labels, ["t3 blocked", "idle for a day", "also idle"]);
     }
 
     #[test]
