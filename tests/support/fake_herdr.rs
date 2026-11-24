@@ -83,6 +83,10 @@ impl FakeHerdr {
                         store_tokens(&mut agents.lock().unwrap(), params);
                         json!({"type": "ok"})
                     }
+                    "agent.rename" => {
+                        rename(&mut agents.lock().unwrap(), params);
+                        json!({"type": "ok"})
+                    }
                     "pane.close" => {
                         agents
                             .lock()
@@ -194,6 +198,14 @@ fn store_tokens(agents: &mut [Value], params: &Value) {
             tokens.remove(name);
         } else {
             tokens.insert(name.clone(), value.clone());
+        }
+    }
+}
+
+fn rename(agents: &mut [Value], params: &Value) {
+    for agent in agents {
+        if agent["pane_id"] == params["target"] {
+            agent["name"] = params["name"].clone();
         }
     }
 }

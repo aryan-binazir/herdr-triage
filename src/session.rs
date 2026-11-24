@@ -494,16 +494,33 @@ fn publish(herdr: &mut Herdr, agents: &[Agent], rows: &[Row], now: i64) -> io::R
             continue;
         };
         let agent = &agents[index];
+        // The name triage last gave the agent in Herdr, so clearing a title clears only that.
+        let pushed = agent.tokens.get("triage_name");
+        let rename = match (&row.title, pushed) {
+            (Some(title), _) if agent.name.as_ref() != Some(title) => Some(Some(title.as_str())),
+            (None, Some(pushed)) if agent.name.as_ref() == Some(pushed) => Some(None),
+            _ => None,
+        };
+        if let Some(name) = rename
+            && let Err(error) = herdr.rename_agent(&agent.pane_id, name)
+        {
+            failure.get_or_insert(error);
+        }
         let rank = row.rank().token().to_owned();
         let label = row.sidebar_label(&pin_icon, now, &Local);
         if agent.tokens.get("triage_rank") == Some(&rank)
             && agent.tokens.get("triage") == label.as_ref()
+            && pushed == row.title.as_ref()
         {
             continue;
         }
         let mut tokens = Map::new();
         tokens.insert("triage_rank".into(), Value::String(rank));
         tokens.insert("triage".into(), label.map_or(Value::Null, Value::String));
+        if row.title.is_some() || pushed.is_some() {
+            let name = row.title.clone().map_or(Value::Null, Value::String);
+            tokens.insert("triage_name".into(), name);
+        }
         // A pane can close between the snapshot and here; the others still need their tokens.
         if let Err(error) = herdr.report_tokens(&agent.pane_id, &tokens) {
             failure.get_or_insert(error);
@@ -577,10 +594,14 @@ fn items(snapshot: &Snapshot, now: i64) -> Vec<Item> {
                 .or_else(|| row.thread.agent.clone())
                 .unwrap_or_else(|| "-".into());
             let cwd = row.thread.cwd.as_deref().unwrap_or_default();
+            // Once triage names an agent in Herdr, its terminal title is the automatic one.
+            let terminal_title = agent
+                .and_then(|agent| agent.terminal_title_stripped.as_deref())
+                .unwrap_or_default();
             Item {
                 target: agent.map_or(Target::Closed, |agent| Target::Pane(agent.pane_id.clone())),
                 search: format!(
-                    "{kind} {} {} {location} {cwd}",
+                    "{kind} {} {} {terminal_title} {location} {cwd}",
                     row.label(),
                     row.thread.label
                 ),
@@ -758,7 +779,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             methods(&fake),
-            [&read[..], &["tab.list", view_set]].concat()
+            [&read[..], &["tab.list", "agent.rename", report, view_set]].concat()
         );
 
         session.toggle_section(Section::Working).unwrap();
@@ -774,6 +795,50 @@ mod tests {
                 .is_err()
         );
         assert_eq!(methods(&fake), closing);
+    }
+
+    #[test]
+    fn a_title_names_the_agent_in_herdr_and_clearing_it_clears_only_that_name() {
+        let fake = FakeHerdr::start(vec![
+            fake_herdr::agent("w1:p1", "idle", 3),
+            fake_herdr::agent("w1:p2", "idle", 4),
+        ]);
+        fake.agents.lock().unwrap()[1]["name"] = json!("named in herdr");
+        let (mut session, _) = connect(&fake);
+        let renames = || fake.take("agent.rename");
+        session.view().unwrap();
+        assert!(
+            renames().is_empty(),
+            "a name Herdr already has is left alone"
+        );
+
+        let key = "terminal:t-w1:p1";
+        let view = session.rename(key, Some("checkout flow".into())).unwrap();
+        assert_eq!(
+            renames(),
+            [json!({"target": "w1:p1", "name": "checkout flow"})]
+        );
+        assert!(
+            view.items
+                .iter()
+                .any(|item| item.row.label() == "checkout flow")
+        );
+        session.view().unwrap();
+        assert!(renames().is_empty(), "named once");
+
+        session.rename(key, None).unwrap();
+        assert_eq!(renames(), [json!({"target": "w1:p1", "name": null})]);
+        session.view().unwrap();
+        assert!(renames().is_empty());
+
+        session.rename(key, Some("mine".into())).unwrap();
+        renames();
+        fake.agents.lock().unwrap()[0]["name"] = json!("renamed in herdr since");
+        session.undo().unwrap();
+        assert!(
+            renames().is_empty(),
+            "undoing the title keeps a name given in Herdr since"
+        );
     }
 
     #[test]

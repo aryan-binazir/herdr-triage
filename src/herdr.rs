@@ -204,6 +204,12 @@ impl Herdr {
         self.call("agent.view.set", &params).map(drop)
     }
 
+    /// Names the agent in `pane_id` as Herdr shows it, or clears the name with `None`.
+    pub fn rename_agent(&mut self, pane_id: &str, name: Option<&str>) -> io::Result<()> {
+        self.call("agent.rename", &json!({"target": pane_id, "name": name}))
+            .map(drop)
+    }
+
     pub fn focus_pane(&mut self, pane_id: &str) -> io::Result<()> {
         self.call("pane.focus", &json!({"pane_id": pane_id}))
             .map(drop)
