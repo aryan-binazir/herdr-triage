@@ -38,7 +38,7 @@ CREATE TABLE IF NOT EXISTS threads (
     reopen_generation TEXT,
     restored_at INTEGER,
     title TEXT,
-    settle_requested INTEGER
+    settle_requested TEXT
 );
 CREATE TABLE IF NOT EXISTS settings (name TEXT PRIMARY KEY, value TEXT NOT NULL);
 ";
@@ -130,6 +130,19 @@ impl Store {
         self.dir.join("sync.requested")
     }
 
+    /// Held from deciding a pane may close until Herdr closed it, so two processes closing panes
+    /// of one workspace can't both see a pane to spare. Released on drop.
+    pub fn close_lock(&self) -> io::Result<fs::File> {
+        fs::create_dir_all(&self.dir)?;
+        let lock = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(self.dir.join("close.lock"))?;
+        lock.lock()?;
+        Ok(lock)
+    }
+
     fn lock_file(&self) -> io::Result<fs::File> {
         fs::create_dir_all(&self.dir)?;
         OpenOptions::new()
@@ -212,7 +225,7 @@ const LATER_COLUMNS: [(&str, &str); 5] = [
     ("reopen_generation", "TEXT"),
     ("restored_at", "INTEGER"),
     ("title", "TEXT"),
-    ("settle_requested", "INTEGER"),
+    ("settle_requested", "TEXT"),
 ];
 
 fn add_missing_columns(connection: &Connection) -> rusqlite::Result<()> {
@@ -561,7 +574,7 @@ mod tests {
             reopen_generation: Some("g0".into()),
             restored_at: Some(1_300),
             title: Some("checkout flow".into()),
-            settle_requested: Some(1_250),
+            settle_requested: Some("term-7".into()),
         }
     }
 

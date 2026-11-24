@@ -83,7 +83,6 @@ impl FakeHerdr {
                         store_tokens(&mut agents.lock().unwrap(), params);
                         json!({"type": "ok"})
                     }
-                    "agent.rename" => rename(&mut agents.lock().unwrap(), params),
                     "pane.close" => {
                         close_pane(&mut agents.lock().unwrap(), &workspaces, params);
                         json!({"type": "ok"})
@@ -110,8 +109,6 @@ impl FakeHerdr {
                 requests.lock().unwrap().push(request.clone());
                 let reply = if failing {
                     json!({"id": request["id"], "error": {"code": "failed", "message": "injected"}})
-                } else if let Some(code) = result["error"].as_str() {
-                    json!({"id": request["id"], "error": {"code": code, "message": code}})
                 } else {
                     json!({"id": request["id"], "result": result})
                 };
@@ -217,33 +214,6 @@ fn close_pane(agents: &mut Vec<Value>, workspaces: &Mutex<Vec<Value>>, params: &
         }
     }
     agents.retain(|a| a["pane_id"] != params["pane_id"]);
-}
-
-/// Herdr's rules: a name is `[a-z][a-z0-9_-]{0,31}` and unique among agents.
-fn rename(agents: &mut [Value], params: &Value) -> Value {
-    let name = &params["name"];
-    if let Some(name) = name.as_str() {
-        let valid = name.len() <= 32
-            && name.starts_with(|c: char| c.is_ascii_lowercase())
-            && name
-                .chars()
-                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || "-_".contains(c));
-        if !valid {
-            return json!({"error": "invalid_agent_name"});
-        }
-        if agents
-            .iter()
-            .any(|a| a["name"] == *name && a["pane_id"] != params["target"])
-        {
-            return json!({"error": "agent_name_taken"});
-        }
-    }
-    for agent in agents {
-        if agent["pane_id"] == params["target"] {
-            agent["name"] = name.clone();
-        }
-    }
-    json!({"type": "agent_info"})
 }
 
 pub fn agent(pane: &str, status: &str, seq: u64) -> Value {

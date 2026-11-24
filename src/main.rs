@@ -227,7 +227,10 @@ fn apply(
             }
             if matches!(
                 action,
-                Action::ToggleSettle | Action::CloseForGood | Action::Snooze(_)
+                Action::ToggleSettle
+                    | Action::SettleKeepingOpen
+                    | Action::CloseForGood { .. }
+                    | Action::Snooze(_)
             ) {
                 picker.move_on_from(&key, from);
             }

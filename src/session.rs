@@ -129,7 +129,14 @@ impl Session {
             }) => self.herdr.focus(&snapshot.agents[*index].pane_id),
             Some(closed) => match self.act(&closed.key, Action::Reopen)? {
                 Outcome::Refused(refusal) => self.herdr.notify(&refusal).map(drop),
-                _ => Ok(()),
+                Outcome::Reopened => Ok(()),
+                // It came back on its own since: go to it.
+                Outcome::Done { key, .. } => {
+                    match self.herdr.agents()?.iter().find(|a| a.key() == key) {
+                        Some(agent) => self.herdr.focus(&agent.pane_id),
+                        None => Ok(()),
+                    }
+                }
             },
             None => self.herdr.notify("Nothing needs you").map(drop),
         }
@@ -176,7 +183,8 @@ impl Session {
             .find(|w| agent.workspace_id.as_deref() == Some(w.workspace_id.as_str()));
         let pane = if let Some(branch) = &agent.branch {
             // Herdr branches new worktrees from the repository, not from another worktree.
-            let from = workspace.map(|w| match &w.worktree {
+            let source = workspace.or_else(|| workspaces.iter().find(|w| w.focused));
+            let from = source.map(|w| match &w.worktree {
                 Some(WorkspaceWorktree {
                     is_linked_worktree: true,
                     repo_root: Some(root),
@@ -186,11 +194,17 @@ impl Session {
             });
             self.herdr.create_worktree(from, branch)?
         } else {
-            let cwd = agent.cwd.as_deref().filter(|dir| Path::new(dir).is_dir());
+            // A gone workspace's directory may belong to another project than the current one.
+            let cwd =
+                (agent.cwd.as_deref()).filter(|dir| workspace.is_some() && Path::new(dir).is_dir());
             let id = workspace.map(|w| w.workspace_id.as_str());
             self.herdr.create_tab(id, cwd)?
         };
-        self.herdr.run_command(&pane, agent.command)
+        let started = self.herdr.run_command(&pane, agent.command);
+        if started.is_err() {
+            let _ = self.herdr.close_pane(&pane);
+        }
+        started
     }
 
     pub fn notify(&mut self, title: &str) -> io::Result<()> {
@@ -279,7 +293,9 @@ impl Session {
             let _ = self.herdr.notify(&title);
         }
         for close in &reconciled.closes {
-            let _ = self.close_session(close);
+            if self.close_session(close).is_err() {
+                let _ = self.locked(|_, state| state.retry_close(close));
+            }
         }
         Ok(Some(synced.map(|(snapshot, edited)| {
             let wake_failed = wake_failed.map(|error| error.to_string());
@@ -334,6 +350,7 @@ impl Session {
     }
 
     fn close_session(&mut self, close: &Close) -> io::Result<Option<String>> {
+        let closing_alone = self.store.close_lock()?;
         let closing = self.locked(|held, state| {
             let generation = held.herdr.server_generation();
             state.confirm_close(close, &generation, held.now(), || {
@@ -352,6 +369,7 @@ impl Session {
             Closing::Skip => return Ok(None),
         };
         let closed = self.herdr.close_pane(&pane);
+        drop(closing_alone);
         let announced =
             closed.is_ok() && for_good && matches!(self.herdr.notify(CLOSED_FOR_GOOD), Ok(true));
         self.locked(|_, state| state.report_close(close, closed.is_ok()))?;
@@ -373,7 +391,15 @@ impl Session {
         }
         let cwd = launch.cwd.filter(|dir| Path::new(dir).is_dir());
         self.locked(|held, state| {
+            let now = held.now();
             let herdr = &mut *held.herdr;
+            // Another process may have launched it since the plan was made.
+            if let Some(pane) = state.launched_reopen(plan, &herdr.server_generation(), now)
+                && Some(pane.as_str()) != launch.focus
+                && herdr.focus_pane(&pane).is_ok()
+            {
+                return Ok(());
+            }
             let pane = herdr.create_tab(launch.workspace, cwd)?;
             let launched = match launch.session_to_report {
                 Some((agent, session)) => herdr.report_session(&pane, agent, session),
@@ -384,7 +410,6 @@ impl Session {
                 let _ = herdr.close_pane(&pane);
                 return Err(error);
             }
-            let now = (held.clock)();
             state.report_reopen(plan, &pane, &herdr.server_generation(), now);
             Ok(())
         })?
@@ -524,22 +549,16 @@ fn publish(herdr: &mut Herdr, agents: &[Agent], rows: &[Row], now: i64) -> io::R
             continue;
         };
         let agent = &agents[index];
-        let pushed = agent.tokens.get(NAME_TOKEN);
-        let name = name_agent(herdr, agent, row.title.as_deref());
         let rank = row.rank().token().to_owned();
         let label = row.sidebar_label(&pin_icon, now, &Local);
         if agent.tokens.get("triage_rank") == Some(&rank)
             && agent.tokens.get("triage") == label.as_ref()
-            && pushed == name.as_ref()
         {
             continue;
         }
         let mut tokens = Map::new();
         tokens.insert("triage_rank".into(), Value::String(rank));
         tokens.insert("triage".into(), label.map_or(Value::Null, Value::String));
-        if name.is_some() || pushed.is_some() {
-            tokens.insert(NAME_TOKEN.into(), name.map_or(Value::Null, Value::String));
-        }
         // A pane can close between the snapshot and here; the others still need their tokens.
         if let Err(error) = herdr.report_tokens(&agent.pane_id, &tokens) {
             failure.get_or_insert(error);
@@ -547,54 +566,6 @@ fn publish(herdr: &mut Herdr, agents: &[Agent], rows: &[Row], now: i64) -> io::R
     }
     let view = herdr.set_view(&view_label(rows), &Rank::hidden_tokens());
     failure.map_or(view, Err)
-}
-
-/// The pane token remembering the Herdr name triage last gave the agent for its title: `name`
-/// when triage set it, `!name` when Herdr refused it or the agent already had it. Triage pushes a
-/// name only when the title changes, so a name given in Herdr since stays, and clears only a
-/// name it set.
-const NAME_TOKEN: &str = "triage_name";
-
-/// Names the agent in Herdr after its title, best effort, and returns the token to keep.
-fn name_agent(herdr: &mut Herdr, agent: &Agent, title: Option<&str>) -> Option<String> {
-    let pushed = agent.tokens.get(NAME_TOKEN);
-    let owned = pushed.filter(|name| !name.starts_with('!'));
-    let tried = pushed.map(|name| name.trim_start_matches('!'));
-    match title.and_then(agent_name) {
-        Some(name) if tried == Some(name.as_str()) => pushed.cloned(),
-        Some(name) if agent.name.as_ref() == Some(&name) => Some(format!("!{name}")),
-        Some(name) => match herdr.rename_agent(&agent.pane_id, Some(&name)) {
-            Ok(()) => Some(name),
-            Err(_) => Some(format!("!{name}")),
-        },
-        None => match owned {
-            Some(name) if agent.name.as_ref() == Some(name) => herdr
-                .rename_agent(&agent.pane_id, None)
-                .err()
-                .and(pushed.cloned()),
-            _ => None,
-        },
-    }
-}
-
-/// A title as Herdr accepts an agent name: `[a-z][a-z0-9_-]{0,31}`.
-fn agent_name(title: &str) -> Option<String> {
-    let mut name = String::new();
-    for c in title.chars().flat_map(char::to_lowercase) {
-        if c.is_ascii_lowercase() || c.is_ascii_digit() {
-            name.push(c);
-        } else if !name.is_empty() && !name.ends_with('-') {
-            name.push('-');
-        }
-    }
-    if name.is_empty() {
-        return None;
-    }
-    if !name.starts_with(|c: char| c.is_ascii_lowercase()) {
-        name.insert_str(0, "t-");
-    }
-    name.truncate(32);
-    Some(name.trim_end_matches('-').to_owned())
 }
 
 /// One notice for every snooze that came due in a sync.
@@ -679,12 +650,11 @@ fn items(snapshot: &Snapshot, now: i64) -> Vec<Item> {
 }
 
 fn thread_label(agent: &Agent) -> String {
-    let given_by_triage = agent.tokens.get(NAME_TOKEN);
     if let Some(name) = agent
         .name
         .as_deref()
         .map(str::trim)
-        .filter(|name| !name.is_empty() && given_by_triage.map(String::as_str) != Some(*name))
+        .filter(|name| !name.is_empty())
     {
         return name.to_owned();
     }
@@ -845,7 +815,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             methods(&fake),
-            [&read[..], &["tab.list", "agent.rename", report, view_set]].concat()
+            [&read[..], &["tab.list", view_set]].concat()
         );
 
         session.toggle_section(Section::Working).unwrap();
@@ -861,89 +831,6 @@ mod tests {
                 .is_err()
         );
         assert_eq!(methods(&fake), closing);
-    }
-
-    #[test]
-    fn a_title_names_the_agent_in_herdr_as_herdr_allows() {
-        let fake = FakeHerdr::start(vec![
-            fake_herdr::agent("w1:p1", "idle", 3),
-            fake_herdr::agent("w1:p2", "idle", 4),
-        ]);
-        fake.agents.lock().unwrap()[0]["terminal_title_stripped"] = json!("claude: auto title");
-        let (mut session, _) = connect(&fake);
-        let renames = || fake.take("agent.rename");
-        let key = "terminal:t-w1:p1";
-        let view = session
-            .rename(key, Some("Fix flaky test (#2)".into()))
-            .unwrap();
-        assert_eq!(
-            renames(),
-            [json!({"target": "w1:p1", "name": "fix-flaky-test-2"})]
-        );
-        let row = &view.items.iter().find(|i| i.row.key == key).unwrap().row;
-        assert_eq!(row.label(), "Fix flaky test (#2)");
-        let view = session.view().unwrap();
-        assert!(renames().is_empty(), "named once");
-        let row = &view.items.iter().find(|i| i.row.key == key).unwrap().row;
-        assert_eq!(row.thread.label, "auto title", "the automatic title stays");
-
-        session.rename(key, None).unwrap();
-        assert_eq!(renames(), [json!({"target": "w1:p1", "name": null})]);
-        session.view().unwrap();
-        assert!(renames().is_empty());
-    }
-
-    #[test]
-    fn titles_become_names_herdr_accepts() {
-        assert_eq!(
-            agent_name("Fix flaky test").as_deref(),
-            Some("fix-flaky-test")
-        );
-        assert_eq!(agent_name("  --API v2!! ").as_deref(), Some("api-v2"));
-        assert_eq!(agent_name("2026 plan").as_deref(), Some("t-2026-plan"));
-        assert_eq!(agent_name("決済の再試行"), None);
-        let long = agent_name("a very long title that keeps going well past it").unwrap();
-        assert!(long.len() <= 32 && !long.ends_with('-'), "{long}");
-    }
-
-    #[test]
-    fn a_name_herdr_refuses_or_already_has_never_breaks_a_sync_or_gets_cleared() {
-        let fake = FakeHerdr::start(vec![
-            fake_herdr::agent("w1:p1", "idle", 3),
-            fake_herdr::agent("w1:p2", "idle", 4),
-            fake_herdr::agent("w1:p3", "idle", 5),
-        ]);
-        fake.agents.lock().unwrap()[1]["name"] = json!("docs");
-        fake.agents.lock().unwrap()[2]["name"] = json!("mine");
-        let (mut session, _) = connect(&fake);
-        let renames = || fake.take("agent.rename");
-
-        session
-            .rename("terminal:t-w1:p1", Some("Docs".into()))
-            .unwrap();
-        assert_eq!(renames().len(), 1, "taken by p2: Herdr refuses");
-        session.view().unwrap();
-        assert!(renames().is_empty(), "a refused name is not retried");
-
-        session
-            .rename("terminal:t-w1:p3", Some("mine".into()))
-            .unwrap();
-        assert!(renames().is_empty(), "already named so");
-        session.rename("terminal:t-w1:p3", None).unwrap();
-        assert!(renames().is_empty(), "a name triage did not give stays");
-
-        session
-            .rename("terminal:t-w1:p1", Some("checkout".into()))
-            .unwrap();
-        assert_eq!(renames().len(), 1);
-        fake.agents.lock().unwrap()[0]["name"] = json!("renamed-in-herdr");
-        session.view().unwrap();
-        assert!(
-            renames().is_empty(),
-            "a name you give in Herdr is not overwritten"
-        );
-        session.rename("terminal:t-w1:p1", None).unwrap();
-        assert!(renames().is_empty(), "nor cleared");
     }
 
     #[test]
@@ -1126,7 +1013,7 @@ mod tests {
             .unwrap();
         assert!(keys.contains(&"terminal:t-w1:p1".to_owned()), "{keys:?}");
         session
-            .act("terminal:t-w1:p1", Action::CloseForGood)
+            .act("terminal:t-w1:p1", Action::CloseForGood { seq: 3 })
             .unwrap();
         assert_eq!(fake.take("pane.close"), [json!({"pane_id": "w1:p1"})]);
         let kept = store(&fake)
@@ -1332,7 +1219,10 @@ mod tests {
                 "a snooze keeps a pane it could not reopen to wake"
             );
             methods(&fake);
-            assert_eq!(session.act(key, Action::CloseForGood).unwrap(), done(key));
+            assert_eq!(
+                session.act(key, Action::CloseForGood { seq: 3 }).unwrap(),
+                done(key)
+            );
             let calls: Vec<Value> = fake
                 .requests
                 .lock()
@@ -1365,7 +1255,7 @@ mod tests {
         let (mut session, _) = connect(&fake);
         let key = "terminal:t-w1:p1";
         *fake.fail_method.lock().unwrap() = Some("pane.close".into());
-        assert!(session.act(key, Action::CloseForGood).is_err());
+        assert!(session.act(key, Action::CloseForGood { seq: 3 }).is_err());
         assert!(fake.take("notification.show").is_empty());
         let kept = store(&fake)
             .transact(|state| state.records.contains_key(key))
@@ -1385,7 +1275,7 @@ mod tests {
             let kept = store.transact(|state| state.records.contains_key(key));
             *seen.lock().unwrap() = kept.ok();
         });
-        session.act(key, Action::CloseForGood).unwrap();
+        session.act(key, Action::CloseForGood { seq: 3 }).unwrap();
         assert_eq!(
             *unreported.lock().unwrap(),
             Some(true),
@@ -1401,7 +1291,7 @@ mod tests {
         let key = "terminal:t-w1:p1";
         *fake.notification_shown.lock().unwrap() = false;
         assert_eq!(
-            session.act(key, Action::CloseForGood).unwrap(),
+            session.act(key, Action::CloseForGood { seq: 3 }).unwrap(),
             Outcome::Done {
                 key: key.into(),
                 notice: Some("closed for good: it has no session to resume".into()),
@@ -1418,7 +1308,7 @@ mod tests {
         let key = "terminal:t-w1:p1";
         *fake.fail_method.lock().unwrap() = Some("notification.show".into());
         assert_eq!(
-            session.act(key, Action::CloseForGood).unwrap(),
+            session.act(key, Action::CloseForGood { seq: 3 }).unwrap(),
             Outcome::Done {
                 key: key.into(),
                 notice: Some("closed for good: it has no session to resume".into()),
@@ -1716,6 +1606,43 @@ mod tests {
     }
 
     #[test]
+    fn a_close_waits_for_another_process_closing_in_the_same_workspace() {
+        let fake = two_resumable_agents();
+        let held = store(&fake).close_lock().unwrap();
+        let socket = fake.socket.clone();
+        let state = fake.state_dir();
+        let settling = std::thread::spawn(move || {
+            let mut session = Session::new(
+                Herdr::at(&socket).unwrap(),
+                Store::at(state),
+                || NOW,
+                |_| Ok(()),
+            );
+            session.act(KEY, Action::ToggleSettle).unwrap()
+        });
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert!(fake.take("pane.close").is_empty(), "it waits for the lock");
+        Herdr::at(&fake.socket)
+            .unwrap()
+            .close_pane("w1:p2")
+            .unwrap();
+        fake.take("pane.close");
+        drop(held);
+        let outcome = settling.join().unwrap();
+        assert!(fake.take("pane.close").is_empty(), "{outcome:?}");
+        assert!(
+            matches!(
+                outcome,
+                Outcome::Done {
+                    notice: Some(_),
+                    ..
+                }
+            ),
+            "kept open as the workspace's last pane: {outcome:?}"
+        );
+    }
+
+    #[test]
     fn a_landed_settle_closes_its_pane_even_when_publishing_fails() {
         let fake = FakeHerdr::start(vec![
             resumable_agent("w1:p1", "working", 3),
@@ -1765,6 +1692,41 @@ mod tests {
             fake.take("worktree.create")[0],
             json!({"branch": "fix/y", "focus": true})
         );
+    }
+
+    #[test]
+    fn a_new_agent_in_the_current_workspace_drops_stale_paths_and_never_leaves_a_blank_tab() {
+        let fake = FakeHerdr::start(vec![]);
+        {
+            let mut workspaces = fake.workspaces.lock().unwrap();
+            workspaces[0]["focused"] = json!(true);
+            workspaces[0]["worktree"] =
+                json!({"repo_root": "/work/acme-api", "is_linked_worktree": true});
+        }
+        let (mut session, _) = connect(&fake);
+        let dir = tempfile::tempdir().unwrap();
+        let gone = |branch: Option<&str>| NewAgent {
+            workspace_id: Some("w-gone".into()),
+            cwd: Some(dir.path().to_str().unwrap().to_owned()),
+            branch: branch.map(str::to_owned),
+            command: "claude",
+        };
+        session.start_agent(&gone(None)).unwrap();
+        assert_eq!(
+            fake.take("tab.create")[0],
+            json!({"workspace_id": null, "cwd": null, "focus": true}),
+            "the gone workspace's directory may be another project's"
+        );
+        session.start_agent(&gone(Some("fix/z"))).unwrap();
+        assert_eq!(
+            fake.take("worktree.create")[0],
+            json!({"cwd": "/work/acme-api", "branch": "fix/z", "focus": true}),
+            "the focused workspace is a linked worktree: branch from its repository"
+        );
+
+        *fake.fail_method.lock().unwrap() = Some("pane.send_input".into());
+        assert!(session.start_agent(&gone(None)).is_err());
+        assert_eq!(fake.take("pane.close"), [json!({"pane_id": "w1:p92"})]);
     }
 
     #[test]
@@ -1867,6 +1829,7 @@ mod tests {
             changed_at: None,
             status: triage::Status::Idle,
             settle_pending: false,
+            workspace_panes: 0,
             title: None,
             thread: Thread::default(),
         };

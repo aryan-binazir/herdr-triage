@@ -99,6 +99,8 @@ pub struct ForgetPrompt {
 pub struct ClosePrompt {
     pub key: String,
     pub label: String,
+    /// Herdr's change counter for the agent when asked; `y` holds only for that turn.
+    seq: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -253,8 +255,10 @@ impl Picker {
         }
         if let Some(prompt) = self.close.take() {
             let action = match key.code {
-                KeyCode::Char('y') => Action::CloseForGood,
-                KeyCode::Char('n') => Action::ToggleSettle,
+                KeyCode::Char('y') if key.modifiers.is_empty() => {
+                    Action::CloseForGood { seq: prompt.seq }
+                }
+                KeyCode::Char('n') if key.modifiers.is_empty() => Action::SettleKeepingOpen,
                 _ => return Effect::None,
             };
             return Effect::Apply {
@@ -365,6 +369,7 @@ impl Picker {
                     self.close = Some(ClosePrompt {
                         key: item.row.key.clone(),
                         label: item.row.label().to_owned(),
+                        seq: item.row.seq,
                     });
                     return Effect::None;
                 }
@@ -1172,8 +1177,11 @@ mod tests {
             key: "k-p2".into(),
             action,
         };
-        assert_eq!(settle(KeyCode::Char('y')), apply(Action::CloseForGood));
-        assert_eq!(settle(KeyCode::Char('n')), apply(Action::ToggleSettle));
+        assert_eq!(
+            settle(KeyCode::Char('y')),
+            apply(Action::CloseForGood { seq: 2 })
+        );
+        assert_eq!(settle(KeyCode::Char('n')), apply(Action::SettleKeepingOpen));
         assert_eq!(settle(KeyCode::Esc), Effect::None);
         assert_eq!(settle(KeyCode::Char('q')), Effect::None);
 
