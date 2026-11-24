@@ -29,7 +29,6 @@ pub struct Session {
     store: Store,
     clock: Box<Clock>,
     waker: Box<dyn FnMut(i64) -> io::Result<()>>,
-    /// A person asking wants the reopened thread in front; an agent asking must not move them.
     focus_reopened: bool,
 }
 
@@ -42,7 +41,7 @@ pub struct View {
 #[derive(Debug, PartialEq, Eq)]
 pub enum Outcome {
     Refused(String),
-    /// The thread was resumed in a new tab, which Herdr focused.
+    /// The thread was resumed in a new tab.
     Reopened,
     Done {
         /// The thread acted on, under the key Herdr knows it by now.
@@ -92,7 +91,6 @@ impl Session {
         }
     }
 
-    /// Reopens threads in the background, leaving the person's focus where it is.
     pub fn in_background(mut self) -> Self {
         self.focus_reopened = false;
         self
@@ -102,9 +100,6 @@ impl Session {
         (self.clock)()
     }
 
-    /// Records that the agent in `pane` was launched by `by`, under `title`. `None` when Herdr
-    /// does not list an agent there.
-    /// Done by `deadline`, store lock and Herdr requests included, or fails with `TimedOut`.
     pub fn stamp_launch(
         &mut self,
         pane: &str,
@@ -138,7 +133,6 @@ impl Session {
                 Some(key)
             };
             if let Some(synced) = self.sync_once(false, false, stamp)? {
-                // A hook that asked for a sync meanwhile is served even when this one failed.
                 let served = self.serve_sync_requests();
                 let (_, key) = synced?;
                 served?;
@@ -391,7 +385,6 @@ impl Session {
             .map(|w| w.workspace_id.as_str())
             .collect();
         let launch = plan.launch(&self.herdr.server_generation(), &workspaces);
-        // A reopen moments ago already started it, if that tab is still there.
         if let Some(pane) = launch.focus {
             let started = if self.focus_reopened {
                 self.herdr.focus_pane(pane).is_ok()
@@ -578,7 +571,6 @@ fn publish(herdr: &mut Herdr, agents: &[Agent], rows: &[Row], now: i64) -> io::R
 fn view_label(rows: &[Row]) -> String {
     let count = |rank| rows.iter().filter(|row| row.rank() == rank).count();
     let (snoozed, settled) = (count(Rank::Snoozed), count(Rank::Settled));
-    // Herdr right-aligns the label after its own "agents" title, so it has to stay short.
     match (snoozed, settled) {
         (0, 0) => "triage".into(),
         (n, 0) => format!("{n} snoozed"),
@@ -587,8 +579,6 @@ fn view_label(rows: &[Row]) -> String {
     }
 }
 
-/// Herdr names the plugin's config directory to its own commands; a command an MCP client started
-/// finds it where Herdr keeps it.
 pub fn pin_icon() -> String {
     let dir = std::env::var_os("HERDR_PLUGIN_CONFIG_DIR")
         .map(PathBuf::from)

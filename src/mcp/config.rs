@@ -1,6 +1,3 @@
-//! What `herdr_launch` starts when the caller does not say: `mcp.yaml`, read on every call so an
-//! edit applies to the next launch.
-
 use std::collections::BTreeMap;
 use std::fs;
 use std::io;
@@ -8,7 +5,6 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
-/// The agents this server knows how to start with a model and an effort.
 pub const HARNESSES: [&str; 3] = ["pi", "claude", "codex"];
 
 const TEMPLATE: &str = "\
@@ -92,7 +88,6 @@ fn default_harness() -> String {
     "pi".into()
 }
 
-/// What one launch runs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Selection {
     pub harness: String,
@@ -102,12 +97,10 @@ pub struct Selection {
 }
 
 impl Selection {
-    /// The arguments after the agent's own name. A model or effort that could pass for a flag,
-    /// or that no model name would hold, is refused.
     pub fn argv(&self) -> Result<Vec<String>, String> {
         for (name, value) in [("model", &self.model), ("effort", &self.effort)] {
             if let Some(value) = value
-                && !plain(value)
+                && !could_be_model_name(value)
             {
                 return Err(format!(
                     "{name} `{value}` has characters a model name never has"
@@ -145,7 +138,7 @@ impl Selection {
     }
 }
 
-fn plain(value: &str) -> bool {
+fn could_be_model_name(value: &str) -> bool {
     !value.is_empty()
         && !value.starts_with('-')
         && value
@@ -154,8 +147,6 @@ fn plain(value: &str) -> bool {
 }
 
 impl Config {
-    /// The file's settings, or the defaults when there is no file. A file that does not parse is
-    /// an error: launching something other than what it says would be worse than not launching.
     pub fn load(path: Option<&Path>) -> io::Result<Self> {
         let text = match path.map(fs::read_to_string) {
             Some(Ok(text)) => text,
@@ -169,7 +160,6 @@ impl Config {
         })
     }
 
-    /// Call arguments win over the project's settings, which win over the harness's.
     pub fn select(
         &self,
         project: &[&str],
@@ -191,10 +181,9 @@ impl Config {
             .or_else(|| project.harness.clone())
             .unwrap_or_else(|| self.default_harness.clone());
         let defaults = self.harness(&chosen);
-        // A project's model belongs to the harness it launches, not to one the caller swapped in.
         let project_harness = project.harness.as_deref().unwrap_or(&self.default_harness);
-        let project_applies = harness.is_none_or(|asked| asked == project_harness);
-        let from_project = |value: Option<String>| value.filter(|_| project_applies);
+        let project_harness_kept = harness.is_none_or(|asked| asked == project_harness);
+        let from_project = |value: Option<String>| value.filter(|_| project_harness_kept);
         Selection {
             model: model
                 .map(str::to_owned)
@@ -209,7 +198,6 @@ impl Config {
         }
     }
 
-    /// A harness's settings, each one the file leaves out taken from the built-in defaults.
     pub fn harness(&self, name: &str) -> Harness {
         let builtin = builtin(name);
         match self.harnesses.get(name).cloned().flatten() {
@@ -223,7 +211,6 @@ impl Config {
     }
 }
 
-/// The agreed defaults: pi on Opus 5.5 at medium effort; other agents on their own.
 fn builtin(harness: &str) -> Harness {
     match harness {
         "pi" => Harness {
@@ -235,8 +222,6 @@ fn builtin(harness: &str) -> Harness {
     }
 }
 
-/// `None` with no absolute config directory to look in: a relative one would be wherever the
-/// client started the server.
 pub fn path() -> Option<PathBuf> {
     let config = std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
@@ -249,15 +234,11 @@ pub fn path() -> Option<PathBuf> {
     Some(config.join("herdr-triage").join("mcp.yaml"))
 }
 
-/// Leaves a commented file to edit where there is none. Failing to is not an error: the
-/// defaults it documents apply either way.
 pub fn write_template(path: &Path) {
     let Some(dir) = path.parent() else { return };
     if fs::create_dir_all(dir).is_err() {
         return;
     }
-    // Written whole beside it, then linked into place only if still absent, so a client
-    // starting at the same moment never reads half a file.
     let staged = path.with_extension(format!("yaml.{}", std::process::id()));
     if fs::write(&staged, TEMPLATE).is_ok() {
         let _ = fs::hard_link(&staged, path);

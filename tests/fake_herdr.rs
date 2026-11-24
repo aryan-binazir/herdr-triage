@@ -456,7 +456,6 @@ fn an_overdue_waker_started_during_sync_requests_another_sync() {
 fn hooks_keep_a_link_to_the_binary_where_mcp_clients_start_it() {
     let herdr = FakeHerdr::start(vec![agent("w1:p1", "idle", 3)]);
     let link = herdr.dir.path().join("state/herdr-triage");
-    // What an earlier install left: a link to a binary that is gone.
     std::fs::create_dir_all(link.parent().unwrap()).unwrap();
     std::os::unix::fs::symlink("/gone/herdr-triage", &link).unwrap();
     herdr.run(&["sync"]);

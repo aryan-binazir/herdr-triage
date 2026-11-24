@@ -147,7 +147,6 @@ pub struct Record {
     pub restored_at: Option<i64>,
     #[serde(default)]
     pub title: Option<String>,
-    /// Who started this thread through the MCP server; unset for threads a person started.
     #[serde(default)]
     pub launched_by: Option<String>,
 }
@@ -310,8 +309,6 @@ pub enum Action {
     TogglePin,
     Reopen,
     Forget,
-    /// Reach a state rather than toggle, judged under the store's lock: one already reached is
-    /// left alone, so two callers asking for it at once cannot undo each other.
     Ensure(Want),
 }
 
@@ -368,7 +365,7 @@ pub struct ReopenPlan {
     pending_generation: Option<String>,
 }
 
-/// What the executor does to reopen a thread: focus `focus` if Herdr still has it, otherwise
+/// What the executor does to reopen a thread: reuse `focus` if Herdr still has it, otherwise
 /// launch `argv` in a new tab and report the tab's pane with `State::report_reopen`.
 #[derive(Debug, PartialEq, Eq)]
 pub struct Launch<'a> {
@@ -1054,7 +1051,6 @@ impl State {
         after
     }
 
-    /// The toggle that reaches what `Action::Ensure` wants, or `None` when it is already so.
     fn toggle_toward(
         &self,
         key: &str,

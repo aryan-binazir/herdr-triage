@@ -1,6 +1,3 @@
-//! What each tool does: resolve the project or thread the caller named, drive Herdr, and keep
-//! triage's record of it. Every refusal names its reason in `Failure::code`.
-
 use std::io;
 use std::path::Path;
 use std::thread;
@@ -17,24 +14,20 @@ use crate::picker::{Item, Target};
 use crate::session::{Outcome, Session};
 use crate::triage::{Action, Display, Park, Want};
 
-/// A whole launch, inside the five minutes the README tells Codex to allow (it allows 60 by
-/// default); most of it is for checking out a large repository's worktree.
+/// Inside the five minutes the README tells Codex to allow (it allows 60 by default).
 pub const LAUNCH_BUDGET: Duration = Duration::from_secs(240);
-/// What a launch keeps back after its worktree to start the agent and give it its message.
-const AFTER_CHECKOUT: Duration = Duration::from_secs(60);
+const RESERVED_AFTER_CHECKOUT: Duration = Duration::from_secs(60);
 const START_TIMEOUT: Duration = Duration::from_secs(40);
 const POLL: Duration = Duration::from_millis(200);
-/// How long a submitted prompt has to start a turn before the caller is told it may not have.
 const TURN_START_MS: u64 = 10_000;
 const WAIT_DEFAULT_MS: u64 = 30_000;
 const WAIT_MAX_MS: u64 = 50_000;
-const RULE: usize = 8;
+const RULE_STROKES: usize = 8;
 const READ_DEFAULT_LINES: u64 = 100;
 const READ_MAX_LINES: u64 = 2_000;
 const READ_DEFAULT_CHARS: usize = 12_000;
 const READ_MAX_CHARS: usize = 60_000;
 const LIST_DEFAULT: usize = 50;
-/// Herdr answers these at once; the margin covers a busy server.
 const QUICK: Duration = Duration::from_secs(10);
 const MARGIN: Duration = Duration::from_secs(10);
 
@@ -88,23 +81,18 @@ impl From<Refused> for Failure {
 
 type Done = Result<Value, Failure>;
 
-/// One tool call's view of the caller, Herdr and triage.
 pub struct Call<'a> {
     env: &'a Env,
     client: &'a str,
     herdr: Herdr,
     session: Session,
     caller: Option<Caller>,
-    /// When a launch's time runs out: every Herdr request it makes is cut to fit.
     deadline: Option<Instant>,
 }
 
 #[derive(Clone)]
 struct Caller {
-    /// Who the caller is in `Record::launched_by`: the terminal it runs in, which keeps its
-    /// identity while its agent is detected, reports its session or moves; else this server's
-    /// client session.
-    key: String,
+    launched_by: String,
     workspace: Option<String>,
 }
 
@@ -160,14 +148,14 @@ impl<'a> Call<'a> {
         });
         let caller = match pane {
             Some(pane) => Caller {
-                key: format!(
+                launched_by: format!(
                     "terminal:{}",
                     pane["terminal_id"].as_str().unwrap_or_default()
                 ),
                 workspace: pane["workspace_id"].as_str().map(str::to_owned),
             },
             None => Caller {
-                key: format!("client:{}", self.client),
+                launched_by: format!("client:{}", self.client),
                 workspace: None,
             },
         };
@@ -176,14 +164,11 @@ impl<'a> Call<'a> {
     }
 
     fn threads(&mut self) -> Result<Threads, Failure> {
-        let caller = self.caller().key;
+        let caller = self.caller().launched_by;
         let items = self.session.view()?.items;
         Ok(Threads { items, caller })
     }
 
-    /// The threads, and the id `id` goes by in them. A launch can hand out a thread's id before
-    /// its agent reports its session, which renames the thread; the old id still finds it while
-    /// its agent runs, whenever the renaming lands.
     fn lookup(&mut self, id: &str) -> Result<(Threads, String), Failure> {
         let threads = self.threads()?;
         if threads.find(id).is_ok() || !id.starts_with("terminal:") {
@@ -200,8 +185,8 @@ impl<'a> Call<'a> {
         ))
     }
 
-    /// Herdr's workspaces, each with the checkout it is in. `workspace.list` names the checkout
-    /// only for some, so the rest are asked for one repository at a time.
+    /// `workspace.list` names the checkout only for some, so the rest are asked for one
+    /// repository at a time.
     fn workspaces(&mut self) -> Result<Vec<Workspace>, Failure> {
         let mut listed = self.ask("workspace.list", &json!({}), QUICK)?;
         let mut workspaces: Vec<Workspace> = serde_json::from_value(listed["workspaces"].take())
@@ -211,7 +196,6 @@ impl<'a> Call<'a> {
                 continue;
             }
             let params = json!({"workspace_id": workspaces[at].workspace_id});
-            // A workspace outside any repository is refused here, and stays a project of its own.
             let Ok(Ok(listed)) = self.request("worktree.list", &params, QUICK) else {
                 continue;
             };
@@ -269,7 +253,6 @@ impl Threads {
             })
     }
 
-    /// The pane of an open thread; a closed one has to be reopened first.
     fn pane(&self, id: &str) -> Result<(&Item, String), Failure> {
         let item = self.find(id)?;
         match &item.target {
@@ -330,7 +313,6 @@ fn decode<T: for<'de> Deserialize<'de>>(arguments: Value) -> Result<T, Failure> 
         .map_err(|error| Failure::new("invalid_arguments", error.to_string()))
 }
 
-/// Workspaces of one repository, or one workspace Herdr found no repository in.
 struct Project<'a> {
     key: &'a str,
     name: &'a str,
@@ -339,9 +321,8 @@ struct Project<'a> {
 }
 
 impl<'a> Project<'a> {
-    /// The repository's own checkout, which new worktrees branch off. Herdr refuses a linked
-    /// worktree's workspace as their source, so with only those open the repository's root is.
-    fn primary(&self) -> Option<&'a Workspace> {
+    /// Herdr refuses a linked worktree's workspace as a new worktree's source.
+    fn worktree_source(&self) -> Option<&'a Workspace> {
         self.workspaces
             .iter()
             .find(|w| w.worktree.as_ref().is_none_or(|c| !c.is_linked_worktree))
@@ -388,9 +369,7 @@ fn projects(workspaces: &[Workspace]) -> Vec<Project<'_>> {
     projects
 }
 
-/// The open project `query` names: a workspace id, a path inside a repository (resolved by
-/// Herdr's own Git discovery), or a repository name or workspace label that names one project.
-fn place<'a>(
+fn find_project<'a>(
     call: &mut Call,
     workspaces: &'a [Workspace],
     query: &str,
@@ -552,7 +531,6 @@ impl LaunchArgs {
     }
 }
 
-/// Where a launch put its agent's shell.
 struct Opened {
     pane: String,
     detail: Map<String, Value>,
@@ -574,7 +552,7 @@ pub fn launch_tool(call: &mut Call, args: &LaunchArgs, budget: Duration) -> Done
                 "pass `project`: herdr_projects lists the open ones",
             )
         })?;
-    let project = place(call, &workspaces, query)?;
+    let project = find_project(call, &workspaces, query)?;
     in_time(deadline)?;
     let selection = config.select(
         &project.names(),
@@ -590,7 +568,7 @@ pub fn launch_tool(call: &mut Call, args: &LaunchArgs, budget: Duration) -> Done
         let slug = slug(&args.title, 40);
         format!("{}{slug}-{suffix}", config.worktree.branch_prefix)
     });
-    let checkout = deadline.saturating_duration_since(Instant::now() + AFTER_CHECKOUT);
+    let checkout = deadline.saturating_duration_since(Instant::now() + RESERVED_AFTER_CHECKOUT);
     if checkout.is_zero() {
         return Err(out_of_time());
     }
@@ -602,7 +580,6 @@ pub fn launch_tool(call: &mut Call, args: &LaunchArgs, budget: Duration) -> Done
         args.base.as_deref(),
         checkout,
     )
-    // Herdr may have made the worktree even when no answer came: a retry must not make another.
     .map_err(|failure| failure.with("branch", branch.as_str()))?;
     let with_place = |mut failure: Failure| {
         failure.detail.extend(opened.detail.clone());
@@ -621,7 +598,6 @@ pub fn launch_tool(call: &mut Call, args: &LaunchArgs, budget: Duration) -> Done
     in_time(deadline).map_err(with_place)?;
     let ready = match start_agent(call, &start, deadline) {
         Ok(ready) => ready,
-        // No agent means no thread to read, so the pane's last words go with the refusal.
         Err(failure) => {
             let screen = screen_of(call, &opened.pane);
             return Err(with_place(failure).with("screen", screen));
@@ -629,7 +605,7 @@ pub fn launch_tool(call: &mut Call, args: &LaunchArgs, budget: Duration) -> Done
     };
     let thread = call
         .session
-        .stamp_launch(&opened.pane, &caller.key, &args.title, deadline)
+        .stamp_launch(&opened.pane, &caller.launched_by, &args.title, deadline)
         .map_err(|error| match error.kind() {
             io::ErrorKind::TimedOut => with_place(out_of_time()),
             _ => with_place(error.into()),
@@ -668,8 +644,6 @@ fn after_launch(ready: bool, sent: bool) -> &'static str {
     }
 }
 
-/// A launch past its budget stops before its next step: the client may have given up on it, and
-/// the failure names what was opened, for a retry with the same `request_id` to find.
 fn in_time(deadline: Instant) -> Result<(), Failure> {
     if Instant::now() < deadline {
         return Ok(());
@@ -688,9 +662,8 @@ const SENT: &str = "herdr_wait for the turn to end, then herdr_read. Herdr canno
                     message, so check the reply answers yours: a turn someone else started in the \
                     same instant would end first.";
 
-/// Starts the agent and stays until it takes input. `false` when it stopped first at a dialog of
-/// its own, such as trusting the directory. Herdr's `agent.start` answers before the agent is up,
-/// and refuses a pane whose shell has not reached its first prompt yet.
+/// Herdr's `agent.start` answers before the agent is up, and refuses a pane whose shell has not
+/// reached its first prompt yet.
 fn start_agent(call: &mut Call, start: &Value, deadline: Instant) -> Result<bool, Failure> {
     let pane = json!({"target": start["pane_id"]});
     let by = (Instant::now() + START_TIMEOUT).min(deadline);
@@ -706,7 +679,6 @@ fn start_agent(call: &mut Call, start: &Value, deadline: Instant) -> Result<bool
     loop {
         let mut found = match call.request("agent.get", &pane, QUICK)? {
             Ok(found) => found,
-            // Herdr gives up on a launch whose command exits or never becomes the agent.
             Err(refused) if refused.code == "agent_not_found" => {
                 return Err(Failure::new(
                     "agent_start_failed",
@@ -740,19 +712,16 @@ fn open_worktree(
     base: Option<&str>,
     checkout: Duration,
 ) -> Result<Opened, Failure> {
-    // The workspace is named for its project, so the thread's row says where it is; the title
-    // is on the thread itself.
     let mut worktree = json!({
         "branch": branch,
         "base": base.or(config.worktree.base.as_deref()),
         "label": project.name,
         "focus": false,
     });
-    match project.primary() {
+    match project.worktree_source() {
         Some(source) => worktree["workspace_id"] = json!(source.workspace_id),
         None => worktree["cwd"] = json!(project.root),
     }
-    // Herdr runs `git worktree add`, which checks out the whole tree.
     let made = call.ask("worktree.create", &worktree, checkout)?;
     let pane = pane_of(&made)?;
     Ok(Opened {
@@ -766,13 +735,12 @@ fn open_worktree(
     })
 }
 
-/// The end of what a pane shows, for a launch that left no agent to read.
 fn screen_of(call: &mut Call, pane: &str) -> String {
     let params = json!({
         "pane_id": pane, "source": "recent", "lines": 30, "format": "text", "strip_ansi": true,
     });
     let read = call.ask("pane.read", &params, QUICK).unwrap_or_default();
-    let text = without_blank_runs(read["read"]["text"].as_str().unwrap_or_default());
+    let text = compact_screen(read["read"]["text"].as_str().unwrap_or_default());
     let cut = text.chars().count().saturating_sub(800);
     text.chars().skip(cut).collect()
 }
@@ -791,9 +759,8 @@ fn pane_of(made: &Value) -> Result<String, Failure> {
         .ok_or_else(|| Failure::new("herdr_unavailable", "Herdr opened no pane"))
 }
 
-/// Submits `text` and stays until the turn is seen to start, so a wait that follows cannot
-/// mistake the idle moment before it for the turn's end. Herdr counts a turn already running as
-/// that start, so a message to an agent mid-turn is refused just before it would go.
+/// Herdr's `agent.prompt` wait counts a turn already running, so a message to an agent mid-turn
+/// is refused before it goes.
 fn prompt(call: &mut Call, pane: &str, text: &str, deadline: Instant) -> Result<(), Failure> {
     let status = call.ask("agent.get", &json!({"target": pane}), QUICK)?;
     if status["agent"]["agent_status"] == "working" {
@@ -832,8 +799,7 @@ fn slug(text: &str, max: usize) -> String {
     }
 }
 
-/// Herdr's agent names start with a lowercase letter, hold at most 32 of `a-z 0-9 - _`, and are
-/// unique; two threads may share a title.
+/// Herdr's agent names start with a lowercase letter and hold at most 32 of `a-z 0-9 - _`.
 fn agent_name(title: &str, suffix: &str) -> String {
     let slug = slug(title, 21);
     let lead = if slug.starts_with(|c: char| c.is_ascii_lowercase()) {
@@ -844,7 +810,6 @@ fn agent_name(title: &str, suffix: &str) -> String {
     format!("{lead}{slug}-{suffix}")
 }
 
-/// A title is shown on one row of the picker.
 fn one_line(text: &str) -> String {
     text.split(char::is_control)
         .flat_map(str::split_whitespace)
@@ -852,8 +817,6 @@ fn one_line(text: &str) -> String {
         .join(" ")
 }
 
-/// What reaches an agent's terminal as typing: lines and tabs, but no control characters, which
-/// a terminal would act on as keys.
 fn typeable(text: &str) -> Result<(), Failure> {
     if text
         .chars()
@@ -925,12 +888,11 @@ pub fn read_tool(call: &mut Call, arguments: Value) -> Done {
         params["source"] = json!("visible");
         call.ask("agent.read", &params, QUICK)?
     };
-    let text = without_blank_runs(read["read"]["text"].as_str().unwrap_or_default());
+    let text = compact_screen(read["read"]["text"].as_str().unwrap_or_default());
     let max = args
         .max_chars
         .unwrap_or(READ_DEFAULT_CHARS)
         .clamp(1, READ_MAX_CHARS);
-    // The end of the screen is the news; what is cut is the oldest of it.
     let cut = text.chars().count().saturating_sub(max);
     let kept: String = text.chars().skip(cut).collect();
     let mut result = threads.describe(item);
@@ -939,9 +901,7 @@ pub fn read_tool(call: &mut Call, arguments: Value) -> Done {
     Ok(result)
 }
 
-/// A terminal's screen is mostly padding: rows lose their trailing spaces, blank rows in a row
-/// become one, and a rule drawn across the screen is cut to a few strokes.
-fn without_blank_runs(screen: &str) -> String {
+fn compact_screen(screen: &str) -> String {
     let mut text = String::new();
     for row in screen.lines().map(str::trim_end) {
         if row.is_empty() && (text.is_empty() || text.ends_with("\n\n")) {
@@ -949,10 +909,12 @@ fn without_blank_runs(screen: &str) -> String {
         }
         let mut drawn = row.chars();
         let rule = drawn.next().filter(|first| {
-            !first.is_alphanumeric() && row.chars().count() > RULE && drawn.all(|c| c == *first)
+            !first.is_alphanumeric()
+                && row.chars().count() > RULE_STROKES
+                && drawn.all(|c| c == *first)
         });
         match rule {
-            Some(stroke) => text.extend(std::iter::repeat_n(stroke, RULE)),
+            Some(stroke) => text.extend(std::iter::repeat_n(stroke, RULE_STROKES)),
             None => text.push_str(row),
         }
         text.push('\n');
@@ -1018,7 +980,7 @@ pub fn threads_tool(call: &mut Call, arguments: Value) -> Done {
         None => Vec::new(),
     };
     let project = match args.project.as_deref() {
-        Some(query) => Some(place(call, &workspaces, query)?),
+        Some(query) => Some(find_project(call, &workspaces, query)?),
         None => None,
     };
     let wanted = |item: &&Item| {
@@ -1029,7 +991,6 @@ pub fn threads_tool(call: &mut Call, arguments: Value) -> Done {
                 .is_none_or(|p| p.holds(item.row.thread.workspace_id.as_deref()))
     };
     let mut listed: Vec<&Item> = threads.items.iter().filter(wanted).collect();
-    // Triage's order within each half: the caller's own threads are the ones it should reach for.
     listed.sort_by_key(|item| !threads.mine(item));
     let limit = args.limit.unwrap_or(LIST_DEFAULT).max(1);
     Ok(json!({
@@ -1109,7 +1070,6 @@ pub fn organize_tool(call: &mut Call, arguments: Value) -> Done {
             Verb::MarkUnread => Some(Action::Ensure(Want::Unread)),
             Verb::MarkRead => Some(Action::Ensure(Want::Read)),
             Verb::Forget => Some(Action::Forget),
-            // Undo is answered above.
             Verb::Undo => return Err(Failure::new("invalid_arguments", "undo takes no thread")),
         };
         if let Some(action) = action {

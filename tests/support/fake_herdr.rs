@@ -18,11 +18,8 @@ pub struct FakeHerdr {
     pub list_delay: Arc<Mutex<std::time::Duration>>,
     pub tabs: Arc<Mutex<Vec<Value>>>,
     pub notification_shown: Arc<Mutex<bool>>,
-    /// The error code a `fail_method` request is refused with.
     pub fail_code: Arc<Mutex<String>>,
-    /// What `worktree.list` answers for each workspace; a workspace not here is in no repository.
-    pub repositories: Arc<Mutex<std::collections::BTreeMap<String, Value>>>,
-    /// What `agent.read` finds on any agent's terminal.
+    pub worktree_lists: Arc<Mutex<std::collections::BTreeMap<String, Value>>>,
     pub screen: Arc<Mutex<String>>,
     hooks: Arc<Mutex<Vec<(String, Hook)>>>,
 }
@@ -48,12 +45,12 @@ impl FakeHerdr {
             notification_shown: Arc::new(Mutex::new(true)),
             fail_code: Arc::new(Mutex::new("failed".into())),
             screen: Arc::new(Mutex::new(String::new())),
-            repositories: Arc::default(),
+            worktree_lists: Arc::default(),
             hooks: Arc::new(Mutex::new(Vec::new())),
         };
         let shown = fake.notification_shown.clone();
         let (fail_code, screen) = (fake.fail_code.clone(), fake.screen.clone());
-        let repositories = fake.repositories.clone();
+        let worktree_lists = fake.worktree_lists.clone();
         let (agents, workspaces, tabs, requests, fail, list_delay, hooks) = (
             fake.agents.clone(),
             fake.workspaces.clone(),
@@ -111,7 +108,7 @@ impl FakeHerdr {
                         params,
                         &mut agents.lock().unwrap(),
                         &screen,
-                        &repositories.lock().unwrap(),
+                        &worktree_lists.lock().unwrap(),
                         &mut opened,
                     ),
                 };
@@ -189,20 +186,18 @@ impl FakeHerdr {
     }
 }
 
-/// Tabs and worktrees that are opened, and agents that are started, prompted, read and awaited.
 fn agent_api(
     method: &str,
     params: &Value,
     agents: &mut Vec<Value>,
     screen: &Mutex<String>,
-    repositories: &std::collections::BTreeMap<String, Value>,
+    worktree_lists: &std::collections::BTreeMap<String, Value>,
     opened: &mut i32,
 ) -> Value {
     match method {
-        // Git finds the repository a directory is in, through any of its worktrees.
         "worktree.list" => {
             let found = if let Some(cwd) = params["cwd"].as_str() {
-                repositories.values().find(|listing| {
+                worktree_lists.values().find(|listing| {
                     let source = listing["source"]["repo_root"].as_str().unwrap();
                     let worktrees = listing["worktrees"].as_array().unwrap();
                     std::iter::once(source)
@@ -210,7 +205,7 @@ fn agent_api(
                         .any(|dir| std::path::Path::new(cwd).starts_with(dir))
                 })
             } else {
-                repositories.get(params["workspace_id"].as_str().unwrap_or_default())
+                worktree_lists.get(params["workspace_id"].as_str().unwrap_or_default())
             };
             found.cloned().unwrap_or(json!({"type": "ok"}))
         }
@@ -258,7 +253,6 @@ fn agent_api(
             json!({"type": "agent_info", "agent": found})
         }
         "pane.get" => {
-            // A pane with no agent in it is in the workspace its id names.
             let pane = params["pane_id"].as_str().unwrap();
             let workspace = agents.iter().find(|a| a["pane_id"] == pane).map_or_else(
                 || json!(pane.split(':').next()),

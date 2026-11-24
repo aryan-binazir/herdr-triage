@@ -1,6 +1,3 @@
-//! `herdr-triage mcp`: a Model Context Protocol server on stdin and stdout, so an agent can start
-//! other agents in Herdr, talk to them and triage them. One request is answered at a time.
-
 mod config;
 mod ops;
 
@@ -16,9 +13,9 @@ use crate::session::Session;
 use crate::store;
 use ops::{Call, Failure, LaunchArgs};
 
-/// Newest first: a client that offers none of these is answered with the first.
 /// Revisions without JSON-RPC batches, which this server does not take.
-const PROTOCOLS: [&str; 2] = ["2025-06-18", "2024-11-05"];
+const PROTOCOLS: [&str; 2] = [NEWEST_PROTOCOL, "2024-11-05"];
+const NEWEST_PROTOCOL: &str = "2025-06-18";
 
 const INSTRUCTIONS: &str = "\
 Starts and drives coding agents in the user's Herdr terminal session. Each agent is a thread the \
@@ -28,11 +25,9 @@ threads marked `mine` (the ones you launched) unless the user names another. A t
 is `blocked` is waiting on an approval or a question that is the user's to answer: report it, never \
 answer it. Use herdr_organize's `forget` only when the user asks for it.";
 
-/// Where this server finds Herdr, its settings and its caller.
 pub struct Env {
     pub socket: PathBuf,
     pub config: Option<PathBuf>,
-    /// The Herdr pane the calling agent runs in, when it runs in one.
     pub caller_pane: Option<String>,
     pub session: Box<dyn Fn() -> io::Result<Session>>,
 }
@@ -54,22 +49,15 @@ impl Env {
     }
 }
 
-/// Where MCP clients are told to start the server. Each plugin update puts the binary somewhere
-/// new, so Herdr's hooks keep this link pointing at the one Herdr runs now. Best effort: a client
-/// that finds no link says so when it starts.
-pub fn link_path() -> PathBuf {
-    store::state_root().join("herdr-triage")
-}
-
+/// Each plugin update puts the binary somewhere new.
 pub fn link_for_clients() {
     let Ok(binary) = std::env::current_exe() else {
         return;
     };
-    let link = link_path();
+    let link = store::state_root().join("herdr-triage");
     if fs::read_link(&link).is_ok_and(|target| target == binary) {
         return;
     }
-    // Hooks run at once, so each stages its own link before swapping it into place.
     let staged = link.with_extension(format!("new-{}", std::process::id()));
     let _ = fs::remove_file(&staged);
     let linked = link
@@ -88,10 +76,8 @@ struct Tool {
     description: &'static str,
     properties: Value,
     required: &'static [&'static str],
-    /// Changes nothing in Herdr or triage.
-    reads: bool,
-    /// Can close a pane or drop a thread.
-    destroys: bool,
+    read_only: bool,
+    destructive: bool,
 }
 
 fn thread_id() -> Value {
@@ -112,8 +98,8 @@ fn starting_tools() -> Vec<Tool> {
             description: "The projects open in Herdr: one per repository, with its workspaces and what a launch there starts by default.",
             properties: json!({}),
             required: &[],
-            reads: true,
-            destroys: false,
+            read_only: true,
+            destructive: false,
         },
         Tool {
             name: "herdr_capabilities",
@@ -121,8 +107,8 @@ fn starting_tools() -> Vec<Tool> {
             description: "The harnesses herdr_launch can start (pi, claude, codex), each one's default model and effort, per-project overrides, and the file the user sets them in.",
             properties: json!({}),
             required: &[],
-            reads: true,
-            destroys: false,
+            read_only: true,
+            destructive: false,
         },
         Tool {
             name: "herdr_launch",
@@ -140,8 +126,8 @@ fn starting_tools() -> Vec<Tool> {
                 "request_id": {"type": "string", "description": "Any unique string. Repeat it when retrying a launch whose answer you did not get, so it is not started twice."},
             }),
             required: &["title"],
-            reads: false,
-            destroys: false,
+            read_only: false,
+            destructive: false,
         },
     ]
 }
@@ -155,8 +141,8 @@ fn thread_tools() -> Vec<Tool> {
             description: "Send a message to an open thread's agent, as if typed at its prompt. Any thread can be reached; prefer ones marked `mine`. Refused with `agent_working` mid-turn (herdr_wait first), and with `agent_blocked` while the agent waits on an approval or a question. Next: herdr_wait.",
             properties: json!({"thread": thread, "message": {"type": "string"}}),
             required: &["thread", "message"],
-            reads: false,
-            destroys: false,
+            read_only: false,
+            destructive: false,
         },
         Tool {
             name: "herdr_read",
@@ -168,8 +154,8 @@ fn thread_tools() -> Vec<Tool> {
                 "max_chars": {"type": "integer", "description": "Keep this much of the end. Default 12000, at most 60000."},
             }),
             required: &["thread"],
-            reads: true,
-            destroys: false,
+            read_only: true,
+            destructive: false,
         },
         Tool {
             name: "herdr_wait",
@@ -180,8 +166,8 @@ fn thread_tools() -> Vec<Tool> {
                 "timeout_ms": {"type": "integer", "description": "Default 30000, at most 50000."},
             }),
             required: &["thread"],
-            reads: true,
-            destroys: false,
+            read_only: true,
+            destructive: false,
         },
         Tool {
             name: "herdr_threads",
@@ -194,8 +180,8 @@ fn thread_tools() -> Vec<Tool> {
                 "limit": {"type": "integer", "description": "Default 50."},
             }),
             required: &[],
-            reads: true,
-            destroys: false,
+            read_only: true,
+            destructive: false,
         },
         Tool {
             name: "herdr_organize",
@@ -209,8 +195,8 @@ fn thread_tools() -> Vec<Tool> {
                 "title": {"type": "string", "description": "For rename."},
             }),
             required: &["action"],
-            reads: false,
-            destroys: true,
+            read_only: false,
+            destructive: true,
         },
     ]
 }
@@ -228,8 +214,8 @@ fn listing(tool: &Tool) -> Value {
         },
         "annotations": {
             "title": tool.title,
-            "readOnlyHint": tool.reads,
-            "destructiveHint": tool.destroys,
+            "readOnlyHint": tool.read_only,
+            "destructiveHint": tool.destructive,
             "openWorldHint": false,
         },
     })
@@ -238,11 +224,8 @@ fn listing(tool: &Tool) -> Value {
 struct Server {
     env: Env,
     client: String,
-    /// Tells this client session from another of the same client, which owns other threads.
     instance: String,
-    /// Launches by the caller's `request_id`: the result, or a failure after something was
-    /// opened, so a retry answers with it instead of opening more.
-    launched: BTreeMap<String, Result<Value, Failure>>,
+    launches_by_request_id: BTreeMap<String, Result<Value, Failure>>,
 }
 
 impl Server {
@@ -264,26 +247,24 @@ impl Server {
         if let Some(first) = args
             .request_id
             .as_ref()
-            .and_then(|id| self.launched.get(id))
+            .and_then(|id| self.launches_by_request_id.get(id))
         {
             return first.clone();
         }
         let result = Call::open(&self.env, &who)
             .and_then(|mut call| ops::launch_tool(&mut call, &args, ops::LAUNCH_BUDGET));
-        // A failure naming a branch came once the worktree was asked for.
-        let opened = result
+        let worktree_asked_for = result
             .as_ref()
             .err()
             .is_none_or(|failure| failure.detail.contains_key("branch"));
         if let Some(id) = args.request_id
-            && opened
+            && worktree_asked_for
         {
-            self.launched.insert(id, result.clone());
+            self.launches_by_request_id.insert(id, result.clone());
         }
         result
     }
 
-    /// The reply to one request; `None` for what needs none.
     fn answer(&mut self, request: &Value) -> Option<Value> {
         let invalid = |id: &Value, message: &str| {
             let error = json!({"code": -32600, "message": message});
@@ -295,7 +276,6 @@ impl Server {
         let method = request["method"].as_str();
         let id = match (request.get("id"), method) {
             (Some(id), _) if id.is_string() || id.is_i64() || id.is_u64() => id.clone(),
-            // A notification: nothing to answer.
             (None, Some(_)) if request["jsonrpc"] == "2.0" => return None,
             _ => return invalid(&Value::Null, "a request needs a string or integer `id`"),
         };
@@ -314,7 +294,7 @@ impl Server {
                 let asked = params["protocolVersion"].as_str().unwrap_or_default();
                 let protocol = PROTOCOLS.iter().find(|known| **known == asked);
                 Ok(json!({
-                    "protocolVersion": protocol.unwrap_or(&PROTOCOLS[0]),
+                    "protocolVersion": protocol.unwrap_or(&NEWEST_PROTOCOL),
                     "capabilities": {"tools": {}},
                     "serverInfo": {"name": "herdr-triage", "version": env!("CARGO_PKG_VERSION")},
                     "instructions": INSTRUCTIONS,
@@ -366,7 +346,7 @@ pub fn serve(env: Env, input: impl BufRead, mut output: impl Write) -> io::Resul
         env,
         client: "unknown".into(),
         instance: ops::suffix().map_err(|failure| io::Error::other(failure.message))?,
-        launched: BTreeMap::new(),
+        launches_by_request_id: BTreeMap::new(),
     };
     for line in input.lines() {
         let line = line?;
@@ -402,7 +382,6 @@ mod tests {
 
     const NOW: i64 = 1_800_000_000;
 
-    /// A server on a fake Herdr, called the way a client calls it: one JSON-RPC request at a time.
     struct Rig {
         fake: FakeHerdr,
         server: Server,
@@ -441,7 +420,7 @@ mod tests {
             env,
             client: "test-client".into(),
             instance: "i1".into(),
-            launched: BTreeMap::new(),
+            launches_by_request_id: BTreeMap::new(),
         };
         Rig {
             fake,
@@ -460,27 +439,30 @@ mod tests {
             reply
         }
 
-        /// What the tool answered, and whether it answered with a failure.
-        fn tool(&mut self, name: &str, arguments: Value) -> (Value, bool) {
+        fn tool(&mut self, name: &str, arguments: Value) -> Result<Value, Value> {
             let mut params = json!({"name": name});
             params["arguments"] = arguments;
             let reply = self.request("tools/call", params);
             let result = &reply["result"];
             let content = result["structuredContent"].clone();
             assert_eq!(result["content"][0]["text"], content.to_string());
-            (content, result["isError"] == true)
+            if result["isError"] == true {
+                Err(content)
+            } else {
+                Ok(content)
+            }
         }
 
         fn ok(&mut self, name: &str, arguments: Value) -> Value {
-            let (content, failed) = self.tool(name, arguments);
-            assert!(!failed, "{content}");
-            content
+            self.tool(name, arguments)
+                .unwrap_or_else(|content| panic!("{content}"))
         }
 
         fn failure(&mut self, name: &str, arguments: Value) -> Value {
-            let (content, failed) = self.tool(name, arguments);
-            assert!(failed, "{content}");
-            content["error"].clone()
+            match self.tool(name, arguments) {
+                Ok(content) => panic!("{content}"),
+                Err(content) => content["error"].clone(),
+            }
         }
 
         fn refuse(&self, method: &str, code: &str) {
@@ -492,7 +474,6 @@ mod tests {
             fs::write(self.server.env.config.as_ref().unwrap(), yaml).unwrap();
         }
 
-        /// What `herdr_launch` asked Herdr for, its branch's random suffix cut off.
         fn worktrees(&self) -> Vec<Value> {
             let mut asked = self.fake.take("worktree.create");
             for worktree in &mut asked {
@@ -883,7 +864,6 @@ mod tests {
     #[test]
     fn a_caller_inside_herdr_launches_in_its_own_project_by_default() {
         let mut rig = rig(vec![resumable("w3:p1", "working", 2)], Some("w3:p1"));
-        // The fake's agents all say they are in w1.
         rig.fake.agents.lock().unwrap()[0]["workspace_id"] = json!("w3");
         rig.ok("herdr_launch", json!({"title": "Here"}));
         assert_eq!(rig.worktrees()[0]["workspace_id"], "w3");
@@ -996,8 +976,8 @@ mod tests {
     #[test]
     fn a_turn_that_starts_after_the_snapshot_still_stops_a_message() {
         let mut rig = rig(vec![resumable("w1:p1", "idle", 3)], None);
-        // Herdr's sidebar view is set at the end of each sync: the agent starts a turn right then.
-        rig.fake.on("agent.view.set", |agents| {
+        let end_of_sync = "agent.view.set";
+        rig.fake.on(end_of_sync, |agents| {
             agents[0]["agent_status"] = json!("working");
         });
         let error = rig.failure("herdr_send", json!({"thread": "w1:p1", "message": "hi"}));
@@ -1269,7 +1249,7 @@ mod tests {
             ],
         });
         rig.fake
-            .repositories
+            .worktree_lists
             .lock()
             .unwrap()
             .insert("w1".into(), listing);

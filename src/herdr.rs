@@ -86,7 +86,6 @@ pub struct Workspace {
     pub worktree: Option<Checkout>,
 }
 
-/// The Git checkout Herdr found a workspace in.
 #[derive(Debug, Clone, Deserialize)]
 pub struct Checkout {
     pub repo_key: String,
@@ -97,7 +96,6 @@ pub struct Checkout {
     pub is_linked_worktree: bool,
 }
 
-/// Herdr refused a request: `code` is its machine-readable reason.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Refused {
     pub code: String,
@@ -115,7 +113,6 @@ pub struct Tab {
 pub struct Herdr {
     path: PathBuf,
     next_id: u64,
-    /// No request waits past this; one asked for after it fails with `TimedOut`.
     pub deadline: Option<Instant>,
 }
 
@@ -148,7 +145,6 @@ impl Herdr {
             .map_err(|refused| io::Error::other(format!("{method}: {}", refused.message)))
     }
 
-    /// One request, allowed `timeout` to answer: Herdr holds waits and agent starts open that long.
     pub fn request(
         &mut self,
         method: &str,
@@ -258,7 +254,6 @@ impl Herdr {
             .map(drop)
     }
 
-    /// Whether Herdr has the pane; an unanswered request is an error, not an absence.
     pub fn has_pane(&mut self, pane_id: &str) -> io::Result<bool> {
         let found = self.request("pane.get", &json!({"pane_id": pane_id}), TIMEOUT)?;
         Ok(found.is_ok())
