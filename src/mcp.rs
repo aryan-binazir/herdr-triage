@@ -238,6 +238,8 @@ fn listing(tool: &Tool) -> Value {
 struct Server {
     env: Env,
     client: String,
+    /// Tells this client session from another of the same client, which owns other threads.
+    instance: String,
     /// Launches by the caller's `request_id`: the result, or a failure after something was
     /// opened, so a retry answers with it instead of opening more.
     launched: BTreeMap<String, Result<Value, Failure>>,
@@ -245,8 +247,9 @@ struct Server {
 
 impl Server {
     fn call(&mut self, name: &str, arguments: Value) -> Result<Value, Failure> {
+        let who = format!("{}:{}", self.client, self.instance);
         if name != "herdr_launch" {
-            let mut call = Call::open(&self.env, &self.client)?;
+            let mut call = Call::open(&self.env, &who)?;
             return match name {
                 "herdr_projects" => ops::projects_tool(&mut call, arguments),
                 "herdr_capabilities" => ops::capabilities_tool(&mut call, arguments),
@@ -265,12 +268,13 @@ impl Server {
         {
             return first.clone();
         }
-        let result = Call::open(&self.env, &self.client)
-            .and_then(|mut call| ops::launch_tool(&mut call, &args));
+        let result =
+            Call::open(&self.env, &who).and_then(|mut call| ops::launch_tool(&mut call, &args));
+        // A failure naming a branch came once the worktree was asked for.
         let opened = result
             .as_ref()
             .err()
-            .is_none_or(|failure| failure.detail.contains_key("pane_id"));
+            .is_none_or(|failure| failure.detail.contains_key("branch"));
         if let Some(id) = args.request_id
             && opened
         {
@@ -288,9 +292,16 @@ impl Server {
         if request.is_array() {
             return invalid(&Value::Null, "batches are not supported");
         }
-        let id = request.get("id").filter(|id| !id.is_null())?.clone();
-        let Some(method) = request["method"].as_str() else {
-            return invalid(&id, "a request needs a `method`");
+        let method = request["method"].as_str();
+        let id = request.get("id").filter(|id| !id.is_null());
+        let id = match (id, method) {
+            (Some(id), _) if id.is_string() || id.is_number() => id.clone(),
+            // A notification: nothing to answer.
+            (None, Some(_)) if request["jsonrpc"] == "2.0" => return None,
+            _ => return invalid(&Value::Null, "a request needs a string or number `id`"),
+        };
+        let Some(method) = method.filter(|_| request["jsonrpc"] == "2.0") else {
+            return invalid(&id, "a request needs `jsonrpc: \"2.0\"` and a `method`");
         };
         let params = &request["params"];
         let result = match method {
@@ -352,6 +363,7 @@ pub fn serve(env: Env, input: impl BufRead, mut output: impl Write) -> io::Resul
     let mut server = Server {
         env,
         client: "unknown".into(),
+        instance: ops::suffix().map_err(|failure| io::Error::other(failure.message))?,
         launched: BTreeMap::new(),
     };
     for line in input.lines() {
@@ -426,6 +438,7 @@ mod tests {
         let server = Server {
             env,
             client: "test-client".into(),
+            instance: "i1".into(),
             launched: BTreeMap::new(),
         };
         Rig {
@@ -589,6 +602,14 @@ mod tests {
             .server
             .answer(&json!([{"jsonrpc": "2.0", "id": 1, "method": "ping"}]));
         assert_eq!(batch.unwrap()["error"]["code"], -32600);
+        for malformed in [
+            json!({}),
+            json!({"jsonrpc": "1.0", "id": 1, "method": "ping"}),
+            json!({"jsonrpc": "2.0", "id": true, "method": "ping"}),
+        ] {
+            let reply = rig.server.answer(&malformed);
+            assert_eq!(reply.unwrap()["error"]["code"], -32600, "{malformed}");
+        }
         let unknown = rig.request("tools/call", json!({"name": "herdr_nope", "arguments": {}}));
         assert_eq!(unknown["error"]["code"], -32602);
         let positional = rig.request(
@@ -923,6 +944,29 @@ mod tests {
             rig.fake.take("agent.prompt").last().unwrap()["target"],
             "w1:p1"
         );
+    }
+
+    #[test]
+    fn a_launch_whose_worktree_request_went_unanswered_is_not_retried_into_a_second() {
+        let mut rig = rig(vec![], None);
+        rig.refuse("worktree.create", "worktree_open_failed");
+        let arguments = json!({"project": "acme-api", "title": "Big repo", "request_id": "r1"});
+        let error = rig.failure("herdr_launch", arguments.clone());
+        assert!(error["branch"].as_str().unwrap().starts_with("big-repo-"));
+        assert_eq!(rig.failure("herdr_launch", arguments), error);
+        assert_eq!(rig.fake.take("worktree.create").len(), 1);
+    }
+
+    #[test]
+    fn a_turn_that_starts_after_the_snapshot_still_stops_a_message() {
+        let mut rig = rig(vec![resumable("w1:p1", "idle", 3)], None);
+        // Herdr's sidebar view is set at the end of each sync: the agent starts a turn right then.
+        rig.fake.on("agent.view.set", |agents| {
+            agents[0]["agent_status"] = json!("working");
+        });
+        let error = rig.failure("herdr_send", json!({"thread": "w1:p1", "message": "hi"}));
+        assert_eq!(error["code"], "agent_working");
+        assert!(rig.fake.take("agent.prompt").is_empty());
     }
 
     #[test]

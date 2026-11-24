@@ -360,18 +360,15 @@ impl Session {
             .collect();
         let launch = plan.launch(&self.herdr.server_generation(), &workspaces);
         // A reopen moments ago already started it, if that tab is still there.
-        let focus_reopened = self.focus_reopened;
-        let started = |herdr: &mut Herdr, pane| {
-            if focus_reopened {
-                herdr.focus_pane(pane).is_ok()
+        if let Some(pane) = launch.focus {
+            let started = if self.focus_reopened {
+                self.herdr.focus_pane(pane).is_ok()
             } else {
-                herdr.has_pane(pane)
+                self.herdr.has_pane(pane)?
+            };
+            if started {
+                return Ok(());
             }
-        };
-        if let Some(pane) = launch.focus
-            && started(&mut self.herdr, pane)
-        {
-            return Ok(());
         }
         let cwd = launch.cwd.filter(|dir| Path::new(dir).is_dir());
         let focus = self.focus_reopened;

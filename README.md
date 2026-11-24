@@ -197,11 +197,12 @@ Codex hides your environment from MCP servers, so also add these lines to the
 `[mcp_servers.herdr]` table that `codex mcp add` wrote in `~/.codex/config.toml`. Without
 `env_vars` the server cannot tell which pane is calling, and with `XDG_*` set it would read other
 settings and another triage database than the plugin's. The timeout leaves room for a large
-repository's worktree checkout (Codex allows 60 seconds otherwise):
+repository's worktree checkout (Codex allows 60 seconds otherwise; a launch takes at most four
+minutes):
 
 ```toml
 env_vars = ["HERDR_PANE_ID", "HERDR_SOCKET_PATH", "XDG_CONFIG_HOME", "XDG_STATE_HOME"]
-tool_timeout_sec = 120
+tool_timeout_sec = 300
 ```
 
 Any client that starts a stdio MCP server works the same way. Two environment variables matter:
@@ -263,7 +264,8 @@ stops launches with the parse error, rather than launching something you did not
 ### What to expect
 
 - **Launching** asks Herdr for a worktree off the project's own checkout (or its repository root,
-  when only linked worktrees are open), on a new branch named after the title with a short random
+  when only linked worktrees are open, which makes Herdr open a workspace for that checkout too),
+  on a new branch named after the title with a short random
   suffix (or on `branch`), starts the agent in the new workspace and types the message. Nothing
   takes your focus. Herdr decides where worktrees go (`~/.herdr/worktrees/<repository>/<branch>`
   unless you configured it otherwise), and the new workspace is named after the repository, so the
@@ -281,12 +283,14 @@ stops launches with the parse error, rather than launching something you did not
   answers an agent that is blocked on an approval or a question, and tells the calling agent to
   ask you.
 - **A launch that fails partway** leaves what it opened (the worktree, the workspace) in place and
-  names it in the error, pane included; nothing is deleted for you. Retried with the same
-  `request_id`, it answers with that error again instead of opening more.
+  names it in the error, branch and pane included; nothing is deleted for you. Retried with the
+  same `request_id`, it answers with that error again instead of opening more, even when Herdr's
+  answer to the worktree request never came.
 - **Any thread can be messaged or triaged**, not only the caller's own, so one agent can pick up
   another's work when you ask. Threads the caller launched are marked `mine` and listed first, and
   the tools tell agents to prefer them. A message to an agent mid-turn is refused rather than
-  queued behind the turn, and a message holding control characters (other than line breaks and
+  queued behind the turn (Herdr cannot tell a turn the message started from one that began in the
+  instant before it, so a wait could otherwise report the wrong turn), and a message holding control characters (other than line breaks and
   tabs) is refused, since the terminal would act on them as keys.
 - **Triage follows the rules above**, with one difference: the caller names the state it wants, so
   settling a settled thread changes nothing where the picker's key would unsettle it. Settling or

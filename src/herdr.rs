@@ -245,11 +245,10 @@ impl Herdr {
             .map(drop)
     }
 
-    pub fn has_pane(&mut self, pane_id: &str) -> bool {
-        matches!(
-            self.request("pane.get", &json!({"pane_id": pane_id}), TIMEOUT),
-            Ok(Ok(_))
-        )
+    /// Whether Herdr has the pane; an unanswered request is an error, not an absence.
+    pub fn has_pane(&mut self, pane_id: &str) -> io::Result<bool> {
+        let found = self.request("pane.get", &json!({"pane_id": pane_id}), TIMEOUT)?;
+        Ok(found.is_ok())
     }
 
     pub fn close_pane(&mut self, pane_id: &str) -> io::Result<()> {

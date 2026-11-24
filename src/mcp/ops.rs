@@ -17,7 +17,11 @@ use crate::picker::{Item, Target};
 use crate::session::{Outcome, Session};
 use crate::triage::{Action, Display, Park, Want};
 
-/// Codex gives a tool call 60 seconds unless told otherwise, so a launch stays well inside that.
+/// A whole launch, inside the five minutes the README tells Codex to allow (it allows 60 by
+/// default); most of it is for checking out a large repository's worktree.
+const LAUNCH_BUDGET: Duration = Duration::from_secs(240);
+/// What a launch keeps back after its worktree to start the agent and give it its message.
+const AFTER_CHECKOUT: Duration = Duration::from_secs(60);
 const START_TIMEOUT: Duration = Duration::from_secs(40);
 const POLL: Duration = Duration::from_millis(200);
 /// How long a submitted prompt has to start a turn before the caller is told it may not have.
@@ -136,7 +140,7 @@ impl<'a> Call<'a> {
                 workspace: pane["workspace_id"].as_str().map(str::to_owned),
             },
             None => Caller {
-                key: format!("client:{}:{}", self.client, std::process::id()),
+                key: format!("client:{}", self.client),
                 workspace: None,
             },
         };
@@ -150,16 +154,23 @@ impl<'a> Call<'a> {
         Ok(Threads { items, caller })
     }
 
-    /// A launch can hand out a thread's id before its agent reports its session, which renames
-    /// the thread; the old id still finds it while its agent runs.
-    fn current_id(&mut self, id: &str) -> String {
-        if id.starts_with("terminal:")
-            && let Ok(agents) = self.herdr.agents()
-            && let Some(agent) = agents.iter().find(|agent| agent.terminal_key() == id)
-        {
-            return agent.key();
+    /// The threads, and the id `id` goes by in them. A launch can hand out a thread's id before
+    /// its agent reports its session, which renames the thread; the old id still finds it while
+    /// its agent runs, whenever the renaming lands.
+    fn lookup(&mut self, id: &str) -> Result<(Threads, String), Failure> {
+        let threads = self.threads()?;
+        if threads.find(id).is_ok() || !id.starts_with("terminal:") {
+            return Ok((threads, id.to_owned()));
         }
-        id.to_owned()
+        let renamed = self
+            .herdr
+            .agents()?
+            .into_iter()
+            .find(|agent| agent.terminal_key() == id);
+        Ok((
+            threads,
+            renamed.map_or_else(|| id.to_owned(), |agent| agent.key()),
+        ))
     }
 
     /// Herdr's workspaces, each with the checkout it is in. `workspace.list` names the checkout
@@ -519,6 +530,7 @@ struct Opened {
 }
 
 pub fn launch_tool(call: &mut Call, args: &LaunchArgs) -> Done {
+    let deadline = Instant::now() + LAUNCH_BUDGET;
     let config = call.config()?;
     let caller = call.caller();
     let workspaces = call.workspaces()?;
@@ -547,7 +559,16 @@ pub fn launch_tool(call: &mut Call, args: &LaunchArgs) -> Done {
         let slug = slug(&args.title, 40);
         format!("{}{slug}-{suffix}", config.worktree.branch_prefix)
     });
-    let opened = open_worktree(call, &config, &project, &branch, args.base.as_deref())?;
+    let opened = open_worktree(
+        call,
+        &config,
+        &project,
+        &branch,
+        args.base.as_deref(),
+        deadline,
+    )
+    // Herdr may have made the worktree even when no answer came: a retry must not make another.
+    .map_err(|failure| failure.with("branch", branch.as_str()))?;
     let with_place = |mut failure: Failure| {
         failure.detail.extend(opened.detail.clone());
         failure
@@ -562,7 +583,7 @@ pub fn launch_tool(call: &mut Call, args: &LaunchArgs) -> Done {
         "args": command,
         "timeout_ms": START_TIMEOUT.as_millis(),
     });
-    let ready = match start_agent(call, &start) {
+    let ready = match start_agent(call, &start, deadline) {
         Ok(ready) => ready,
         // No agent means no thread to read, so the pane's last words go with the refusal.
         Err(failure) => {
@@ -579,7 +600,9 @@ pub fn launch_tool(call: &mut Call, args: &LaunchArgs) -> Done {
         .as_deref()
         .filter(|text| !text.trim().is_empty());
     let sent = match message {
-        Some(text) if ready => Some(prompt(call, &opened.pane, text).map_err(with_place)?),
+        Some(text) if ready => {
+            Some(prompt(call, &opened.pane, text, deadline).map_err(with_place)?)
+        }
         _ => None,
     };
     let next = match (ready, sent) {
@@ -605,9 +628,9 @@ pub fn launch_tool(call: &mut Call, args: &LaunchArgs) -> Done {
 /// Starts the agent and stays until it takes input. `false` when it stopped first at a dialog of
 /// its own, such as trusting the directory. Herdr's `agent.start` answers before the agent is up,
 /// and refuses a pane whose shell has not reached its first prompt yet.
-fn start_agent(call: &mut Call, start: &Value) -> Result<bool, Failure> {
+fn start_agent(call: &mut Call, start: &Value, deadline: Instant) -> Result<bool, Failure> {
     let pane = json!({"target": start["pane_id"]});
-    let by = Instant::now() + START_TIMEOUT;
+    let by = (Instant::now() + START_TIMEOUT).min(deadline);
     loop {
         match call.herdr.request("agent.start", start, QUICK)? {
             Ok(_) => break,
@@ -652,6 +675,7 @@ fn open_worktree(
     project: &Project,
     branch: &str,
     base: Option<&str>,
+    deadline: Instant,
 ) -> Result<Opened, Failure> {
     // The workspace is named for its project, so the thread's row says where it is; the title
     // is on the thread itself.
@@ -666,7 +690,8 @@ fn open_worktree(
         None => worktree["cwd"] = json!(project.root),
     }
     // Herdr runs `git worktree add`, which checks out the whole tree.
-    let made = call.ask("worktree.create", &worktree, Duration::from_secs(120))?;
+    let checkout = deadline.saturating_duration_since(Instant::now() + AFTER_CHECKOUT);
+    let made = call.ask("worktree.create", &worktree, checkout)?;
     let pane = pane_of(&made)?;
     Ok(Opened {
         detail: detail(&[
@@ -705,14 +730,23 @@ fn pane_of(made: &Value) -> Result<String, Failure> {
 }
 
 /// Submits `text` and stays until the turn is seen to start, so a wait that follows cannot
-/// mistake the idle moment before it for the turn's end.
-fn prompt(call: &mut Call, pane: &str, text: &str) -> Result<(), Failure> {
+/// mistake the idle moment before it for the turn's end. Herdr counts a turn already running as
+/// that start, so a message to an agent mid-turn is refused just before it would go.
+fn prompt(call: &mut Call, pane: &str, text: &str, deadline: Instant) -> Result<(), Failure> {
+    let status = call.ask("agent.get", &json!({"target": pane}), QUICK)?;
+    if status["agent"]["agent_status"] == "working" {
+        return Err(Failure::new(
+            "agent_working",
+            "it is in the middle of a turn: herdr_wait for it to end, then send.",
+        ));
+    }
     let params = json!({
         "target": pane,
         "text": text,
         "wait": {"until": ["working", "blocked", "done"], "timeout_ms": TURN_START_MS},
     });
-    let within = Duration::from_millis(TURN_START_MS) + MARGIN;
+    let within = (Duration::from_millis(TURN_START_MS) + MARGIN)
+        .min(deadline.saturating_duration_since(Instant::now()));
     call.ask("agent.prompt", &params, within).map(drop)
 }
 
@@ -739,7 +773,7 @@ fn slug(text: &str, max: usize) -> String {
 /// Herdr's agent names start with a lowercase letter, hold at most 32 of `a-z 0-9 - _`, and are
 /// unique; two threads may share a title.
 fn agent_name(title: &str, suffix: &str) -> String {
-    let slug = slug(title, 24);
+    let slug = slug(title, 21);
     let lead = if slug.starts_with(|c: char| c.is_ascii_lowercase()) {
         ""
     } else {
@@ -771,11 +805,11 @@ fn typeable(text: &str) -> Result<(), Failure> {
     Ok(())
 }
 
-fn suffix() -> Result<String, Failure> {
-    let mut bytes = [0u8; 2];
+pub fn suffix() -> Result<String, Failure> {
+    let mut bytes = [0u8; 4];
     getrandom::fill(&mut bytes)
         .map_err(|error| Failure::new("herdr_unavailable", error.to_string()))?;
-    Ok(format!("{:02x}{:02x}", bytes[0], bytes[1]))
+    Ok(format!("{:08x}", u32::from_be_bytes(bytes)))
 }
 
 pub fn send_tool(call: &mut Call, arguments: Value) -> Done {
@@ -790,18 +824,11 @@ pub fn send_tool(call: &mut Call, arguments: Value) -> Done {
         return Err(Failure::new("invalid_arguments", "message is empty"));
     }
     typeable(&args.message)?;
-    let id = call.current_id(&args.thread);
-    let threads = call.threads()?;
+    let (threads, id) = call.lookup(&args.thread)?;
     let (item, pane) = threads.pane(&id)?;
-    // The agent would queue it behind its turn, and a wait then would see that turn end instead.
-    if item.row.display == Display::Working {
-        return Err(Failure::new(
-            "agent_working",
-            "it is in the middle of a turn: herdr_wait for it to end, then send.",
-        ));
-    }
     let mine = threads.mine(item);
-    prompt(call, &pane, &args.message)?;
+    let deadline = Instant::now() + Duration::from_millis(TURN_START_MS) + MARGIN;
+    prompt(call, &pane, &args.message, deadline)?;
     Ok(json!({
         "thread": item.row.key,
         "sent": true,
@@ -819,8 +846,7 @@ pub fn read_tool(call: &mut Call, arguments: Value) -> Done {
         max_chars: Option<usize>,
     }
     let args: Args = decode(arguments)?;
-    let id = call.current_id(&args.thread);
-    let threads = call.threads()?;
+    let (threads, id) = call.lookup(&args.thread)?;
     let (item, pane) = threads.pane(&id)?;
     let mut params = json!({
         "target": pane,
@@ -880,8 +906,8 @@ pub fn wait_tool(call: &mut Call, arguments: Value) -> Done {
         timeout_ms: Option<u64>,
     }
     let args: Args = decode(arguments)?;
-    let id = call.current_id(&args.thread);
-    let (_, pane) = call.threads()?.pane(&id)?;
+    let (threads, id) = call.lookup(&args.thread)?;
+    let (_, pane) = threads.pane(&id)?;
     let timeout = args
         .timeout_ms
         .unwrap_or(WAIT_DEFAULT_MS)
@@ -1007,8 +1033,8 @@ pub fn organize_tool(call: &mut Call, arguments: Value) -> Done {
                 "`thread` is required for every action but undo",
             )
         })?;
-        let id = call.current_id(id);
-        let key = call.threads()?.find(&id)?.row.key.clone();
+        let (threads, id) = call.lookup(id)?;
+        let key = threads.find(&id)?.row.key.clone();
         let action = match args.action {
             Verb::Rename => None,
             Verb::Settle => Some(Action::Ensure(Want::Settled)),
