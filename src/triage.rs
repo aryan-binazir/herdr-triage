@@ -147,6 +147,9 @@ pub struct Record {
     pub restored_at: Option<i64>,
     #[serde(default)]
     pub title: Option<String>,
+    /// Who started this thread through the MCP server; unset for threads a person started.
+    #[serde(default)]
+    pub launched_by: Option<String>,
 }
 
 fn live_by_default() -> bool {
@@ -401,6 +404,7 @@ pub struct Row {
     pub changed_at: Option<i64>,
     pub thread: Thread,
     pub title: Option<String>,
+    pub launched_by: Option<String>,
 }
 
 impl Row {
@@ -1045,6 +1049,7 @@ impl State {
                 changed_at: record.and_then(|r| r.changed_at),
                 thread: agent.thread.clone(),
                 title: record.and_then(|r| r.title.clone()),
+                launched_by: record.and_then(|r| r.launched_by.clone()),
             }
         });
         let closed = self
@@ -1061,6 +1066,7 @@ impl State {
                 changed_at: record.changed_at,
                 thread: record.thread.clone(),
                 title: record.title.clone(),
+                launched_by: record.launched_by.clone(),
             });
         let mut rows: Vec<Row> = live.chain(closed).collect();
         rows.sort_by_key(|row| {

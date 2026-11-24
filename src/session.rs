@@ -27,6 +27,8 @@ pub struct Session {
     store: Store,
     clock: Box<Clock>,
     waker: Box<dyn FnMut(i64) -> io::Result<()>>,
+    /// A person asking wants the reopened thread in front; an agent asking must not move them.
+    focus_reopened: bool,
 }
 
 pub struct View {
@@ -73,7 +75,7 @@ impl Session {
         ))
     }
 
-    fn new(
+    pub(crate) fn new(
         herdr: Herdr,
         store: Store,
         clock: impl Fn() -> i64 + 'static,
@@ -84,7 +86,40 @@ impl Session {
             store,
             clock: Box::new(clock),
             waker: Box::new(waker),
+            focus_reopened: true,
         }
+    }
+
+    /// Reopens threads in the background, leaving the person's focus where it is.
+    pub fn in_background(mut self) -> Self {
+        self.focus_reopened = false;
+        self
+    }
+
+    pub fn now(&self) -> i64 {
+        (self.clock)()
+    }
+
+    /// Records that the agent in `pane` was launched by `by`, under `title`. `None` when Herdr
+    /// does not list an agent there.
+    pub fn stamp_launch(
+        &mut self,
+        pane: &str,
+        by: &str,
+        title: &str,
+    ) -> io::Result<Option<String>> {
+        let (_, key) = self.sync_and_serve(false, |state, observed, _| {
+            let key = observed
+                .iter()
+                .find(|agent| agent.pane_id == pane)?
+                .key
+                .clone();
+            let record = state.records.get_mut(&key)?;
+            record.launched_by = Some(by.to_owned());
+            record.title = Some(title.trim().to_owned()).filter(|title| !title.is_empty());
+            Some(key)
+        })?;
+        Ok(key)
     }
 
     /// Herdr runs at most 32 plugin commands at once and rejects the rest, so a hook that finds a
@@ -325,14 +360,15 @@ impl Session {
             .collect();
         let launch = plan.launch(&self.herdr.server_generation(), &workspaces);
         if let Some(pane) = launch.focus
-            && self.herdr.focus_pane(pane).is_ok()
+            && (!self.focus_reopened || self.herdr.focus_pane(pane).is_ok())
         {
             return Ok(());
         }
         let cwd = launch.cwd.filter(|dir| Path::new(dir).is_dir());
+        let focus = self.focus_reopened;
         self.locked(|held, state| {
             let herdr = &mut *held.herdr;
-            let pane = herdr.create_tab(launch.workspace, cwd)?;
+            let pane = herdr.create_tab(launch.workspace, cwd, focus)?;
             let launched = match launch.session_to_report {
                 Some((agent, session)) => herdr.report_session(&pane, agent, session),
                 None => Ok(()),
@@ -1438,6 +1474,7 @@ mod tests {
             pinned: false,
             changed_at: None,
             title: None,
+            launched_by: None,
             thread: Thread::default(),
         };
         assert_eq!(view_label(&[row(None)]), "triage");

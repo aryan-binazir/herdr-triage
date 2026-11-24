@@ -161,6 +161,142 @@ points at it, and `enter` (or its digit) opens it in the T3 desktop app through 
   picker shows no T3 rows (or keeps the last ones it read) and T3 changes fail with a message;
   Herdr's rows are unaffected.
 
+## MCP server
+
+`herdr-triage mcp` is a [Model Context Protocol](https://modelcontextprotocol.io) server, so an
+agent can start other agents in Herdr, message them, read them and triage them. Every agent it
+starts is an ordinary thread: you see it in the picker and sidebar and can take it over at any
+time. It speaks MCP over stdin and stdout; there is no daemon, port or login. Inspired by
+[T3 Code](https://github.com/pingdotgg/t3code)'s MCP server.
+
+| Tool | What it does |
+| --- | --- |
+| `herdr_projects` | The projects open in Herdr, one per repository, with their workspaces and what a launch there starts |
+| `herdr_capabilities` | The agents it can launch and the models and efforts they default to |
+| `herdr_launch` | Start an agent in a project, in a new Git worktree (its own workspace) or, with `checkout: existing`, a new tab in the project's checkout; optionally with its first message |
+| `herdr_send` | Message an open thread's agent |
+| `herdr_read` | The recent text on a thread's terminal |
+| `herdr_wait` | Wait until a thread's agent stops working |
+| `herdr_threads` | Threads with their triage state, the caller's own first |
+| `herdr_organize` | Everything the picker does to a thread: settle, unsettle, snooze, wake, reopen, pin, unpin, mark read or unread, rename, undo, forget |
+
+### Connect a client
+
+The binary lives in Herdr's copy of the plugin, whose directory name changes between installs, so
+have the client look it up each time it starts the server (needs `jq`):
+
+```sh
+herdr_triage_mcp='exec "$(herdr plugin list --plugin ar.triage --json | jq -r ".result.plugins[0].plugin_root")/target/release/herdr-triage" mcp'
+
+# Claude Code
+claude mcp add --scope user herdr -- sh -c "$herdr_triage_mcp"
+```
+
+Codex, in `~/.codex/config.toml`:
+
+```toml
+[mcp_servers.herdr]
+command = "sh"
+args = ["-c", 'exec "$(herdr plugin list --plugin ar.triage --json | jq -r ".result.plugins[0].plugin_root")/target/release/herdr-triage" mcp']
+env_vars = ["HERDR_PANE_ID", "HERDR_SOCKET_PATH"]
+```
+
+Any client that starts a stdio MCP server works the same way. Two environment variables matter,
+and Codex only passes them on when told to, as above:
+
+- `HERDR_PANE_ID`, which Herdr sets in every pane, tells the server which agent is calling. That
+  agent's launches are then its own (`mine`), and a launch with no `project` goes to the project
+  it runs in. A client outside Herdr is known by its client name instead and has to name a project.
+- `HERDR_SOCKET_PATH` picks the Herdr session to drive when you run more than the default one.
+
+### What it launches
+
+`~/.config/herdr-triage/mcp.yaml` (under `$XDG_CONFIG_HOME` if set, on Linux and macOS alike). The
+server writes this file with its defaults the first time it runs and reads it on every launch:
+
+```yaml
+# The agent to launch: pi, claude or codex.
+default_harness: pi
+
+# Per agent: its model and effort, and any extra command-line arguments.
+# Leave `model` or `effort` out to use the agent's own default.
+harnesses:
+  pi:
+    model: claude-opus-5-5      # any pattern `pi --model` accepts
+    effort: medium              # off, minimal, low, medium, high, xhigh, max
+    args: []
+  claude:
+    # model: opus
+    # effort: medium            # low, medium, high, xhigh, max
+    args: []
+  codex:
+    # model: gpt-5.2-codex
+    # effort: medium            # minimal, low, medium, high, xhigh
+    # Codex only has a session Herdr can reopen when it runs with --no-daemon. Add it here
+    # unless your `codex` command already passes it: Codex refuses the flag twice.
+    args: []
+
+# Per project (the repository's name, or the workspace's label): override any of the above.
+projects: {}
+#  acme-api:
+#    harness: codex
+#    model: gpt-5.2-codex
+#    effort: high
+
+worktree:
+  # The ref new worktrees start from. Left out, Herdr picks.
+  # base: origin/main
+  # Prepended to the branch name made from the thread's title, e.g. `agent/`.
+  branch_prefix: ""
+
+limits:
+  # Launches are refused while this many launched threads are open and not settled or snoozed.
+  max_open: 8
+```
+
+The caller can name a `harness`, `model` or `effort` for one launch; otherwise the project's
+settings apply, then the harness's. They become `pi --model M --thinking E`,
+`claude --model M --effort E` or `codex --model M --config model_reasoning_effort=E`, followed by
+`args`. Put flags you always want there, such as a permission mode. A file that does not parse
+stops launches with the parse error, rather than launching something you did not ask for.
+
+### What to expect
+
+- **Launching** asks Herdr for a worktree off the project's own checkout, on a branch named after
+  the title (or `branch`), starts the agent in the new workspace and types the message. Nothing
+  takes your focus. Herdr decides where worktrees go (`~/.herdr/worktrees/<repository>/<branch>`
+  unless you configured it otherwise), and the new workspace is named after the repository, so the
+  picker shows the thread's title beside its project. The project can be a repository's name from
+  `herdr_projects`, a workspace id or label, or a path inside a repository, open in Herdr or not.
+- **A launch waits for the agent to come up**, usually a few seconds and at most a minute. If its
+  command exits instead, for example on a flag it does not know, the error carries what the pane
+  printed.
+- **A repository Herdr has not been told to trust** is not launched into: Herdr's refusal is passed
+  on, and the server never grants that trust for you.
+- **An agent that stops at a dialog of its own** before taking input, such as trusting a new
+  directory, is reported as launched but not ready, and the message is not sent. The server never
+  answers an agent that is blocked on an approval or a question, and tells the calling agent to
+  ask you.
+- **A launch that fails partway** leaves what it opened (the worktree, the workspace) in place and
+  names it in the error; nothing is deleted for you.
+- **Any thread can be messaged or triaged**, not only the caller's own, so one agent can pick up
+  another's work when you ask. Threads the caller launched are marked `mine` and listed first, and
+  the tools tell agents to prefer them.
+- **Triage follows the rules above.** Settling or snoozing can close an agent's pane; a working or
+  blocked agent is refused, so an agent cannot close the pane it is running in. Reopening starts a
+  tab in the background. `undo` takes back the last change whoever made it, yours included.
+- **A thread launched into a worktree stays open when settled**, because its pane is the only one
+  in its workspace. It leaves the list and frees its place under `max_open`; closing the workspace
+  and removing the worktree are yours to do.
+- **Reading** returns the terminal's recent rows, not a transcript.
+- **Waiting** holds for 30 seconds by default (5 minutes at most) and then says the agent is still
+  working. An agent stopped at a prompt Herdr does not recognize as one also reads as working, so
+  the answer tells the caller to read the thread. The server answers one request at a time, so a
+  wait delays a call made alongside it.
+- **Only Herdr's own agents** are listed or changed here, not the other threads the picker shows.
+- A retried launch with the same `request_id` returns the first launch instead of starting a
+  second, for as long as the server process lives.
+
 ## Sidebar
 
 The plugin owns Herdr's Agents view while it is enabled. It hides snoozed and settled agents and
@@ -193,6 +329,10 @@ a server restart. Each snooze starts a detached sleeper that syncs once its wake
 
 Threads live in a SQLite database in Herdr's plugin state directory, one per Herdr server. Triage saved
 by earlier versions (`state.json`) is imported once.
+
+The MCP server is started by its client, not by Herdr, and finds the same database at
+`$XDG_STATE_HOME/herdr/plugins/ar.triage` (else `~/.local/state/herdr/plugins/ar.triage`); set
+`HERDR_PLUGIN_STATE_DIR` for it if your Herdr keeps plugin state elsewhere.
 
 Herdr doesn't run startup hooks on install or enable, so the sidebar adopts the triage order at the
 first agent event or the first time you open the picker.

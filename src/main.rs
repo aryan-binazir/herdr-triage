@@ -1,4 +1,5 @@
 mod herdr;
+mod mcp;
 mod picker;
 mod session;
 mod store;
@@ -37,12 +38,17 @@ fn main() -> ExitCode {
         Some("open") => Herdr::connect()
             .and_then(|mut herdr| herdr.open_picker(invoked_from(&invocation_context()))),
         Some("picker") => run_picker(),
+        Some("mcp") => mcp::serve(
+            mcp::Env::of_process(),
+            io::stdin().lock(),
+            io::stdout().lock(),
+        ),
         Some("wake-at") => match args.get(1).and_then(|at| at.parse().ok()) {
             Some(until) => wakers::wake_at(until),
             None => Err(io::Error::other("wake-at needs a unix time")),
         },
         _ => Err(io::Error::other(
-            "usage: herdr-triage <open|sync|startup|next|wake-at TIME>",
+            "usage: herdr-triage <open|sync|startup|next|mcp|wake-at TIME>",
         )),
     };
     match result {
