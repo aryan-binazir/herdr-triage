@@ -36,6 +36,30 @@ pub enum Effect {
     Rename { key: String, title: Option<String> },
     Undo,
     ToggleSection(Section),
+    NewAgent(NewAgent),
+}
+
+/// The agents `n` offers, by the digit beside each, and the command that starts it.
+pub const NEW_AGENTS: [&str; 4] = ["claude", "codex", "opencode", "pi"];
+
+/// An agent to start in a new tab of `workspace_id` (the current workspace if `None`), or in a
+/// new worktree of it on `branch`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewAgent {
+    pub workspace_id: Option<String>,
+    pub cwd: Option<String>,
+    pub branch: Option<String>,
+    pub command: &'static str,
+}
+
+#[derive(Debug, Clone)]
+pub struct NewAgentPrompt {
+    pub workspace_id: Option<String>,
+    pub label: String,
+    cwd: Option<String>,
+    pub branch: Option<String>,
+    /// The branch being typed for a new worktree.
+    pub typing: Option<String>,
 }
 
 const T3_READ: &str = "T3 marks a thread read when you open it";
@@ -113,6 +137,7 @@ pub struct Picker {
     forget: Option<ForgetPrompt>,
     close: Option<ClosePrompt>,
     rename: Option<RenamePrompt>,
+    new_agent: Option<NewAgentPrompt>,
     undo: Option<(&'static str, String)>,
     message: Option<String>,
     message_is_error: bool,
@@ -146,6 +171,7 @@ impl Picker {
             forget: None,
             close: None,
             rename: None,
+            new_agent: None,
             undo: None,
             message: None,
             message_is_error: false,
@@ -220,6 +246,9 @@ impl Picker {
         }
         if self.rename.is_some() {
             return self.rename_key(key, ctrl);
+        }
+        if self.new_agent.is_some() {
+            return self.new_agent_key(key, ctrl);
         }
         if let Some(prompt) = self.close.take() {
             let action = match key.code {
@@ -340,6 +369,7 @@ impl Picker {
                     });
                 }
             }
+            KeyCode::Char('n') => self.new_agent = Some(self.prompt_for_new_agent()),
             KeyCode::Char('D') => {
                 let Some(item) = self.selected() else {
                     return Effect::None;
@@ -574,6 +604,7 @@ impl Picker {
             || self.rename.is_some()
             || self.forget.is_some()
             || self.close.is_some()
+            || self.new_agent.is_some()
     }
 
     pub fn move_on_from(&mut self, key: &str, from: usize) {
@@ -635,6 +666,79 @@ impl Picker {
 
     pub fn filter(&self) -> &str {
         &self.filter
+    }
+
+    /// Starts where the selected thread lives: its Herdr workspace and directory, or the current
+    /// workspace for a T3 thread or no selection.
+    fn prompt_for_new_agent(&self) -> NewAgentPrompt {
+        let item = self
+            .selected()
+            .filter(|item| !matches!(item.target, Target::T3 { .. }));
+        let thread = item.map(|item| &item.row.thread);
+        let workspace_id = thread.and_then(|thread| thread.workspace_id.clone());
+        let label = match (item, &workspace_id) {
+            (Some(item), Some(_)) => {
+                (item.row.thread.workspace_label.clone()).unwrap_or_else(|| item.location.clone())
+            }
+            _ => "this workspace".into(),
+        };
+        NewAgentPrompt {
+            label,
+            cwd: thread.and_then(|thread| thread.cwd.clone()),
+            workspace_id,
+            branch: None,
+            typing: None,
+        }
+    }
+
+    fn new_agent_key(&mut self, key: KeyEvent, ctrl: bool) -> Effect {
+        let Some(prompt) = &mut self.new_agent else {
+            return Effect::None;
+        };
+        if let Some(text) = &mut prompt.typing {
+            match key.code {
+                KeyCode::Enter => {
+                    let branch = text.trim().to_owned();
+                    prompt.branch = Some(branch).filter(|branch| !branch.is_empty());
+                    prompt.typing = None;
+                }
+                KeyCode::Esc => prompt.typing = None,
+                KeyCode::Backspace => drop(text.pop()),
+                KeyCode::Char('u') if ctrl => text.clear(),
+                KeyCode::Char(c) if !ctrl && !c.is_whitespace() => text.push(c),
+                _ => {}
+            }
+            return Effect::None;
+        }
+        match key.code {
+            KeyCode::Char(c @ '1'..='9') => {
+                let Some(&command) = NEW_AGENTS.get(c as usize - '1' as usize) else {
+                    return Effect::None;
+                };
+                let Some(prompt) = self.new_agent.take() else {
+                    return Effect::None;
+                };
+                Effect::NewAgent(NewAgent {
+                    workspace_id: prompt.workspace_id,
+                    cwd: prompt.cwd,
+                    branch: prompt.branch,
+                    command,
+                })
+            }
+            KeyCode::Char('w') => {
+                prompt.typing = Some(prompt.branch.clone().unwrap_or_default());
+                Effect::None
+            }
+            KeyCode::Esc | KeyCode::Char('q') => {
+                self.new_agent = None;
+                Effect::None
+            }
+            _ => Effect::None,
+        }
+    }
+
+    pub fn new_agent_prompt(&self) -> Option<&NewAgentPrompt> {
+        self.new_agent.as_ref()
     }
 
     fn rename_key(&mut self, key: KeyEvent, ctrl: bool) -> Effect {
@@ -1067,6 +1171,86 @@ mod tests {
             press(&mut picker, KeyCode::Char('s')),
             apply(Action::ToggleSettle),
             "a resumable agent settles at once"
+        );
+    }
+
+    #[test]
+    fn n_starts_an_agent_where_the_selected_thread_lives() {
+        let mut items = items();
+        items[1].row.thread.cwd = Some("/work/api".into());
+        let mut picker = Picker::new(items, Some("p2"), &closed_sections());
+        assert_eq!(press(&mut picker, KeyCode::Char('n')), Effect::None);
+        assert_eq!(
+            picker.new_agent_prompt().map(|p| p.label.as_str()),
+            Some("acme-api")
+        );
+        assert_eq!(press(&mut picker, KeyCode::Char('9')), Effect::None);
+        assert_eq!(
+            press(&mut picker, KeyCode::Char('1')),
+            Effect::NewAgent(NewAgent {
+                workspace_id: Some("w1".into()),
+                cwd: Some("/work/api".into()),
+                branch: None,
+                command: "claude",
+            })
+        );
+        assert!(picker.new_agent_prompt().is_none());
+    }
+
+    #[test]
+    fn w_in_the_new_agent_prompt_asks_for_a_worktree_branch_first() {
+        let mut picker = Picker::new(items(), Some("p2"), &closed_sections());
+        press(&mut picker, KeyCode::Char('n'));
+        press(&mut picker, KeyCode::Char('w'));
+        for c in "fix/a b".chars() {
+            press(&mut picker, KeyCode::Char(c));
+        }
+        assert_eq!(
+            picker.new_agent_prompt().and_then(|p| p.typing.as_deref()),
+            Some("fix/ab"),
+            "a branch has no spaces"
+        );
+        press(&mut picker, KeyCode::Enter);
+        assert_eq!(
+            press(&mut picker, KeyCode::Char('2')),
+            Effect::NewAgent(NewAgent {
+                workspace_id: Some("w1".into()),
+                cwd: None,
+                branch: Some("fix/ab".into()),
+                command: "codex",
+            })
+        );
+
+        press(&mut picker, KeyCode::Char('n'));
+        press(&mut picker, KeyCode::Char('w'));
+        press(&mut picker, KeyCode::Char('x'));
+        press(&mut picker, KeyCode::Esc);
+        let prompt = picker.new_agent_prompt().unwrap();
+        assert!(
+            prompt.typing.is_none() && prompt.branch.is_none(),
+            "esc goes back"
+        );
+        assert_eq!(press(&mut picker, KeyCode::Char('q')), Effect::None);
+        assert!(picker.new_agent_prompt().is_none());
+    }
+
+    #[test]
+    fn n_on_a_t3_thread_starts_the_agent_in_the_current_workspace() {
+        let mut picker = Picker::new(with_t3(), None, &closed_sections());
+        select(&mut picker, "t3-done");
+        press(&mut picker, KeyCode::Char('n'));
+        assert_eq!(
+            picker.new_agent_prompt().map(|p| p.label.as_str()),
+            Some("this workspace")
+        );
+        assert_eq!(
+            press(&mut picker, KeyCode::Char('4')),
+            Effect::NewAgent(NewAgent {
+                workspace_id: None,
+                cwd: None,
+                branch: None,
+                command: "pi",
+            })
         );
     }
 

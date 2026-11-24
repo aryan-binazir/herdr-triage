@@ -10,7 +10,7 @@ use chrono::Local;
 use serde_json::{Map, Value};
 
 use crate::herdr::{Agent, Herdr, Tab, Workspace};
-use crate::picker::{Item, Target};
+use crate::picker::{Item, NewAgent, Target};
 use crate::store::Store;
 use crate::triage::{
     self, Action, After, CLOSED_FOR_GOOD, Close, Closing, Observed, Rank, Reconciled, Refusal,
@@ -165,6 +165,19 @@ impl Session {
 
     pub fn focus(&mut self, pane: &str) -> io::Result<()> {
         self.herdr.focus(pane)
+    }
+
+    /// Starts an agent in a new tab of its workspace, or in a new worktree of it, which Herdr
+    /// focuses.
+    pub fn start_agent(&mut self, agent: &NewAgent) -> io::Result<()> {
+        let workspace = agent.workspace_id.as_deref();
+        let pane = if let Some(branch) = &agent.branch {
+            self.herdr.create_worktree(workspace, branch)?
+        } else {
+            let cwd = agent.cwd.as_deref().filter(|dir| Path::new(dir).is_dir());
+            self.herdr.create_tab(workspace, cwd)?
+        };
+        self.herdr.run_command(&pane, agent.command)
     }
 
     pub fn notify(&mut self, title: &str) -> io::Result<()> {
@@ -1550,6 +1563,47 @@ mod tests {
             .unwrap()
             .row;
         assert_eq!(row.status_text(NOW), "settled · closed");
+    }
+
+    #[test]
+    fn a_new_agent_starts_in_a_new_tab_or_a_new_worktree() {
+        let fake = FakeHerdr::start(vec![]);
+        let (mut session, _) = connect(&fake);
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().to_str().unwrap().to_owned();
+        let agent = |branch: Option<&str>, cwd: Option<String>| NewAgent {
+            workspace_id: Some("w1".into()),
+            cwd,
+            branch: branch.map(str::to_owned),
+            command: "claude",
+        };
+        session
+            .start_agent(&agent(None, Some(cwd.clone())))
+            .unwrap();
+        assert_eq!(
+            fake.take("tab.create")[0],
+            json!({"workspace_id": "w1", "cwd": cwd, "focus": true})
+        );
+        assert_eq!(
+            fake.take("pane.send_input")[0],
+            json!({"pane_id": "w1:p91", "text": "claude", "keys": ["Enter"]})
+        );
+
+        session
+            .start_agent(&agent(None, Some("/no/such/dir".into())))
+            .unwrap();
+        assert_eq!(fake.take("tab.create")[0]["cwd"], Value::Null);
+        fake.take("pane.send_input");
+
+        session
+            .start_agent(&agent(Some("fix/flaky"), Some(cwd)))
+            .unwrap();
+        assert!(fake.take("tab.create").is_empty());
+        assert_eq!(
+            fake.take("worktree.create")[0],
+            json!({"workspace_id": "w1", "branch": "fix/flaky", "focus": true})
+        );
+        assert_eq!(fake.take("pane.send_input")[0]["pane_id"], "w9:p1");
     }
 
     #[test]

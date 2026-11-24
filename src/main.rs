@@ -127,6 +127,7 @@ fn run_picker() -> io::Result<()> {
             Effect::Close => break Ok(Leave::Close),
             Effect::Focus(pane) => break Ok(Leave::Focus(pane)),
             Effect::OpenT3(link) => break Ok(Leave::OpenT3(link)),
+            Effect::NewAgent(agent) => break Ok(Leave::NewAgent(agent)),
             Effect::T3 { thread, op } => {
                 if t3.request(&thread, op) {
                     t3_sent.push(picker.sent(&t3::row_key(&thread)));
@@ -158,12 +159,19 @@ fn run_picker() -> io::Result<()> {
         }
     };
     ratatui::restore();
-    match outcome? {
+    leave(&mut session, outcome?)
+}
+
+fn leave(session: &mut Session, leave: Leave) -> io::Result<()> {
+    match leave {
         Leave::Close => Ok(()),
         Leave::Focus(pane) => session.focus(&pane),
         Leave::OpenT3(link) => {
             t3::open(&link).or_else(|error| session.notify(&format!("Could not open T3: {error}")))
         }
+        Leave::NewAgent(agent) => session.start_agent(&agent).or_else(|error| {
+            session.notify(&format!("Could not start {}: {error}", agent.command))
+        }),
     }
 }
 
@@ -261,6 +269,7 @@ enum Leave {
     Close,
     Focus(String),
     OpenT3(String),
+    NewAgent(picker::NewAgent),
 }
 
 struct Shown {

@@ -67,6 +67,7 @@ rows = [
 | `p` | pin / unpin | typed |
 | `r` | rename the thread (`enter` saves; an empty title restores the automatic one) | typed |
 | `U` | undo the last triage change or rename (the footer names it, e.g. `U undo settle “docs pass”`) | typed |
+| `n` | new agent where the selected thread lives: `1`–`4` start claude, codex, opencode or pi in a new tab; `w` first asks for a branch and starts it in a new worktree | typed |
 | `D` | forget a closed thread (asks `y`) | typed |
 | `esc` | clear the search, else close | leave search, keeping it |
 | `q` | close (cancels an open prompt) | typed |

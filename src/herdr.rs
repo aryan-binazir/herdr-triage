@@ -273,6 +273,21 @@ impl Herdr {
             .ok_or_else(|| io::Error::other("tab.create returned no pane"))
     }
 
+    /// Creates a worktree of `workspace_id` (the current workspace if `None`) on `branch`, opens it
+    /// as a focused workspace, and returns its first pane.
+    pub fn create_worktree(
+        &mut self,
+        workspace_id: Option<&str>,
+        branch: &str,
+    ) -> io::Result<String> {
+        let params = json!({"workspace_id": workspace_id, "branch": branch, "focus": true});
+        let result = self.call("worktree.create", &params)?;
+        result["root_pane"]["pane_id"]
+            .as_str()
+            .map(str::to_owned)
+            .ok_or_else(|| io::Error::other("worktree.create returned no pane"))
+    }
+
     pub fn run_command(&mut self, pane_id: &str, command: &str) -> io::Result<()> {
         let params = json!({"pane_id": pane_id, "text": command, "keys": ["Enter"]});
         self.call("pane.send_input", &params).map(drop)

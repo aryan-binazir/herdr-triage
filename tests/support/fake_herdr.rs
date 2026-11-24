@@ -96,10 +96,10 @@ impl FakeHerdr {
                     }
                     "tab.create" => {
                         opened += 1;
-                        let workspace = params["workspace_id"].as_str().unwrap_or("w1");
-                        json!({"type": "tab_created",
-                               "tab": {"tab_id": format!("{workspace}:t9{opened}"), "workspace_id": workspace},
-                               "root_pane": {"pane_id": format!("{workspace}:p9{opened}")}})
+                        created_tab(params, opened)
+                    }
+                    "worktree.create" => {
+                        json!({"type": "worktree_created", "root_pane": {"pane_id": "w9:p1"}})
                     }
                     "notification.show" => {
                         let shown = *shown.lock().unwrap();
@@ -200,6 +200,13 @@ fn store_tokens(agents: &mut [Value], params: &Value) {
             tokens.insert(name.clone(), value.clone());
         }
     }
+}
+
+fn created_tab(params: &Value, opened: usize) -> Value {
+    let workspace = params["workspace_id"].as_str().unwrap_or("w1");
+    json!({"type": "tab_created",
+           "tab": {"tab_id": format!("{workspace}:t9{opened}"), "workspace_id": workspace},
+           "root_pane": {"pane_id": format!("{workspace}:p9{opened}")}})
 }
 
 fn rename(agents: &mut [Value], params: &Value) {

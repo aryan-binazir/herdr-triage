@@ -8,7 +8,7 @@ use ratatui::widgets::{
     Block, BorderType, Cell, HighlightSpacing, Padding, Paragraph, Row, Table, TableState,
 };
 
-use crate::picker::{Item, ListRow, Mode, Picker, Target};
+use crate::picker::{Item, ListRow, Mode, NEW_AGENTS, NewAgentPrompt, Picker, Target};
 use crate::triage::{Action, Attention, Display, Section};
 
 const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -591,7 +591,7 @@ fn rename_line(text: &str, room: usize) -> Line<'static> {
 fn labelled_prompt(
     verb: Span<'static>,
     label: &str,
-    punct: &'static str,
+    punct: &str,
     options: Vec<Span<'static>>,
     width: usize,
 ) -> Line<'static> {
@@ -611,7 +611,7 @@ fn labelled_prompt(
     if let Some(label) = quoted {
         spans.push(Span::raw(format!(" “{label}”")));
     }
-    spans.push(Span::raw(punct));
+    spans.push(Span::raw(punct.to_owned()));
     spans.extend(options);
     if Line::from(spans.clone()).width() + cancel.iter().map(Span::width).sum::<usize>() <= width {
         spans.extend(cancel);
@@ -619,8 +619,49 @@ fn labelled_prompt(
     Line::from(spans)
 }
 
+/// The new-agent prompt: pick an agent, or type a branch for a new worktree first.
+fn new_agent_line(prompt: &NewAgentPrompt, width: usize) -> (Line<'static>, Option<usize>) {
+    if let Some(text) = &prompt.typing {
+        let head = " new worktree on branch: ";
+        let room = width.saturating_sub(cells(head) + cells("  enter ok  esc back"));
+        let text = tail(text, room);
+        let line = Line::from(vec![
+            Span::raw(" new worktree").cyan().bold(),
+            Span::raw(format!(" on branch: {text}")),
+            Span::raw("  enter"),
+            Span::from(" ok").dim(),
+            Span::raw("  esc"),
+            Span::from(" back").dim(),
+        ]);
+        return (line, Some(cells(head) + cells(&text)));
+    }
+    let mut options: Vec<Span<'static>> = NEW_AGENTS
+        .iter()
+        .enumerate()
+        .flat_map(|(i, agent)| {
+            [
+                Span::raw(format!("  {}", i + 1)),
+                Span::from(format!(" {agent}")).dim(),
+            ]
+        })
+        .collect();
+    options.extend([Span::raw("  w"), Span::from(" new worktree").dim()]);
+    let punct = match &prompt.branch {
+        Some(branch) => format!(" on new worktree {branch}"),
+        None => String::new(),
+    };
+    let verb = Span::from("new agent in").cyan().bold();
+    (
+        labelled_prompt(verb, &prompt.label, &punct, options, width),
+        None,
+    )
+}
+
 /// The footer prompt, if one is open, and where the typing cursor sits in it.
 fn prompt_line(picker: &Picker, width: usize) -> Option<(Line<'static>, Option<usize>)> {
+    if let Some(prompt) = picker.new_agent_prompt() {
+        return Some(new_agent_line(prompt, width));
+    }
     if let Some(prompt) = picker.rename_prompt() {
         let room = width.saturating_sub(cells(" rename: ") + cells("  enter save  esc cancel"));
         let text = tail(&prompt.text, room);
@@ -745,7 +786,7 @@ fn footer_line(picker: &Picker, width: usize) -> (Line<'static>, Option<usize>) 
             } else {
                 pairs.extend([("esc", "clear search"), ("q", "close")]);
             }
-            pairs.push(("1-9/0", "open"));
+            pairs.extend([("n", "new agent"), ("1-9/0", "open")]);
             let mut pairs = owned(pairs);
             if let Some((verb, label)) = picker.undo() {
                 let label = ellipsize(label, MIN_LABEL * 3);
@@ -754,7 +795,11 @@ fn footer_line(picker: &Picker, width: usize) -> (Line<'static>, Option<usize>) 
                     pairs[undo_at].1 = Cow::Borrowed("undo");
                 }
             }
-            fitted_hints(pairs, &["1-9/0", "j/k", "/", "r", "p", "u", "U"], width)
+            fitted_hints(
+                pairs,
+                &["1-9/0", "n", "j/k", "/", "r", "p", "u", "U"],
+                width,
+            )
         }
         Mode::Search => {
             pairs.push(("esc", "done"));
@@ -942,6 +987,37 @@ mod tests {
             lines[13].contains(
                 "close “fix flaky test” for good? (can't resume)  y close  n settle, keep it open  esc cancel"
             ),
+            "{}",
+            lines[13]
+        );
+    }
+
+    #[test]
+    fn the_new_agent_prompt_offers_agents_and_a_worktree() {
+        let mut picker = picker();
+        press(&mut picker, KeyCode::Char('n'));
+        let (lines, _) = render(&mut picker, 120, 14);
+        assert!(
+            lines[13].contains(
+                "new agent in “acme-api”  1 claude  2 codex  3 opencode  4 pi  w new worktree  esc cancel"
+            ),
+            "{}",
+            lines[13]
+        );
+        press(&mut picker, KeyCode::Char('w'));
+        for c in "fix/x".chars() {
+            press(&mut picker, KeyCode::Char(c));
+        }
+        let (lines, _) = render(&mut picker, 120, 14);
+        assert!(
+            lines[13].contains("new worktree on branch: fix/x  enter ok  esc back"),
+            "{}",
+            lines[13]
+        );
+        press(&mut picker, KeyCode::Enter);
+        let (lines, _) = render(&mut picker, 120, 14);
+        assert!(
+            lines[13].contains("new agent in “acme-api” on new worktree fix/x  1 claude"),
             "{}",
             lines[13]
         );
