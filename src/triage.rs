@@ -781,6 +781,7 @@ impl State {
                 .or_insert_with(|| Record {
                     generation: generation.to_owned(),
                     last_seq: agent.seq,
+                    changed_at: Some(now),
                     ..Record::default()
                 });
             // A thread that ended or is being reopened comes back by choice, not by Herdr's restore.
@@ -1831,7 +1832,7 @@ mod tests {
         let row = state.ordered(std::slice::from_ref(&working)).remove(0);
         assert_eq!(
             (row.rank(), row.status_text(NOW)),
-            (Rank::Open, "working · settles when done".into())
+            (Rank::Open, "working <1m · settles when done".into())
         );
         assert!(
             state
@@ -2043,7 +2044,11 @@ mod tests {
         assert_eq!(text("w"), "working 4m");
         assert_eq!(text("d"), "done 4m");
         assert_eq!(text("i"), "idle 4m");
-        assert_eq!(text("fresh"), "blocked");
+        assert_eq!(
+            text("fresh"),
+            "blocked 4m",
+            "aged from when triage first saw it"
+        );
     }
 
     #[test]

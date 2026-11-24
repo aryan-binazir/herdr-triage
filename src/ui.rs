@@ -1543,7 +1543,7 @@ mod tests {
         let mut list = listed(&fixture);
         assert_eq!(
             [list[0].status.as_str(), list[1].status.as_str()],
-            ["working", "snoozed · 3h · stays open"]
+            ["working 1m", "snoozed · 3h · stays open"]
         );
         list[0].focused = true;
         "mobile · api".clone_into(&mut list[1].location);
@@ -1663,7 +1663,7 @@ mod tests {
         let (lines, buffer) = render(&mut picker, 100, 14);
         let shown = |label: &str| lines.iter().position(|l| l.contains(label)).unwrap();
         for (label, status) in [
-            ("api refactor", "blocked"),
+            ("api refactor", "blocked 1m"),
             ("old spike", "unread · closed"),
             ("bench run", "snoozed · 1h · stays open"),
             ("release notes", "settled · stays open"),

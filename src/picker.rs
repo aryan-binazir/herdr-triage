@@ -844,10 +844,12 @@ impl Item {
     }
 }
 
-/// Merges T3's threads into Herdr's ordered rows by rank, then wake time, then recency, keeping
-/// Herdr's own order among its rows.
-pub fn combine(herdr: Vec<Item>, mut t3: Vec<Item>) -> Vec<Item> {
-    fn place(item: &Item) -> (crate::triage::Rank, i64, Reverse<i64>) {
+/// Orders Herdr's rows and T3's threads together: by rank, then wake time, then most recent
+/// change, with closed Herdr threads after the live ones of their rank, as Herdr orders them.
+pub fn combine(herdr: Vec<Item>, t3: Vec<Item>) -> Vec<Item> {
+    let mut items = herdr;
+    items.extend(t3);
+    items.sort_by_key(|item| {
         let wake = match item.row.park {
             Some(Park::Snoozed { until }) => until,
             _ => 0,
@@ -855,19 +857,10 @@ pub fn combine(herdr: Vec<Item>, mut t3: Vec<Item>) -> Vec<Item> {
         (
             item.row.rank(),
             wake,
-            Reverse(item.row.changed_at.unwrap_or(0)),
+            item.target == Target::Closed,
+            Reverse(item.row.changed_at),
         )
-    }
-    t3.sort_by_key(place);
-    let mut items = Vec::with_capacity(herdr.len() + t3.len());
-    let mut t3 = t3.into_iter().peekable();
-    for row in herdr {
-        while let Some(thread) = t3.next_if(|thread| place(thread) < place(&row)) {
-            items.push(thread);
-        }
-        items.push(row);
-    }
-    items.extend(t3);
+    });
     items
 }
 
@@ -1906,6 +1899,44 @@ mod tests {
                 "release notes",
                 "old spike",
                 "t3 settled",
+            ]
+        );
+    }
+
+    #[test]
+    fn t3_and_herdr_rows_share_one_recency_order_with_closed_herdr_threads_last() {
+        let herdr = Fixture::new(
+            NOW,
+            &[
+                ("p1", "changed long ago", Status::Idle),
+                ("p2", "just changed", Status::Idle),
+                ("p3", "closed recently", Status::Idle),
+            ],
+        )
+        .act("p3", Action::ToggleUnread)
+        .close("p3");
+        let mut items = listed(&herdr);
+        for (item, ago) in items.iter_mut().zip([100, 10, 5]) {
+            item.row.changed_at = Some(NOW - ago);
+        }
+        let snapshot = crate::t3::Snapshot {
+            environment_id: "env".into(),
+            projects: std::collections::BTreeMap::new(),
+            threads: vec![crate::t3::T3Thread {
+                updated_at: NOW - 50,
+                unseen: false,
+                ..t3_thread("t3 thread", "completed")
+            }],
+        };
+        let combined = combine(items, crate::t3::items(&snapshot, NOW));
+        let labels: Vec<&str> = combined.iter().map(|item| item.row.label()).collect();
+        assert_eq!(
+            labels,
+            [
+                "just changed",
+                "t3 thread",
+                "changed long ago",
+                "closed recently"
             ]
         );
     }

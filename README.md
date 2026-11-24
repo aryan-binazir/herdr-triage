@@ -152,8 +152,8 @@ points at it, and `enter` (or its digit) opens it in the T3 desktop app through 
 - Rows show T3's own state in the picker's words: running is *working*, waiting on you is
   *blocked*, a finished run you haven't opened since is *done*, otherwise *idle*. T3's settles,
   snoozes and pins place the row as Herdr's do; working threads join the `working` section.
-- T3 rows follow the Herdr rows of the same rank, newest first; snoozed rows of either kind wake
-  in order. Settled T3 threads untouched for 30 days are left out. Subagent and side-chat
+- T3 rows mix with Herdr's by rank and most recent change, ahead of closed Herdr threads of the
+  same rank; snoozed rows of either kind wake in order. Settled T3 threads untouched for 30 days are left out. Subagent and side-chat
   threads stay under their parent, as in T3.
 - `s`, `z`, `p` and `u` on a T3 row have T3 settle or unsettle, snooze (same presets) or wake,
   pin or unpin, and mark unread the thread; the row moves once T3 has done it. T3 decides what it
