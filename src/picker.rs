@@ -108,6 +108,7 @@ pub struct SnoozePrompt {
     pub label: String,
     /// Each preset and whether it was offered when the prompt opened.
     pub presets: Vec<(SnoozePreset, bool)>,
+    shown_at: i64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -282,10 +283,22 @@ impl Picker {
             let Some(&(preset, offered)) = prompt.presets.get(choice) else {
                 return Effect::None;
             };
-            let until = preset.until(now, tz);
-            if !offered || until <= now {
+            // A time of day means the day the prompt showed; a duration runs from now.
+            let from = match preset {
+                SnoozePreset::OneHour | SnoozePreset::ThreeHours => now,
+                _ => prompt.shown_at,
+            };
+            let until = preset.until(from, tz);
+            let refused = if !offered {
+                Some("is under 30 minutes away")
+            } else if until <= now {
+                Some("has passed")
+            } else {
+                None
+            };
+            if let Some(why) = refused {
+                self.notify(format!("{} {why}", preset.label()));
                 self.snooze = None;
-                self.notify(format!("{} is too soon", preset.label()));
                 return Effect::None;
             }
             let effect = match &prompt.t3_thread {
@@ -400,6 +413,7 @@ impl Picker {
                     t3_thread: None,
                     label: item.row.label().to_owned(),
                     presets: snooze_presets(now, tz),
+                    shown_at: now,
                 });
             }
             _ => {}
@@ -430,6 +444,7 @@ impl Picker {
                     t3_thread: Some(thread),
                     label: item.row.label().to_owned(),
                     presets: snooze_presets(now, tz),
+                    shown_at: now,
                 });
                 return Some(Effect::None);
             }
@@ -1116,7 +1131,10 @@ mod tests {
         picker.key(key('z'), evening, &chrono::Utc);
         assert_eq!(picker.key(key('3'), evening, &chrono::Utc), Effect::None);
         assert!(picker.snooze_prompt().is_none());
-        assert_eq!(picker.message(), Some("today 18:00 is too soon"));
+        assert_eq!(
+            picker.message(),
+            Some("today 18:00 is under 30 minutes away")
+        );
     }
 
     #[test]
@@ -1127,7 +1145,7 @@ mod tests {
         picker.key(key('z'), shown_at, &chrono::Utc);
         let past_six = NOW + 5 * 3_600 + 60;
         assert_eq!(picker.key(key('3'), past_six, &chrono::Utc), Effect::None);
-        assert_eq!(picker.message(), Some("today 18:00 is too soon"));
+        assert_eq!(picker.message(), Some("today 18:00 has passed"));
     }
 
     #[test]
@@ -1244,6 +1262,36 @@ mod tests {
                 branch: None,
                 command: "pi",
             })
+        );
+    }
+
+    #[test]
+    fn a_calendar_snooze_keeps_the_day_it_showed() {
+        let key = |c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE);
+        let sunday_evening = NOW + 5 * 86_400 + 7 * 3_600;
+        let monday_ten = NOW + 6 * 86_400 - 3 * 3_600;
+        let mut picker = Picker::new(items(), Some("p2"), &closed_sections());
+        picker.key(key('z'), sunday_evening, &chrono::Utc);
+        assert_eq!(picker.key(key('5'), monday_ten, &chrono::Utc), Effect::None);
+        assert_eq!(picker.message(), Some("next Mon 09:00 has passed"));
+
+        let tuesday_five = NOW + 4 * 3_600;
+        picker.key(key('z'), tuesday_five, &chrono::Utc);
+        let wednesday_ten = NOW + 86_400 - 3 * 3_600;
+        assert_eq!(
+            picker.key(key('3'), wednesday_ten, &chrono::Utc),
+            Effect::None
+        );
+        assert_eq!(picker.message(), Some("today 18:00 has passed"));
+
+        picker.key(key('z'), tuesday_five, &chrono::Utc);
+        assert_eq!(
+            picker.key(key('1'), tuesday_five + 600, &chrono::Utc),
+            Effect::Apply {
+                key: "k-p2".into(),
+                action: Action::Snooze(tuesday_five + 600 + 3_600)
+            },
+            "1h is an hour from when you pick it"
         );
     }
 
