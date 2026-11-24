@@ -83,7 +83,7 @@ fn sync_publishes_rank_tokens_and_installs_the_agents_view() {
 }
 
 #[test]
-fn the_sidebar_hides_parked_agents_and_counts_them_in_its_header() {
+fn the_sidebar_hides_parked_agents_and_counts_only_snoozed_ones() {
     let herdr = FakeHerdr::start(vec![
         agent("w1:p1", "idle", 3),
         agent("w1:p2", "idle", 4),
@@ -98,7 +98,7 @@ fn the_sidebar_hides_parked_agents_and_counts_them_in_its_header() {
 
     herdr.run(&["sync"]);
     let views = herdr.take("agent.view.set");
-    assert_eq!(views[0]["label"], "3 parked");
+    assert_eq!(views[0]["label"], "1 snoozed");
 }
 
 #[test]
