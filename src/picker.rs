@@ -953,7 +953,7 @@ mod tests {
     }
 
     #[test]
-    fn snooze_on_a_snoozed_agent_wakes_it_and_on_a_busy_one_explains_why_not() {
+    fn snooze_on_a_snoozed_agent_wakes_it_and_on_a_busy_one_asks_when() {
         let list = listed(&three(Status::Working).act("p3", Action::Snooze(NOW + 60)));
         let mut picker = Picker::new(list, Some("p3"), &BTreeSet::from([Section::Snoozed]));
         assert_eq!(
@@ -967,8 +967,10 @@ mod tests {
         let blocked = listed(&three(Status::Blocked));
         let mut picker = Picker::new(blocked, Some("p1"), &closed_sections());
         assert_eq!(press(&mut picker, KeyCode::Char('z')), Effect::None);
-        assert!(picker.snooze_prompt().is_none());
-        assert_eq!(picker.message(), Some("can't snooze a blocked agent"));
+        assert!(
+            picker.snooze_prompt().is_some(),
+            "a blocked agent can be snoozed"
+        );
 
         let mut picker = Picker::new(items(), Some("p1"), &closed_sections());
         press(&mut picker, KeyCode::Char('z'));

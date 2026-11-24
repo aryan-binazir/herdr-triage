@@ -653,7 +653,6 @@ fn refusal(action: Action, shown: Display, live: bool) -> Option<Refusal> {
         }
         Action::ToggleSettle | Action::SettleKeepingOpen => "settle",
         Action::ToggleUnread => "mark unread",
-        Action::Snooze(_) if shown == Display::Blocked => "snooze",
         _ => return None,
     };
     let busy = match shown {
@@ -1093,7 +1092,8 @@ impl State {
                 Ok(park(record, seq, Park::Settled, None))
             }
             Action::Snooze(until) => {
-                let wakeable = record.resumable() && shown != Display::Working;
+                let busy = matches!(shown, Display::Working | Display::Blocked);
+                let wakeable = record.resumable() && !busy;
                 Ok(park(
                     record,
                     seq,
@@ -1528,7 +1528,7 @@ mod tests {
     }
 
     #[test]
-    fn triage_refuses_to_settle_or_mark_busy_agents_snooze_blocked_ones_or_forget_live_ones() {
+    fn triage_refuses_to_settle_or_mark_busy_agents_or_forget_live_ones() {
         let agents = [
             agent("working", Status::Working, 3),
             agent("blocked", Status::Blocked, 2),
@@ -1565,7 +1565,6 @@ mod tests {
                     vec![
                         "can't settle a blocked agent".to_owned(),
                         "can't mark unread a blocked agent".into(),
-                        "can't snooze a blocked agent".into(),
                         "only closed threads can be forgotten".into(),
                     ]
                 ),
@@ -1682,6 +1681,27 @@ mod tests {
         );
         state.reconcile(GEN, &[focus(&a, true), b.clone()], NOW + 5);
         assert_eq!(shown(&state, &a), (Display::Idle, None), "came back to it");
+    }
+
+    #[test]
+    fn a_blocked_agent_snoozes_with_its_pane_open_until_it_asks_again() {
+        let blocked = resumable("a", Status::Blocked, 4);
+        let mut state = State::default();
+        state.reconcile(GEN, std::slice::from_ref(&blocked), NOW);
+        assert_eq!(
+            act(&mut state, &blocked, Action::Snooze(NOW + 3600)),
+            Ok(After::Nothing),
+            "its pane stays open"
+        );
+        let snoozed = Some(Park::Snoozed { until: NOW + 3600 });
+        state.reconcile(GEN, std::slice::from_ref(&blocked), NOW + 1);
+        assert_eq!(shown(&state, &blocked), (Display::Blocked, snoozed));
+        let answered = resumable("a", Status::Working, 5);
+        state.reconcile(GEN, std::slice::from_ref(&answered), NOW + 2);
+        assert_eq!(shown(&state, &answered), (Display::Working, snoozed));
+        let asks_again = resumable("a", Status::Blocked, 6);
+        state.reconcile(GEN, std::slice::from_ref(&asks_again), NOW + 3);
+        assert_eq!(shown(&state, &asks_again), (Display::Blocked, None));
     }
 
     #[test]

@@ -1225,9 +1225,14 @@ mod tests {
                 session.act(key, Action::ToggleSettle).unwrap(),
                 Outcome::Refused(_)
             ));
-            let outcome = session.act(key, Action::Snooze(NOW + 3600)).unwrap();
-            assert_eq!(matches!(outcome, Outcome::Refused(_)), status == "blocked");
-            assert!(fake.take("pane.close").is_empty());
+            assert_eq!(
+                session.act(key, Action::Snooze(NOW + 3600)).unwrap(),
+                done(key)
+            );
+            assert!(
+                fake.take("pane.close").is_empty(),
+                "a busy agent snoozes with its pane open"
+            );
         }
         for shared in [false, true] {
             let fake = opencode_and_claude();
@@ -1400,14 +1405,14 @@ mod tests {
 
     #[test]
     fn a_snooze_arms_its_wake_only_once_triage_accepts_it() {
-        let fake = FakeHerdr::start(vec![fake_herdr::agent("w1:p1", "blocked", 3)]);
+        let fake = FakeHerdr::start(vec![fake_herdr::agent("w1:p1", "idle", 3)]);
         let (mut session, armed) = connect(&fake);
         let key = "terminal:t-w1:p1";
-        let refused = session.act(key, Action::Snooze(NOW + 3600)).unwrap();
+        let gone = "terminal:t-w1:p9";
+        let refused = session.act(gone, Action::Snooze(NOW + 3600)).unwrap();
         assert!(matches!(refused, Outcome::Refused(_)), "{refused:?}");
         assert!(armed.borrow().is_empty());
 
-        fake.agents.lock().unwrap()[0]["agent_status"] = json!("idle");
         let snoozed = session.act(key, Action::Snooze(NOW + 3600)).unwrap();
         assert_eq!(snoozed, done(key));
         session.view().unwrap();

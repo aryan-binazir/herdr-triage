@@ -102,7 +102,7 @@ and refused. A time that has passed while the prompt was open is refused too:
   notifies you, the thread leaves the picker and undo can't bring it back), `n` settles it and
   keeps its pane open. Snoozing one, or settling one whose
   state Herdr can't tell (`unknown`), leaves it open, as does snoozing an agent that is still
-  working, and so does the last pane of a workspace; these are marked `stays open`. Codex only reports its session to Herdr when it runs without its shared
+  working or blocked, and so does the last pane of a workspace; these are marked `stays open`. Codex only reports its session to Herdr when it runs without its shared
   app-server: start it with `codex --no-daemon` (or alias `codex` to that).
 - **After a Herdr restart,** Herdr relaunches restored agents; state changes in the first 20 seconds
   are not treated as new activity, so parked threads stay parked.
@@ -119,8 +119,8 @@ and refused. A time that has passed while the prompt was open is refused too:
   without reopening it.
 - A thread whose session ends some other way settles as closed, even if you hadn't seen its result,
   unless you marked it unread or a snooze woke it: then it stays open as `unread · closed` or
-  `woke · closed`. Settle and unread are refused while an agent is working or blocked;
-  snooze only while it is blocked.
+  `woke · closed`. Settle and unread are refused while an agent is working or blocked; snooze
+  works in any state.
 - **Undo** (`U`) takes back the last settle, snooze, wake, unread, pin or rename, once. It never closes
   a pane; undoing a settle or snooze that closed a session reopens it, unless it closed for good.
   Once the agent has done
