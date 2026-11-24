@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use chrono::Local;
 use serde_json::{Map, Value};
 
-use crate::herdr::{Agent, Herdr, Tab, Workspace};
+use crate::herdr::{Agent, Herdr, Tab, Workspace, WorkspaceWorktree, WorktreeSource};
 use crate::picker::{Item, NewAgent, Target};
 use crate::store::Store;
 use crate::triage::{
@@ -167,15 +167,28 @@ impl Session {
         self.herdr.focus(pane)
     }
 
-    /// Starts an agent in a new tab of its workspace, or in a new worktree of it, which Herdr
-    /// focuses.
+    /// Starts an agent in a new tab of its workspace, or in a new worktree of its repository,
+    /// which Herdr focuses. A workspace that is gone falls back to the current one.
     pub fn start_agent(&mut self, agent: &NewAgent) -> io::Result<()> {
-        let workspace = agent.workspace_id.as_deref();
+        let workspaces = self.herdr.workspaces()?;
+        let workspace = workspaces
+            .iter()
+            .find(|w| agent.workspace_id.as_deref() == Some(w.workspace_id.as_str()));
         let pane = if let Some(branch) = &agent.branch {
-            self.herdr.create_worktree(workspace, branch)?
+            // Herdr branches new worktrees from the repository, not from another worktree.
+            let from = workspace.map(|w| match &w.worktree {
+                Some(WorkspaceWorktree {
+                    is_linked_worktree: true,
+                    repo_root: Some(root),
+                    ..
+                }) => WorktreeSource::Checkout(root),
+                _ => WorktreeSource::Workspace(&w.workspace_id),
+            });
+            self.herdr.create_worktree(from, branch)?
         } else {
             let cwd = agent.cwd.as_deref().filter(|dir| Path::new(dir).is_dir());
-            self.herdr.create_tab(workspace, cwd)?
+            let id = workspace.map(|w| w.workspace_id.as_str());
+            self.herdr.create_tab(id, cwd)?
         };
         self.herdr.run_command(&pane, agent.command)
     }
@@ -1719,6 +1732,39 @@ mod tests {
         assert!(session.sync().is_err());
         *fake.fail_method.lock().unwrap() = None;
         assert_eq!(fake.take("pane.close"), [json!({"pane_id": "w1:p1"})]);
+    }
+
+    #[test]
+    fn a_new_agent_falls_back_from_a_gone_workspace_and_branches_from_the_repo() {
+        let fake = FakeHerdr::start(vec![]);
+        fake.workspaces.lock().unwrap().push(json!({
+            "workspace_id": "w2", "label": "auth-fix", "tab_count": 1, "pane_count": 1,
+            "worktree": {"repo_name": "acme-api", "repo_root": "/work/acme-api",
+                         "is_linked_worktree": true}
+        }));
+        let (mut session, _) = connect(&fake);
+        let agent = |workspace: &str, branch: Option<&str>| NewAgent {
+            workspace_id: Some(workspace.into()),
+            cwd: None,
+            branch: branch.map(str::to_owned),
+            command: "pi",
+        };
+        session.start_agent(&agent("w-gone", None)).unwrap();
+        assert_eq!(fake.take("tab.create")[0]["workspace_id"], Value::Null);
+
+        session.start_agent(&agent("w2", Some("fix/x"))).unwrap();
+        assert_eq!(
+            fake.take("worktree.create")[0],
+            json!({"cwd": "/work/acme-api", "branch": "fix/x", "focus": true}),
+            "a worktree starts from its repository, not from another worktree"
+        );
+        session
+            .start_agent(&agent("w-gone", Some("fix/y")))
+            .unwrap();
+        assert_eq!(
+            fake.take("worktree.create")[0],
+            json!({"branch": "fix/y", "focus": true})
+        );
     }
 
     #[test]

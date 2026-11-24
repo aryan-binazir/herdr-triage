@@ -15,6 +15,8 @@ use serde_json::{Map, Value, json};
 use crate::triage::Status;
 
 const TIMEOUT: Duration = Duration::from_secs(3);
+/// Creating a worktree checks out a branch, which can take a while in a big repository.
+const WORKTREE_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Agent {
@@ -91,6 +93,8 @@ pub struct WorkspaceWorktree {
     #[serde(default)]
     pub repo_name: Option<String>,
     #[serde(default)]
+    pub repo_root: Option<String>,
+    #[serde(default)]
     pub is_linked_worktree: bool,
 }
 
@@ -102,6 +106,7 @@ impl Workspace {
             Some(WorkspaceWorktree {
                 repo_name: Some(repo),
                 is_linked_worktree: true,
+                ..
             }) if !self.label.starts_with(repo.as_str()) => format!("{repo}/{}", self.label),
             _ => self.label.clone(),
         }
@@ -145,13 +150,22 @@ impl Herdr {
     }
 
     fn call(&mut self, method: &str, params: &Value) -> io::Result<Value> {
+        self.call_within(method, params, TIMEOUT)
+    }
+
+    fn call_within(
+        &mut self,
+        method: &str,
+        params: &Value,
+        timeout: Duration,
+    ) -> io::Result<Value> {
         self.next_id += 1;
         let id = format!("triage-{}", self.next_id);
         let request = json!({"id": id, "method": method, "params": params});
         // Herdr answers one request per connection, then closes it.
         let mut stream = UnixStream::connect(&self.path)?;
-        stream.set_read_timeout(Some(TIMEOUT))?;
-        stream.set_write_timeout(Some(TIMEOUT))?;
+        stream.set_read_timeout(Some(timeout))?;
+        stream.set_write_timeout(Some(timeout))?;
         let mut bytes = serde_json::to_vec(&request).map_err(io::Error::other)?;
         bytes.push(b'\n');
         stream.write_all(&bytes)?;
@@ -273,15 +287,20 @@ impl Herdr {
             .ok_or_else(|| io::Error::other("tab.create returned no pane"))
     }
 
-    /// Creates a worktree of `workspace_id` (the current workspace if `None`) on `branch`, opens it
-    /// as a focused workspace, and returns its first pane.
+    /// Creates a worktree on `branch` of the repository `from` names (the current workspace's if
+    /// `None`), opens it as a focused workspace, and returns its first pane.
     pub fn create_worktree(
         &mut self,
-        workspace_id: Option<&str>,
+        from: Option<WorktreeSource<'_>>,
         branch: &str,
     ) -> io::Result<String> {
-        let params = json!({"workspace_id": workspace_id, "branch": branch, "focus": true});
-        let result = self.call("worktree.create", &params)?;
+        let mut params = json!({"branch": branch, "focus": true});
+        match from {
+            Some(WorktreeSource::Workspace(id)) => params["workspace_id"] = id.into(),
+            Some(WorktreeSource::Checkout(dir)) => params["cwd"] = dir.into(),
+            None => {}
+        }
+        let result = self.call_within("worktree.create", &params, WORKTREE_TIMEOUT)?;
         result["root_pane"]["pane_id"]
             .as_str()
             .map(str::to_owned)
@@ -302,6 +321,13 @@ impl Herdr {
             json!({"plugin_id": plugin_id(), "entrypoint": "picker", "focus": true, "env": env});
         self.call("plugin.pane.open", &params).map(drop)
     }
+}
+
+/// Where a new worktree branches from: a workspace, or a checkout of the repository.
+#[derive(Debug, Clone, Copy)]
+pub enum WorktreeSource<'a> {
+    Workspace(&'a str),
+    Checkout(&'a str),
 }
 
 pub fn plugin_id() -> String {
