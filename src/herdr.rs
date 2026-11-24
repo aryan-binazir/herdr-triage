@@ -82,6 +82,30 @@ pub struct Workspace {
     pub tab_count: usize,
     #[serde(default)]
     pub pane_count: usize,
+    #[serde(default)]
+    pub worktree: Option<WorkspaceWorktree>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct WorkspaceWorktree {
+    #[serde(default)]
+    pub repo_name: Option<String>,
+    #[serde(default)]
+    pub is_linked_worktree: bool,
+}
+
+impl Workspace {
+    /// The workspace's label, led by its repository's name when it is a linked worktree whose
+    /// label does not already say which project it belongs to.
+    pub fn project_label(&self) -> String {
+        match &self.worktree {
+            Some(WorkspaceWorktree {
+                repo_name: Some(repo),
+                is_linked_worktree: true,
+            }) if !self.label.starts_with(repo.as_str()) => format!("{repo}/{}", self.label),
+            _ => self.label.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]

@@ -476,7 +476,7 @@ fn observe(agent: &Agent, workspaces: &[Workspace]) -> Observed {
                 .or_else(|| agent.agent.clone()),
             cwd: agent.cwd.clone(),
             workspace_id: Some(agent.workspace_id.clone()),
-            workspace_label: workspace.map(|w| w.label.clone()),
+            workspace_label: workspace.map(Workspace::project_label),
             session: session.map(|s| SessionRef {
                 source: s.source.clone(),
                 kind: s.kind.clone(),
@@ -656,11 +656,12 @@ fn location(agent: &Agent, workspaces: &[Workspace], tabs: &[Tab]) -> String {
         return "-".into();
     };
     let tab = tabs.iter().find(|t| t.tab_id == agent.tab_id);
+    let project = workspace.project_label();
     match tab {
         Some(tab) if workspace.tab_count > 1 || tab.label != tab.number.to_string() => {
-            format!("{} · {}", workspace.label, tab.label)
+            format!("{project} · {}", tab.label)
         }
-        _ => workspace.label.clone(),
+        _ => project,
     }
 }
 
@@ -838,6 +839,50 @@ mod tests {
         assert!(
             renames().is_empty(),
             "undoing the title keeps a name given in Herdr since"
+        );
+    }
+
+    #[test]
+    fn a_linked_worktree_shows_which_project_it_belongs_to() {
+        let fake = FakeHerdr::start(vec![
+            fake_herdr::agent("w1:p1", "idle", 3),
+            fake_herdr::agent("w2:p1", "idle", 4),
+            fake_herdr::agent("w3:p1", "idle", 5),
+        ]);
+        {
+            let mut agents = fake.agents.lock().unwrap();
+            agents[1]["workspace_id"] = json!("w2");
+            agents[2]["workspace_id"] = json!("w3");
+        }
+        let worktree = |linked| json!({"repo_name": "acme-api", "is_linked_worktree": linked});
+        *fake.workspaces.lock().unwrap() = vec![
+            json!({"workspace_id": "w1", "label": "acme-api", "tab_count": 1, "pane_count": 2,
+                   "worktree": worktree(false)}),
+            json!({"workspace_id": "w2", "label": "auth-fix", "tab_count": 1, "pane_count": 2,
+                   "worktree": worktree(true)}),
+            json!({"workspace_id": "w3", "label": "acme-api-perf", "tab_count": 1, "pane_count": 2,
+                   "worktree": worktree(true)}),
+        ];
+        let (mut session, _) = connect(&fake);
+        let view = session.view().unwrap();
+        let mut locations: Vec<&str> = view.items.iter().map(|i| i.location.as_str()).collect();
+        locations.sort_unstable();
+        assert_eq!(
+            locations,
+            ["acme-api", "acme-api-perf", "acme-api/auth-fix"]
+        );
+        let stored = store(&fake)
+            .transact(|state| {
+                state.records["terminal:t-w2:p1"]
+                    .thread
+                    .workspace_label
+                    .clone()
+            })
+            .unwrap();
+        assert_eq!(
+            stored.as_deref(),
+            Some("acme-api/auth-fix"),
+            "a closed thread keeps it"
         );
     }
 

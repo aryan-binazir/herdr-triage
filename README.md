@@ -72,7 +72,9 @@ rows = [
 | `q` | close (cancels an open prompt) | typed |
 | `^u` / `^w` | — | clear / delete word |
 
-The picker opens on the agent you invoked it from. Agents busy working (unless pinned) collect in a
+The picker opens on the agent you invoked it from. The Workspace column names each thread's project:
+a Herdr worktree workspace leads with its repository (`acme-api/auth-fix`), a T3 thread shows its T3
+project. Agents busy working (unless pinned) collect in a
 `▸ working · N` section below the threads that need you; snoozed and settled threads collect in
 `▸ snoozed · N` and `▸ settled · N` sections at the bottom. Sections stay collapsed until you open
 them, and the picker remembers which are open. A search looks inside them too. After you settle or
