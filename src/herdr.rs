@@ -86,16 +86,12 @@ pub struct Workspace {
     pub pane_count: usize,
     #[serde(default)]
     pub worktree: Option<WorkspaceWorktree>,
-    #[serde(default)]
-    pub focused: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct WorkspaceWorktree {
     #[serde(default)]
     pub repo_name: Option<String>,
-    #[serde(default)]
-    pub repo_root: Option<String>,
     #[serde(default)]
     pub is_linked_worktree: bool,
 }
@@ -283,19 +279,20 @@ impl Herdr {
             .ok_or_else(|| io::Error::other("tab.create returned no pane"))
     }
 
-    /// Creates a worktree on `branch` of the repository `from` names (the current workspace's if
-    /// `None`), opens it as a focused workspace, and returns its first pane.
-    pub fn create_worktree(
-        &mut self,
-        from: Option<WorktreeSource<'_>>,
-        branch: &str,
-    ) -> io::Result<String> {
-        let mut params = json!({"branch": branch, "focus": true});
-        match from {
-            Some(WorktreeSource::Workspace(id)) => params["workspace_id"] = id.into(),
-            Some(WorktreeSource::Checkout(dir)) => params["cwd"] = dir.into(),
-            None => {}
-        }
+    /// The root of the repository `workspace_id` (the current workspace if `None`) belongs to.
+    pub fn repository_root(&mut self, workspace_id: Option<&str>) -> io::Result<String> {
+        let params = workspace_id.map_or_else(|| json!({}), |id| json!({"workspace_id": id}));
+        let result = self.call("worktree.list", &params)?;
+        result["source"]["repo_root"]
+            .as_str()
+            .map(str::to_owned)
+            .ok_or_else(|| io::Error::other("worktree.list returned no repository"))
+    }
+
+    /// Creates a worktree on `branch` of the repository at `root`, opens it as a focused
+    /// workspace, and returns its first pane.
+    pub fn create_worktree(&mut self, root: &str, branch: &str) -> io::Result<String> {
+        let params = json!({"cwd": root, "branch": branch, "focus": true});
         let result = self.call_within("worktree.create", &params, WORKTREE_TIMEOUT)?;
         result["root_pane"]["pane_id"]
             .as_str()
@@ -317,13 +314,6 @@ impl Herdr {
             json!({"plugin_id": plugin_id(), "entrypoint": "picker", "focus": true, "env": env});
         self.call("plugin.pane.open", &params).map(drop)
     }
-}
-
-/// Where a new worktree branches from: a workspace, or a checkout of the repository.
-#[derive(Debug, Clone, Copy)]
-pub enum WorktreeSource<'a> {
-    Workspace(&'a str),
-    Checkout(&'a str),
 }
 
 pub fn plugin_id() -> String {

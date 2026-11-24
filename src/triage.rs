@@ -479,6 +479,10 @@ pub struct Launch<'a> {
 }
 
 impl ReopenPlan {
+    pub fn key(&self) -> &str {
+        &self.key
+    }
+
     pub fn launch<'a>(&'a self, generation: &str, workspaces: &[&str]) -> Launch<'a> {
         let focus = self
             .pending_pane
@@ -954,14 +958,22 @@ impl State {
         }
     }
 
-    /// A close of a settle that landed failed: ask for it again at the next sync.
-    pub fn retry_close(&mut self, close: &Close) {
-        if let Some(record) = self.records.get_mut(&close.key)
-            && record.live
-            && record.park == Some(Park::Settled)
+    /// A thread marked unread while another agent has focus is already left: going to it reads
+    /// it.
+    pub fn mark_left_if_elsewhere(&mut self, key: &str, agents: &[Observed]) {
+        let elsewhere = agents.iter().any(|agent| agent.focused && agent.key != key);
+        if let Some(record) = self.records.get_mut(key)
+            && record.unread == Some(Unread::Manual)
+            && elsewhere
         {
-            record.settle_requested = Some(close.terminal_id.clone());
+            record.unread = Some(Unread::Left);
         }
+    }
+
+    pub fn is_live(&self, plan: &ReopenPlan) -> bool {
+        self.records
+            .get(&plan.key)
+            .is_some_and(|record| record.live)
     }
 
     /// The pane a reopen of `plan`'s thread launched moments ago on this server, if one did since
@@ -1007,7 +1019,9 @@ impl State {
         let quiet_since_action = pane.terminal_id == close.terminal_id
             && !matches!(pane.status, Status::Working | Status::Blocked)
             && (resumable || pane.status != Status::Unknown)
-            && (pane.seq == close.seq || restoring);
+            // A close you confirmed for one turn must not take a later one, even while Herdr
+            // relaunches restored agents.
+            && (pane.seq == close.seq || (restoring && resumable));
         if !quiet_since_action {
             return Ok(Closing::Skip);
         }
@@ -2674,19 +2688,39 @@ mod tests {
     }
 
     #[test]
-    fn a_failed_close_of_a_landed_settle_is_tried_again() {
-        let working = resumable("a", Status::Working, 4);
+    fn a_confirmed_close_for_good_is_not_waived_through_restore_grace() {
+        let idle = agent("terminal:t1", Status::Idle, 2);
         let mut state = State::default();
-        state.reconcile(GEN, std::slice::from_ref(&working), NOW);
-        act(&mut state, &working, Action::ToggleSettle).unwrap();
-        let idle = resumable("a", Status::Idle, 5);
-        let close = state
-            .reconcile(GEN, std::slice::from_ref(&idle), NOW + 1)
-            .closes
-            .remove(0);
-        state.retry_close(&close);
-        let again = state.reconcile(GEN, std::slice::from_ref(&idle), NOW + 2);
-        assert_eq!(again.closes.len(), 1);
+        state.reconcile(GEN, std::slice::from_ref(&idle), NOW);
+        state.records.get_mut(&idle.key).unwrap().restored_at = Some(NOW);
+        let close = intended_close(&mut state, &idle, Action::CloseForGood { seq: 2 });
+        let newer = Observed {
+            seq: 3,
+            ..idle.clone()
+        };
+        assert_eq!(
+            confirm(&mut state, &close, &[newer], GEN, NOW + 1),
+            Closing::Skip
+        );
+    }
+
+    #[test]
+    fn marking_unread_while_another_agent_has_focus_reads_it_on_the_next_visit() {
+        let a = agent("a", Status::Idle, 4);
+        let b = Observed {
+            focused: true,
+            ..agent("b", Status::Idle, 7)
+        };
+        let mut state = State::default();
+        state.reconcile(GEN, &[a.clone(), b.clone()], NOW);
+        act(&mut state, &a, Action::ToggleUnread).unwrap();
+        state.mark_left_if_elsewhere("a", &[a.clone(), b.clone()]);
+        let focused_a = Observed {
+            focused: true,
+            ..a.clone()
+        };
+        state.reconcile(GEN, &[focused_a, agent("b", Status::Idle, 7)], NOW + 1);
+        assert_eq!(shown(&state, &a), (Display::Idle, None));
     }
 
     #[test]

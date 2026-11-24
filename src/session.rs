@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use chrono::Local;
 use serde_json::{Map, Value};
 
-use crate::herdr::{Agent, Herdr, Tab, Workspace, WorkspaceWorktree, WorktreeSource};
+use crate::herdr::{Agent, Herdr, Tab, Workspace};
 use crate::picker::{Item, NewAgent, Target};
 use crate::store::Store;
 use crate::triage::{
@@ -162,6 +162,7 @@ impl Session {
             let key = current_key(observed, key);
             let agent = observed.iter().find(|agent| agent.key == key);
             let after = state.apply(key, agent, action, now)?;
+            state.mark_left_if_elsewhere(key, observed);
             Ok((key.to_owned(), after))
         })
     }
@@ -182,17 +183,11 @@ impl Session {
             .iter()
             .find(|w| agent.workspace_id.as_deref() == Some(w.workspace_id.as_str()));
         let pane = if let Some(branch) = &agent.branch {
-            // Herdr branches new worktrees from the repository, not from another worktree.
-            let source = workspace.or_else(|| workspaces.iter().find(|w| w.focused));
-            let from = source.map(|w| match &w.worktree {
-                Some(WorkspaceWorktree {
-                    is_linked_worktree: true,
-                    repo_root: Some(root),
-                    ..
-                }) => WorktreeSource::Checkout(root),
-                _ => WorktreeSource::Workspace(&w.workspace_id),
-            });
-            self.herdr.create_worktree(from, branch)?
+            // Herdr branches a new worktree from the repository's own checkout, never from a
+            // linked worktree, and knows which that is for any workspace.
+            let id = workspace.map(|w| w.workspace_id.as_str());
+            let repository = self.herdr.repository_root(id)?;
+            self.herdr.create_worktree(&repository, branch)?
         } else {
             // A gone workspace's directory may belong to another project than the current one.
             let cwd =
@@ -200,11 +195,7 @@ impl Session {
             let id = workspace.map(|w| w.workspace_id.as_str());
             self.herdr.create_tab(id, cwd)?
         };
-        let started = self.herdr.run_command(&pane, agent.command);
-        if started.is_err() {
-            let _ = self.herdr.close_pane(&pane);
-        }
-        started
+        self.herdr.run_command(&pane, agent.command)
     }
 
     pub fn notify(&mut self, title: &str) -> io::Result<()> {
@@ -293,8 +284,10 @@ impl Session {
             let _ = self.herdr.notify(&title);
         }
         for close in &reconciled.closes {
-            if self.close_session(close).is_err() {
-                let _ = self.locked(|_, state| state.retry_close(close));
+            if let Err(error) = self.close_session(close) {
+                let _ = self
+                    .herdr
+                    .notify(&format!("A settled agent's pane didn't close: {error}"));
             }
         }
         Ok(Some(synced.map(|(snapshot, edited)| {
@@ -393,12 +386,18 @@ impl Session {
         self.locked(|held, state| {
             let now = held.now();
             let herdr = &mut *held.herdr;
-            // Another process may have launched it since the plan was made.
+            // Another process may have launched it since the plan was made, and Herdr may even
+            // have registered it already.
             if let Some(pane) = state.launched_reopen(plan, &herdr.server_generation(), now)
                 && Some(pane.as_str()) != launch.focus
                 && herdr.focus_pane(&pane).is_ok()
             {
                 return Ok(());
+            }
+            if state.is_live(plan)
+                && let Some(agent) = herdr.agents()?.iter().find(|a| a.key() == plan.key())
+            {
+                return herdr.focus(&agent.pane_id);
             }
             let pane = herdr.create_tab(launch.workspace, cwd)?;
             let launched = match launch.session_to_report {
@@ -1575,9 +1574,10 @@ mod tests {
             .start_agent(&agent(Some("fix/flaky"), Some(cwd)))
             .unwrap();
         assert!(fake.take("tab.create").is_empty());
+        assert_eq!(fake.take("worktree.list")[0], json!({"workspace_id": "w1"}));
         assert_eq!(
             fake.take("worktree.create")[0],
-            json!({"workspace_id": "w1", "branch": "fix/flaky", "focus": true})
+            json!({"cwd": "/work/acme-api", "branch": "fix/flaky", "focus": true})
         );
         assert_eq!(fake.take("pane.send_input")[0]["pane_id"], "w9:p1");
     }
@@ -1685,48 +1685,62 @@ mod tests {
             json!({"cwd": "/work/acme-api", "branch": "fix/x", "focus": true}),
             "a worktree starts from its repository, not from another worktree"
         );
+        assert_eq!(fake.take("worktree.list")[0], json!({"workspace_id": "w2"}));
         session
             .start_agent(&agent("w-gone", Some("fix/y")))
             .unwrap();
         assert_eq!(
+            fake.take("worktree.list"),
+            [json!({})],
+            "a gone workspace: the active one's repository"
+        );
+        assert_eq!(
             fake.take("worktree.create")[0],
-            json!({"branch": "fix/y", "focus": true})
+            json!({"cwd": "/work/acme-api", "branch": "fix/y", "focus": true})
         );
     }
 
     #[test]
-    fn a_new_agent_in_the_current_workspace_drops_stale_paths_and_never_leaves_a_blank_tab() {
+    fn a_new_agent_in_the_current_workspace_drops_a_gone_workspaces_directory() {
         let fake = FakeHerdr::start(vec![]);
-        {
-            let mut workspaces = fake.workspaces.lock().unwrap();
-            workspaces[0]["focused"] = json!(true);
-            workspaces[0]["worktree"] =
-                json!({"repo_root": "/work/acme-api", "is_linked_worktree": true});
-        }
         let (mut session, _) = connect(&fake);
         let dir = tempfile::tempdir().unwrap();
-        let gone = |branch: Option<&str>| NewAgent {
+        let gone = NewAgent {
             workspace_id: Some("w-gone".into()),
             cwd: Some(dir.path().to_str().unwrap().to_owned()),
-            branch: branch.map(str::to_owned),
+            branch: None,
             command: "claude",
         };
-        session.start_agent(&gone(None)).unwrap();
+        session.start_agent(&gone).unwrap();
         assert_eq!(
             fake.take("tab.create")[0],
             json!({"workspace_id": null, "cwd": null, "focus": true}),
             "the gone workspace's directory may be another project's"
         );
-        session.start_agent(&gone(Some("fix/z"))).unwrap();
-        assert_eq!(
-            fake.take("worktree.create")[0],
-            json!({"cwd": "/work/acme-api", "branch": "fix/z", "focus": true}),
-            "the focused workspace is a linked worktree: branch from its repository"
-        );
+    }
 
-        *fake.fail_method.lock().unwrap() = Some("pane.send_input".into());
-        assert!(session.start_agent(&gone(None)).is_err());
-        assert_eq!(fake.take("pane.close"), [json!({"pane_id": "w1:p92"})]);
+    #[test]
+    fn a_settled_agent_whose_pane_will_not_close_says_so() {
+        let fake = FakeHerdr::start(vec![
+            resumable_agent("w1:p1", "working", 3),
+            resumable_agent("w1:p2", "idle", 4),
+        ]);
+        let (mut session, _) = connect(&fake);
+        session.act(KEY, Action::ToggleSettle).unwrap();
+        {
+            let mut agents = fake.agents.lock().unwrap();
+            agents[0]["agent_status"] = json!("idle");
+            agents[0]["state_change_seq"] = json!(9);
+        }
+        *fake.fail_method.lock().unwrap() = Some("pane.close".into());
+        session.sync().unwrap();
+        let notices = fake.take("notification.show");
+        assert!(
+            notices.iter().any(|n| n["title"]
+                .as_str()
+                .is_some_and(|t| t.starts_with("A settled agent's pane didn't close"))),
+            "{notices:?}"
+        );
     }
 
     #[test]

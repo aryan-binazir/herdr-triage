@@ -91,6 +91,7 @@ impl FakeHerdr {
                         opened += 1;
                         created_tab(params, opened)
                     }
+                    "worktree.list" => worktree_source(&workspaces.lock().unwrap(), params),
                     "worktree.create" => {
                         json!({"type": "worktree_created", "root_pane": {"pane_id": "w9:p1"}})
                     }
@@ -200,6 +201,22 @@ fn created_tab(params: &Value, opened: usize) -> Value {
     json!({"type": "tab_created",
            "tab": {"tab_id": format!("{workspace}:t9{opened}"), "workspace_id": workspace},
            "root_pane": {"pane_id": format!("{workspace}:p9{opened}")}})
+}
+
+/// The repository a workspace (or the first, standing in for the active one) belongs to:
+/// its worktree's `repo_root`, else `/work/<label>`.
+fn worktree_source(workspaces: &[Value], params: &Value) -> Value {
+    let workspace = workspaces
+        .iter()
+        .find(|w| w["workspace_id"] == params["workspace_id"])
+        .or_else(|| workspaces.first());
+    let root = workspace.map_or_else(String::new, |w| {
+        w["worktree"]["repo_root"].as_str().map_or_else(
+            || format!("/work/{}", w["label"].as_str().unwrap_or("")),
+            str::to_owned,
+        )
+    });
+    json!({"type": "worktree_list", "source": {"repo_root": root}, "worktrees": []})
 }
 
 fn close_pane(agents: &mut Vec<Value>, workspaces: &Mutex<Vec<Value>>, params: &Value) {
