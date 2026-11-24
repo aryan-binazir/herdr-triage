@@ -9,7 +9,7 @@ use ratatui::widgets::{
 };
 
 use crate::picker::{Item, ListRow, Mode, Picker, Target};
-use crate::triage::{Action, Attention, Display, Section, Unread};
+use crate::triage::{Action, Attention, Display, Section};
 
 const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const HIGHLIGHT: &str = "▎ ";
@@ -450,7 +450,7 @@ fn row<'a>(
         Display::Working => Style::new().yellow(),
         Display::Blocked => Style::new().red(),
         Display::Done => Style::new().cyan(),
-        Display::Unread(Unread::Manual | Unread::Woke) => Style::new().cyan().bold(),
+        Display::Unread(_) => Style::new().cyan().bold(),
         Display::Idle | Display::Unknown => Style::new().dim(),
     };
     let row_cells = [

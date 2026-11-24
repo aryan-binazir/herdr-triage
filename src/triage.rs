@@ -106,6 +106,8 @@ pub enum Section {
 #[serde(rename_all = "snake_case")]
 pub enum Unread {
     Manual,
+    /// Marked unread, and you have since been on another agent: coming back to it reads it.
+    Left,
     Woke,
 }
 
@@ -468,7 +470,7 @@ impl Row {
         Tz::Offset: std::fmt::Display,
     {
         let triage = self.park_text(now, tz).or(match self.display {
-            Display::Unread(Unread::Manual) => Some("unread".into()),
+            Display::Unread(Unread::Manual | Unread::Left) => Some("unread".into()),
             Display::Unread(Unread::Woke) => Some("woke".into()),
             _ => None,
         });
@@ -496,7 +498,7 @@ impl Row {
                 Display::Blocked => "blocked",
                 Display::Working => "working",
                 Display::Done => "done",
-                Display::Unread(Unread::Manual) => return "unread".into(),
+                Display::Unread(Unread::Manual | Unread::Left) => return "unread".into(),
                 Display::Unread(Unread::Woke) => return "woke".into(),
                 Display::Idle => "idle",
                 Display::Unknown => "unknown",
@@ -703,8 +705,16 @@ impl State {
                 record.park = None;
                 record.unread = Some(Unread::Woke);
             }
-            if agent.focused && record.unread == Some(Unread::Woke) {
-                record.unread = None;
+            match record.unread {
+                Some(Unread::Woke) if agent.focused => record.unread = None,
+                Some(Unread::Left) if agent.focused => {
+                    record.unread = None;
+                    record.ack_seq = Some(agent.seq);
+                }
+                Some(Unread::Manual) if !agent.focused && agents.iter().any(|a| a.focused) => {
+                    record.unread = Some(Unread::Left);
+                }
+                _ => {}
             }
             if now.saturating_sub(record.touched_at) >= LIVE_TOUCH_INTERVAL_SECS {
                 record.touch(now);
@@ -1029,6 +1039,10 @@ impl State {
             if live {
                 Ok(After::Nothing)
             } else {
+                // Reopening a thread is going to read it.
+                if record.unread == Some(Unread::Manual) {
+                    record.unread = Some(Unread::Left);
+                }
                 reopen_plan(key, record, now)
             }
         };
@@ -1610,6 +1624,44 @@ mod tests {
             shown(&state, &done),
             (Display::Unread(Unread::Manual), None)
         );
+    }
+
+    #[test]
+    fn coming_back_to_an_agent_marked_unread_reads_it() {
+        let a = agent("a", Status::Idle, 4);
+        let b = agent("b", Status::Idle, 7);
+        let focus = |agent: &Observed, focused| Observed {
+            focused,
+            ..agent.clone()
+        };
+        let mut state = State::default();
+        state.reconcile(GEN, &[focus(&a, true), b.clone()], NOW);
+        act(&mut state, &a, Action::ToggleUnread).unwrap();
+        let unread = (Display::Unread(Unread::Manual), None);
+
+        state.reconcile(GEN, &[focus(&a, true), b.clone()], NOW + 1);
+        assert_eq!(shown(&state, &a), unread, "still on it after marking it");
+        state.reconcile(GEN, &[a.clone(), b.clone()], NOW + 2);
+        state.reconcile(GEN, &[focus(&a, true), b.clone()], NOW + 3);
+        assert_eq!(
+            shown(&state, &a),
+            unread,
+            "the picker had focus, not another agent"
+        );
+
+        state.reconcile(GEN, &[a.clone(), focus(&b, true)], NOW + 4);
+        assert_eq!(
+            shown(&state, &a),
+            (Display::Unread(Unread::Left), None),
+            "away on another agent"
+        );
+        assert_eq!(
+            state.ordered(std::slice::from_ref(&a))[0].status_text(NOW + 4),
+            "unread",
+            "it still reads as unread"
+        );
+        state.reconcile(GEN, &[focus(&a, true), b.clone()], NOW + 5);
+        assert_eq!(shown(&state, &a), (Display::Idle, None), "came back to it");
     }
 
     #[test]

@@ -262,6 +262,7 @@ fn load(tx: &Transaction) -> rusqlite::Result<State> {
             park,
             unread: match row.get::<_, Option<String>>(4)?.as_deref() {
                 Some("manual") => Some(Unread::Manual),
+                Some("left") => Some(Unread::Left),
                 Some("woke") => Some(Unread::Woke),
                 _ => None,
             },
@@ -354,6 +355,7 @@ fn save(tx: &Transaction, state: &State, before: &State) -> rusqlite::Result<()>
         };
         let unread = r.unread.map(|unread| match unread {
             Unread::Manual => "manual",
+            Unread::Left => "left",
             Unread::Woke => "woke",
         });
         let session = r.thread.session.as_ref();
@@ -462,6 +464,7 @@ mod tests {
             };
             let unread = r.unread.map(|unread| match unread {
                 Unread::Manual => "manual",
+                Unread::Left => "left",
                 Unread::Woke => "woke",
             });
             let session = r.thread.session.as_ref();
@@ -568,7 +571,7 @@ mod tests {
                 .pragma_query_value(None, "user_version", |r| r.get::<_, i32>(0))
                 .unwrap()
         };
-        assert_eq!(version(), 5);
+        assert_eq!(version(), SCHEMA_VERSION);
         observer.pragma_update(None, "user_version", 99).unwrap();
         store.transact(|_| ()).unwrap();
         assert_eq!(version(), 99);

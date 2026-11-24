@@ -113,8 +113,9 @@ and refused. A time that has passed while the prompt was open is refused too:
   Herdr accepting the launch command does not guarantee that the application starts successfully;
   application errors remain visible in the new tab.
 - **Unread** (`u`) on a done or unread thread marks it read without visiting it; on any other it marks
-  it unread until you press `u` again or the agent's next turn. Marking a parked thread unread brings
-  it back without reopening it.
+  it unread until you press `u` again, the agent's next turn, or you read it: go to another agent and
+  come back to it, or reopen it if it was closed. Marking a parked thread unread brings it back
+  without reopening it.
 - A thread whose session ends some other way settles as closed, even if you hadn't seen its result,
   unless you marked it unread or a snooze woke it: then it stays open as `unread · closed` or
   `woke · closed`. Settle and unread are refused while an agent is working or blocked;
