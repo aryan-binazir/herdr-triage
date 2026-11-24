@@ -584,7 +584,9 @@ impl SnoozePreset {
     }
 }
 
-pub fn snooze_presets<Tz: TimeZone>(now: i64, tz: &Tz) -> Vec<SnoozePreset> {
+/// Every preset in a fixed order, so each keeps its digit, paired with whether it is offered:
+/// `today 18:00` is offered until half an hour before.
+pub fn snooze_presets<Tz: TimeZone>(now: i64, tz: &Tz) -> Vec<(SnoozePreset, bool)> {
     let evening_is_half_an_hour_away = SnoozePreset::ThisEvening.until(now, tz) - now >= 1_800;
     [
         SnoozePreset::OneHour,
@@ -594,7 +596,10 @@ pub fn snooze_presets<Tz: TimeZone>(now: i64, tz: &Tz) -> Vec<SnoozePreset> {
         SnoozePreset::NextWeek,
     ]
     .into_iter()
-    .filter(|preset| *preset != SnoozePreset::ThisEvening || evening_is_half_an_hour_away)
+    .map(|preset| {
+        let offered = preset != SnoozePreset::ThisEvening || evening_is_half_an_hour_away;
+        (preset, offered)
+    })
     .collect()
 }
 
@@ -1755,7 +1760,8 @@ mod tests {
         let labels = |now| -> Vec<&str> {
             snooze_presets(now, &tz())
                 .iter()
-                .map(|p| p.label())
+                .filter(|(_, offered)| *offered)
+                .map(|(p, _)| p.label())
                 .collect()
         };
         assert_eq!(
@@ -1770,7 +1776,7 @@ mod tests {
         );
         let untils: Vec<i64> = snooze_presets(ONE_PM, &tz())
             .iter()
-            .map(|p| p.until(ONE_PM, &tz()))
+            .map(|(p, _)| p.until(ONE_PM, &tz()))
             .collect();
         assert_eq!(
             untils,

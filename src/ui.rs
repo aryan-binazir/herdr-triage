@@ -642,11 +642,14 @@ fn prompt_line(picker: &Picker, width: usize) -> Option<(Line<'static>, Option<u
             .presets
             .iter()
             .enumerate()
-            .flat_map(|(i, preset)| {
-                [
-                    Span::raw(format!("  {}", i + 1)),
-                    Span::from(format!(" {}", preset.label())).dim(),
-                ]
+            .flat_map(|(i, &(preset, offered))| {
+                let digit = Span::raw(format!("  {}", i + 1));
+                let label = Span::from(format!(" {}", preset.label())).dim();
+                if offered {
+                    [digit, label]
+                } else {
+                    [digit.dim().crossed_out(), label.crossed_out()]
+                }
             })
             .collect();
         let verb = Span::from("snooze").yellow().bold();
@@ -870,6 +873,26 @@ mod tests {
                 "snooze “fix flaky test”  1 1h  2 3h  3 today 18:00  4 tomorrow 09:00  5 next Mon 09:00  esc cancel"
             )
         );
+    }
+
+    #[test]
+    fn an_evening_preset_too_close_to_offer_stays_in_place_crossed_out() {
+        let mut picker = picker();
+        let evening = NOW + 4 * 3_600 + 40 * 60;
+        picker.key(
+            KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE),
+            evening,
+            &chrono::Utc,
+        );
+        let (lines, buffer) = render(&mut picker, 120, 14);
+        assert!(lines[13].contains("3 today 18:00  4 tomorrow 09:00"), "{}", lines[13]);
+        let x = |text: &str| {
+            let byte = lines[13].find(text).unwrap();
+            u16::try_from(lines[13][..byte].chars().count()).unwrap()
+        };
+        let crossed = |x| buffer[(x, 13)].modifier.contains(Modifier::CROSSED_OUT);
+        assert!(crossed(x("today")) && crossed(x("3 today")));
+        assert!(!crossed(x("tomorrow")) && !crossed(x("4 tomorrow")));
     }
 
     #[test]

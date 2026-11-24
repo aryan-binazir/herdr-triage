@@ -75,7 +75,8 @@ pub struct SnoozePrompt {
     pub key: String,
     t3_thread: Option<String>,
     pub label: String,
-    pub presets: Vec<SnoozePreset>,
+    /// Each preset and whether it was offered when the prompt opened.
+    pub presets: Vec<(SnoozePreset, bool)>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -217,27 +218,27 @@ impl Picker {
                     key: prompt.key,
                     action: Action::Forget,
                 },
-                KeyCode::Char('q') => Effect::Close,
                 _ => Effect::None,
             };
         }
         if let Some(prompt) = &self.snooze {
             let choice = match key.code {
                 KeyCode::Char(c @ '1'..='9') => c as usize - '1' as usize,
-                KeyCode::Char('q') => return Effect::Close,
-                KeyCode::Esc => {
+                KeyCode::Esc | KeyCode::Char('q') => {
                     self.snooze = None;
                     return Effect::None;
                 }
                 _ => return Effect::None,
             };
-            let Some(until) = prompt
-                .presets
-                .get(choice)
-                .map(|preset| preset.until(now, tz))
-            else {
+            let Some(&(preset, offered)) = prompt.presets.get(choice) else {
                 return Effect::None;
             };
+            let until = preset.until(now, tz);
+            if !offered || until <= now {
+                self.snooze = None;
+                self.notify(format!("{} is too soon", preset.label()));
+                return Effect::None;
+            }
             let effect = match &prompt.t3_thread {
                 Some(thread) => Effect::T3 {
                     thread: thread.clone(),
@@ -948,7 +949,7 @@ mod tests {
             &chrono::Utc,
         );
         let presets = &picker.snooze_prompt().unwrap().presets;
-        assert_eq!(presets[2].label(), "today 18:00");
+        assert_eq!(presets[2].0.label(), "today 18:00");
         let confirm = KeyEvent::new(KeyCode::Char('3'), KeyModifiers::NONE);
         let confirmed_at = shown_at + 20 * 60;
         assert_eq!(
@@ -961,12 +962,45 @@ mod tests {
     }
 
     #[test]
-    fn escape_cancels_the_snooze_prompt() {
+    fn snooze_digits_keep_their_preset_after_the_evening_one_is_gone() {
+        let evening = NOW + 4 * 3_600 + 40 * 60;
         let mut picker = Picker::new(items(), Some("p2"), &closed_sections());
-        press(&mut picker, KeyCode::Char('z'));
-        assert_eq!(press(&mut picker, KeyCode::Esc), Effect::None);
+        let key = |c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE);
+        picker.key(key('z'), evening, &chrono::Utc);
+        assert_eq!(
+            picker.key(key('4'), evening, &chrono::Utc),
+            Effect::Apply {
+                key: "k-p2".into(),
+                action: Action::Snooze(NOW + 20 * 3_600)
+            },
+            "4 is still tomorrow 09:00"
+        );
+        picker.key(key('z'), evening, &chrono::Utc);
+        assert_eq!(picker.key(key('3'), evening, &chrono::Utc), Effect::None);
         assert!(picker.snooze_prompt().is_none());
-        assert_eq!(press(&mut picker, KeyCode::Esc), Effect::Close);
+        assert_eq!(picker.message(), Some("today 18:00 is too soon"));
+    }
+
+    #[test]
+    fn a_snooze_prompt_left_open_past_its_time_does_not_snooze_into_the_past() {
+        let shown_at = NOW + 4 * 3_600;
+        let mut picker = Picker::new(items(), Some("p2"), &closed_sections());
+        let key = |c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE);
+        picker.key(key('z'), shown_at, &chrono::Utc);
+        let past_six = NOW + 5 * 3_600 + 60;
+        assert_eq!(picker.key(key('3'), past_six, &chrono::Utc), Effect::None);
+        assert_eq!(picker.message(), Some("today 18:00 is too soon"));
+    }
+
+    #[test]
+    fn escape_or_q_cancels_the_snooze_prompt() {
+        for cancel in [KeyCode::Esc, KeyCode::Char('q')] {
+            let mut picker = Picker::new(items(), Some("p2"), &closed_sections());
+            press(&mut picker, KeyCode::Char('z'));
+            assert_eq!(press(&mut picker, cancel), Effect::None);
+            assert!(picker.snooze_prompt().is_none());
+            assert_eq!(press(&mut picker, KeyCode::Esc), Effect::Close);
+        }
     }
 
     #[test]
@@ -1279,19 +1313,13 @@ mod tests {
     }
 
     #[test]
-    fn q_closes_the_picker_even_while_asking_to_forget() {
+    fn q_cancels_the_forget_prompt_and_keeps_the_picker_open() {
         let mut picker = Picker::new(with_closed(), None, &closed_sections());
         press(&mut picker, KeyCode::Char('j'));
         press(&mut picker, KeyCode::Char('D'));
         assert!(picker.forget_prompt().is_some());
-        assert_eq!(press(&mut picker, KeyCode::Char('q')), Effect::Close);
-    }
-
-    #[test]
-    fn q_closes_the_picker_from_the_snooze_prompt() {
-        let mut picker = Picker::new(items(), Some("p2"), &closed_sections());
-        press(&mut picker, KeyCode::Char('z'));
-        assert!(picker.snooze_prompt().is_some());
+        assert_eq!(press(&mut picker, KeyCode::Char('q')), Effect::None);
+        assert!(picker.forget_prompt().is_none());
         assert_eq!(press(&mut picker, KeyCode::Char('q')), Effect::Close);
     }
 
