@@ -88,10 +88,7 @@ impl FakeHerdr {
                         json!({"type": "ok"})
                     }
                     "pane.close" => {
-                        agents
-                            .lock()
-                            .unwrap()
-                            .retain(|a| a["pane_id"] != params["pane_id"]);
+                        close_pane(&mut agents.lock().unwrap(), &workspaces, params);
                         json!({"type": "ok"})
                     }
                     "tab.create" => {
@@ -207,6 +204,20 @@ fn created_tab(params: &Value, opened: usize) -> Value {
     json!({"type": "tab_created",
            "tab": {"tab_id": format!("{workspace}:t9{opened}"), "workspace_id": workspace},
            "root_pane": {"pane_id": format!("{workspace}:p9{opened}")}})
+}
+
+fn close_pane(agents: &mut Vec<Value>, workspaces: &Mutex<Vec<Value>>, params: &Value) {
+    let closed = agents.iter().find(|a| a["pane_id"] == params["pane_id"]);
+    if let Some(workspace) = closed.map(|a| a["workspace_id"].clone()) {
+        for w in workspaces.lock().unwrap().iter_mut() {
+            if w["workspace_id"] == workspace
+                && let Some(count) = w["pane_count"].as_u64()
+            {
+                w["pane_count"] = json!(count.saturating_sub(1));
+            }
+        }
+    }
+    agents.retain(|a| a["pane_id"] != params["pane_id"]);
 }
 
 fn rename(agents: &mut [Value], params: &Value) {

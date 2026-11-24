@@ -963,17 +963,21 @@ impl State {
         let resumable = record.resumable();
         let shown = look()?;
         let mut panes = shown.iter().filter(|agent| agent.key == close.key);
-        let quiet_since_action = match (panes.next(), panes.next()) {
-            (Some(pane), None) => {
-                pane.terminal_id == close.terminal_id
-                    && !matches!(pane.status, Status::Working | Status::Blocked)
-                    && (resumable || pane.status != Status::Unknown)
-                    && (pane.seq == close.seq || restoring)
-            }
-            _ => false,
+        let (Some(pane), None) = (panes.next(), panes.next()) else {
+            return Ok(Closing::Skip);
         };
+        let quiet_since_action = pane.terminal_id == close.terminal_id
+            && !matches!(pane.status, Status::Working | Status::Blocked)
+            && (resumable || pane.status != Status::Unknown)
+            && (pane.seq == close.seq || restoring);
         if !quiet_since_action {
             return Ok(Closing::Skip);
+        }
+        // Another close since the action may have left this the workspace's last pane.
+        if pane.workspace_panes <= 1 {
+            return Ok(Closing::KeepOpen(
+                "kept open: it is the last pane in its workspace".into(),
+            ));
         }
         // Closing the viewed pane can end the picker before it reports the close.
         if self

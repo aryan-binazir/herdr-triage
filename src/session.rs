@@ -206,9 +206,9 @@ impl Session {
         let outcome = match after {
             Err(Refusal(refusal)) => Ok(Outcome::Refused(refusal)),
             Ok((key, After::Nothing)) => Ok(done(key, None)),
-            Ok((key, After::ClosePane(close))) => self
-                .close_session(&snapshot, &close)
-                .map(|notice| done(key, notice)),
+            Ok((key, After::ClosePane(close))) => {
+                self.close_session(&close).map(|notice| done(key, notice))
+            }
             Ok((_, After::Reopen(plan))) => {
                 self.reopen(&snapshot, &plan).map(|()| Outcome::Reopened)
             }
@@ -265,10 +265,8 @@ impl Session {
         if let Some(title) = woke_notice(&reconciled.woke) {
             let _ = self.herdr.notify(&title);
         }
-        if let Ok((snapshot, _)) = &synced {
-            for close in &reconciled.closes {
-                let _ = self.close_session(snapshot, close);
-            }
+        for close in &reconciled.closes {
+            let _ = self.close_session(close);
         }
         Ok(Some(synced.map(|(snapshot, edited)| {
             let wake_failed = wake_failed.map(|error| error.to_string());
@@ -322,14 +320,15 @@ impl Session {
         Ok(Some((result, failure)))
     }
 
-    fn close_session(&mut self, snapshot: &Snapshot, close: &Close) -> io::Result<Option<String>> {
+    fn close_session(&mut self, close: &Close) -> io::Result<Option<String>> {
         let closing = self.locked(|held, state| {
             let generation = held.herdr.server_generation();
             state.confirm_close(close, &generation, held.now(), || {
                 let agents = held.herdr.agents()?;
+                let workspaces = held.herdr.workspaces()?;
                 Ok(agents
                     .iter()
-                    .map(|agent| observe(agent, &snapshot.workspaces))
+                    .map(|agent| observe(agent, &workspaces))
                     .collect())
             })
         })??;
@@ -768,6 +767,7 @@ mod tests {
             resumable_agent("w1:p2", "idle", 4),
             fake_herdr::agent("w1:p3", "working", 5),
         ]);
+        fake.workspaces.lock().unwrap()[0]["pane_count"] = json!(3);
         let (mut session, _) = connect(&fake);
         let (list, view_set, report) = ("agent.list", "agent.view.set", "pane.report_metadata");
         let read = [list, "workspace.list"];
@@ -777,7 +777,7 @@ mod tests {
         assert_eq!(methods(&fake), first_view);
 
         assert_eq!(session.act(KEY, Action::ToggleSettle).unwrap(), done(KEY));
-        let closing = [&read[..], &[report, view_set, list, "pane.close"]].concat();
+        let closing = [&read[..], &[report, view_set], &read[..], &["pane.close"]].concat();
         assert_eq!(methods(&fake), closing);
 
         let refused = session.act("terminal:t-w1:p3", Action::ToggleUnread);
@@ -1604,6 +1604,48 @@ mod tests {
             json!({"workspace_id": "w1", "branch": "fix/flaky", "focus": true})
         );
         assert_eq!(fake.take("pane.send_input")[0]["pane_id"], "w9:p1");
+    }
+
+    #[test]
+    fn settles_landing_together_never_close_the_last_pane_of_a_workspace() {
+        let fake = FakeHerdr::start(vec![
+            resumable_agent("w1:p1", "working", 3),
+            resumable_agent("w1:p2", "working", 4),
+        ]);
+        let (mut session, _) = connect(&fake);
+        session.act(KEY, Action::ToggleSettle).unwrap();
+        session
+            .act("session:claude:id:id-w1:p2", Action::ToggleSettle)
+            .unwrap();
+        for agent in fake.agents.lock().unwrap().iter_mut() {
+            agent["agent_status"] = json!("idle");
+            agent["state_change_seq"] = json!(9);
+        }
+        session.sync().unwrap();
+        assert_eq!(
+            fake.take("pane.close").len(),
+            1,
+            "the workspace keeps a pane"
+        );
+    }
+
+    #[test]
+    fn a_landed_settle_closes_its_pane_even_when_publishing_fails() {
+        let fake = FakeHerdr::start(vec![
+            resumable_agent("w1:p1", "working", 3),
+            resumable_agent("w1:p2", "idle", 4),
+        ]);
+        let (mut session, _) = connect(&fake);
+        session.act(KEY, Action::ToggleSettle).unwrap();
+        {
+            let mut agents = fake.agents.lock().unwrap();
+            agents[0]["agent_status"] = json!("idle");
+            agents[0]["state_change_seq"] = json!(9);
+        }
+        *fake.fail_method.lock().unwrap() = Some("pane.report_metadata".into());
+        assert!(session.sync().is_err());
+        *fake.fail_method.lock().unwrap() = None;
+        assert_eq!(fake.take("pane.close"), [json!({"pane_id": "w1:p1"})]);
     }
 
     #[test]
