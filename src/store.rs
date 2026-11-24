@@ -7,7 +7,7 @@ use rusqlite::{Connection, OptionalExtension, Transaction, params};
 
 use crate::triage::{Park, Record, Section, SessionRef, State, Status, Thread, Unread};
 
-const SCHEMA_VERSION: i32 = 6;
+const SCHEMA_VERSION: i32 = 7;
 
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS threads (
@@ -38,6 +38,7 @@ CREATE TABLE IF NOT EXISTS threads (
     reopen_generation TEXT,
     restored_at INTEGER,
     title TEXT,
+    launched_by TEXT,
     settle_requested TEXT
 );
 CREATE TABLE IF NOT EXISTS settings (name TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -46,10 +47,13 @@ CREATE TABLE IF NOT EXISTS settings (name TEXT PRIMARY KEY, value TEXT NOT NULL)
 pub fn state_root() -> PathBuf {
     std::env::var_os("HERDR_PLUGIN_STATE_DIR").map_or_else(
         || {
-            let state = std::env::var_os("XDG_STATE_HOME").map_or_else(
-                || PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".local/state"),
-                PathBuf::from,
-            );
+            // An empty or relative XDG_STATE_HOME counts as unset, as the XDG spec says.
+            let state = std::env::var_os("XDG_STATE_HOME")
+                .map(PathBuf::from)
+                .filter(|dir| dir.is_absolute())
+                .unwrap_or_else(|| {
+                    PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".local/state")
+                });
             state.join("herdr/plugins/ar.triage")
         },
         PathBuf::from,
@@ -218,11 +222,12 @@ impl std::fmt::Display for DatabaseError {
 
 impl std::error::Error for DatabaseError {}
 
-const LATER_COLUMNS: [(&str, &str); 5] = [
+const LATER_COLUMNS: [(&str, &str); 6] = [
     ("ended", "INTEGER NOT NULL DEFAULT 0"),
     ("reopen_generation", "TEXT"),
     ("restored_at", "INTEGER"),
     ("title", "TEXT"),
+    ("launched_by", "TEXT"),
     ("settle_requested", "TEXT"),
 ];
 
@@ -254,8 +259,8 @@ fn load(tx: &Transaction) -> rusqlite::Result<State> {
         "SELECT key, pinned, park, snooze_until, unread, ack_seq, generation, last_seq, \
          changed_at, touched_at, live, ended, missing_since, last_status, label, agent, cwd, \
          workspace_id, workspace_label, session_source, session_kind, session_value, \
-         reopen_pane, reopen_at, reopen_generation, restored_at, title, settle_requested \
-         FROM threads",
+         reopen_pane, reopen_at, reopen_generation, restored_at, title, launched_by, \
+         settle_requested FROM threads",
     )?;
     let rows = threads.query_map([], |row| {
         let park = match (row.get::<_, Option<String>>(2)?.as_deref(), row.get(3)?) {
@@ -304,7 +309,8 @@ fn load(tx: &Transaction) -> rusqlite::Result<State> {
             reopen_generation: row.get(24)?,
             restored_at: row.get(25)?,
             title: row.get(26)?,
-            settle_requested: row.get(27)?,
+            launched_by: row.get(27)?,
+            settle_requested: row.get(28)?,
         };
         Ok((row.get::<_, String>(0)?, record))
     })?;
@@ -356,9 +362,9 @@ fn save(tx: &Transaction, state: &State, before: &State) -> rusqlite::Result<()>
         "INSERT OR REPLACE INTO threads (key, pinned, park, snooze_until, unread, ack_seq, generation, \
          last_seq, changed_at, touched_at, live, ended, missing_since, last_status, label, agent, \
          cwd, workspace_id, workspace_label, session_source, session_kind, session_value, \
-         reopen_pane, reopen_at, reopen_generation, restored_at, title, settle_requested) VALUES (?1, ?2, ?3, \
-         ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, \
-         ?25, ?26, ?27, ?28)",
+         reopen_pane, reopen_at, reopen_generation, restored_at, title, launched_by, settle_requested) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, \
+         ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29)",
     )?;
     for (key, r) in &state.records {
         if before.records.get(key) == Some(r) {
@@ -403,6 +409,7 @@ fn save(tx: &Transaction, state: &State, before: &State) -> rusqlite::Result<()>
             r.reopen_generation,
             r.restored_at,
             r.title,
+            r.launched_by,
             r.settle_requested,
         ])?;
     }
@@ -470,9 +477,9 @@ mod tests {
             "INSERT INTO threads (key, pinned, park, snooze_until, unread, ack_seq, generation, \
              last_seq, changed_at, touched_at, live, ended, missing_since, last_status, label, agent, \
              cwd, workspace_id, workspace_label, session_source, session_kind, session_value, \
-             reopen_pane, reopen_at, reopen_generation, restored_at, title, settle_requested) VALUES (?1, ?2, \
-             ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, \
-             ?24, ?25, ?26, ?27, ?28)",
+             reopen_pane, reopen_at, reopen_generation, restored_at, title, launched_by, settle_requested) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, \
+             ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29)",
         )?;
         for (key, r) in &state.records {
             let (park, until) = match r.park {
@@ -514,6 +521,7 @@ mod tests {
                 r.reopen_generation,
                 r.restored_at,
                 r.title,
+                r.launched_by,
                 r.settle_requested,
             ])?;
         }
@@ -572,6 +580,7 @@ mod tests {
             reopen_generation: Some("g0".into()),
             restored_at: Some(1_300),
             title: Some("checkout flow".into()),
+            launched_by: Some("client:claude-code".into()),
             settle_requested: Some("term-7".into()),
         }
     }
