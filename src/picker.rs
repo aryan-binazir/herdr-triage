@@ -113,7 +113,7 @@ pub struct Picker {
     forget: Option<ForgetPrompt>,
     close: Option<ClosePrompt>,
     rename: Option<RenamePrompt>,
-    undoable: bool,
+    undo: Option<(&'static str, String)>,
     message: Option<String>,
     message_is_error: bool,
     offset: usize,
@@ -146,7 +146,7 @@ impl Picker {
             forget: None,
             close: None,
             rename: None,
-            undoable: false,
+            undo: None,
             message: None,
             message_is_error: false,
             offset: 0,
@@ -665,12 +665,15 @@ impl Picker {
         Effect::None
     }
 
-    pub fn set_undoable(&mut self, undoable: bool) {
-        self.undoable = undoable;
+    pub fn set_undo(&mut self, undo: Option<(&'static str, String)>) {
+        self.undo = undo;
     }
 
-    pub fn undoable(&self) -> bool {
-        self.undoable
+    /// What `U` would undo: its verb and thread, e.g. `settle` and `docs pass`.
+    pub fn undo(&self) -> Option<(&'static str, &str)> {
+        self.undo
+            .as_ref()
+            .map(|(verb, label)| (*verb, label.as_str()))
     }
 
     pub fn rename_prompt(&self) -> Option<&RenamePrompt> {

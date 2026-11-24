@@ -516,7 +516,9 @@ fn draw_empty(frame: &mut Frame, picker: &Picker, area: Rect) {
     frame.render_widget(Paragraph::new(text).alignment(Alignment::Center), rect);
 }
 
-fn hints(pairs: &[(&'static str, &'static str)]) -> Line<'static> {
+type Hint = (&'static str, Cow<'static, str>);
+
+fn hints(pairs: &[Hint]) -> Line<'static> {
     let mut spans = vec![Span::raw(" ")];
     for (i, (key, action)) in pairs.iter().enumerate() {
         if i > 0 {
@@ -529,11 +531,7 @@ fn hints(pairs: &[(&'static str, &'static str)]) -> Line<'static> {
 }
 
 /// Hints that fit `width`, dropping whole pairs in `droppable` order rather than cutting one.
-fn fitted_hints(
-    mut pairs: Vec<(&'static str, &'static str)>,
-    droppable: &[&str],
-    width: usize,
-) -> Line<'static> {
+fn fitted_hints(mut pairs: Vec<Hint>, droppable: &[&str], width: usize) -> Line<'static> {
     for key in droppable {
         if hints(&pairs).width() <= width {
             break;
@@ -696,6 +694,12 @@ fn footer_line(picker: &Picker, width: usize) -> (Line<'static>, Option<usize>) 
         return (Line::from(mark), None);
     }
     let mut pairs: Vec<(&str, &str)> = enter_hint(picker).into_iter().collect();
+    let owned = |pairs: Vec<(&'static str, &'static str)>| -> Vec<Hint> {
+        pairs
+            .into_iter()
+            .map(|(k, a)| (k, Cow::Borrowed(a)))
+            .collect()
+    };
     let line = match picker.mode() {
         Mode::Navigate => {
             pairs.extend([("j/k", "move"), ("/", "search")]);
@@ -733,15 +737,21 @@ fn footer_line(picker: &Picker, width: usize) -> (Line<'static>, Option<usize>) 
                     }
                 }
             }
-            if picker.undoable() {
-                pairs.push(("U", "undo"));
-            }
+            let undo_at = pairs.len();
             if picker.filter().is_empty() {
                 pairs.push(("esc/q", "close"));
             } else {
                 pairs.extend([("esc", "clear search"), ("q", "close")]);
             }
             pairs.push(("1-9/0", "open"));
+            let mut pairs = owned(pairs);
+            if let Some((verb, label)) = picker.undo() {
+                let label = ellipsize(label, MIN_LABEL * 3);
+                pairs.insert(undo_at, ("U", format!("undo {verb} “{label}”").into()));
+                if hints(&pairs).width() > width {
+                    pairs[undo_at].1 = Cow::Borrowed("undo");
+                }
+            }
             fitted_hints(pairs, &["1-9/0", "j/k", "/", "r", "p", "u", "U"], width)
         }
         Mode::Search => {
@@ -750,7 +760,7 @@ fn footer_line(picker: &Picker, width: usize) -> (Line<'static>, Option<usize>) 
                 pairs.push(("^j/^k", "move"));
             }
             pairs.extend([("^u", "clear"), ("^w", "delete word")]);
-            fitted_hints(pairs, &["^w", "^u", "^j/^k"], width)
+            fitted_hints(owned(pairs), &["^w", "^u", "^j/^k"], width)
         }
     };
     (line, None)
@@ -1198,13 +1208,27 @@ mod tests {
     }
 
     #[test]
-    fn undo_is_offered_only_when_there_is_something_to_undo() {
+    fn undo_is_offered_only_when_there_is_something_to_undo_and_names_it() {
         let mut picker = picker();
         let (lines, _) = render(&mut picker, 160, 14);
         assert!(!lines[13].contains("U undo"), "{}", lines[13]);
-        picker.set_undoable(true);
+        picker.set_undo(Some(("settle", "docs pass".into())));
         let (lines, _) = render(&mut picker, 160, 14);
-        assert!(lines[13].contains("r rename  U undo"), "{}", lines[13]);
+        assert!(
+            lines[13].contains("r rename  U undo settle “docs pass”"),
+            "{}",
+            lines[13]
+        );
+        picker.set_undo(Some((
+            "snooze",
+            "a very long thread title that goes on and on".into(),
+        )));
+        let (lines, _) = render(&mut picker, 160, 14);
+        assert!(
+            lines[13].contains("U undo snooze “a very long thread titl…”"),
+            "{}",
+            lines[13]
+        );
     }
 
     #[test]
@@ -1305,7 +1329,7 @@ mod tests {
     #[test]
     fn narrow_footers_drop_whole_hints_but_keep_the_triage_keys_and_close() {
         let mut picker = picker();
-        picker.set_undoable(true);
+        picker.set_undo(Some(("settle", "docs pass".into())));
         let (lines, _) = render(&mut picker, 80, 14);
         let footer = lines[13].trim_end();
         assert!(

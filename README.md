@@ -66,7 +66,7 @@ rows = [
 | `u` | mark read / unread | typed |
 | `p` | pin / unpin | typed |
 | `r` | rename the thread (`enter` saves; an empty title restores the automatic one) | typed |
-| `U` | undo the last triage change or rename | typed |
+| `U` | undo the last triage change or rename (the footer names it, e.g. `U undo settle “docs pass”`) | typed |
 | `D` | forget a closed thread (asks `y`) | typed |
 | `esc` | clear the search, else close | leave search, keeping it |
 | `q` | close (cancels an open prompt) | typed |

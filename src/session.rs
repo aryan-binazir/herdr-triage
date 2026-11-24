@@ -32,7 +32,8 @@ pub struct Session {
 pub struct View {
     pub items: Vec<Item>,
     pub open_sections: BTreeSet<Section>,
-    pub undoable: bool,
+    /// What undo would take back, if anything: its verb and thread.
+    pub undo: Option<(&'static str, String)>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -55,7 +56,7 @@ struct Snapshot {
     tabs: Vec<Tab>,
     rows: Vec<Row>,
     open_sections: BTreeSet<Section>,
-    undoable: bool,
+    undo: Option<(&'static str, String)>,
     wake_failed: Option<String>,
 }
 
@@ -167,7 +168,7 @@ impl Session {
         Ok(View {
             items: items(&snapshot, (self.clock)()),
             open_sections: snapshot.open_sections,
-            undoable: snapshot.undoable,
+            undo: snapshot.undo,
         })
     }
 
@@ -402,7 +403,7 @@ fn sync_locked<R>(
         tabs,
         rows,
         open_sections: state.open_sections.clone(),
-        undoable: state.undo.is_some(),
+        undo: state.undo_summary(),
         wake_failed: None,
     };
     (exit_checks, published.map(|()| (snapshot, edited)))

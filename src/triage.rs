@@ -913,6 +913,37 @@ impl State {
         }
     }
 
+    /// What `undo` would take back: the change's verb and the thread's title.
+    pub fn undo_summary(&self) -> Option<(&'static str, String)> {
+        let undo = self.undo.as_ref()?;
+        let record = self.records.get(&undo.key)?;
+        let (before, after) = (&undo.before, &undo.after);
+        let verb = if before.title != after.title {
+            "rename"
+        } else if !before.pinned && after.pinned {
+            "pin"
+        } else if before.park != after.park {
+            match (before.park, after.park) {
+                (_, Some(Park::Settled)) => "settle",
+                (_, Some(Park::Snoozed { .. })) => "snooze",
+                (Some(Park::Settled), None) => "unsettle",
+                _ => "wake",
+            }
+        } else if before.pinned && !after.pinned {
+            "unpin"
+        } else if after.unread.is_some() {
+            "unread"
+        } else {
+            "read"
+        };
+        let label = match &record.title {
+            Some(title) => title.as_str(),
+            None if record.thread.label.is_empty() => UNTITLED,
+            None => record.thread.label.as_str(),
+        };
+        Some((verb, label.to_owned()))
+    }
+
     pub fn undo(&mut self, now: i64) -> Result<(String, After), Refusal> {
         let nothing = || Refusal("nothing to undo".into());
         let Undo {
@@ -2076,6 +2107,35 @@ mod tests {
             confirm(&mut state, &close, &[restored_unknown], GEN, NOW + 1),
             Closing::Skip
         );
+    }
+
+    #[test]
+    fn undo_names_the_change_it_would_take_back() {
+        let a = resumable("a", Status::Idle, 2);
+        let done = resumable("d", Status::Done, 2);
+        let mut state = State::default();
+        state.reconcile(GEN, &[a.clone(), done.clone()], NOW);
+        let summary = |state: &State| {
+            state
+                .undo_summary()
+                .map(|(verb, label)| format!("{verb} {label}"))
+        };
+        assert_eq!(summary(&state), None);
+        for (agent, action, expected) in [
+            (&a, Action::TogglePin, "pin thread a"),
+            (&a, Action::TogglePin, "unpin thread a"),
+            (&a, Action::ToggleSettle, "settle thread a"),
+            (&a, Action::ToggleSettle, "unsettle thread a"),
+            (&a, Action::Snooze(NOW + 60), "snooze thread a"),
+            (&a, Action::Wake, "wake thread a"),
+            (&a, Action::ToggleUnread, "unread thread a"),
+            (&done, Action::ToggleUnread, "read thread d"),
+        ] {
+            act(&mut state, agent, action).unwrap();
+            assert_eq!(summary(&state).as_deref(), Some(expected), "{action:?}");
+        }
+        state.rename("a", Some("renamed".into()), NOW);
+        assert_eq!(summary(&state).as_deref(), Some("rename renamed"));
     }
 
     #[test]

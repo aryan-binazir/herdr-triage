@@ -81,7 +81,7 @@ fn run_picker() -> io::Result<()> {
     let t3 = t3::Worker::start(&store::state_root());
     let mut t3_sent = Vec::new();
     let mut picker = Picker::new(shown.items(), focus.as_deref(), &shown.herdr.open_sections);
-    picker.set_undoable(shown.herdr.undoable);
+    picker.set_undo(shown.herdr.undo.clone());
 
     let mut terminal = ratatui::init();
     let started = Instant::now();
@@ -280,7 +280,7 @@ fn show(picker: &mut Picker, shown: &mut Shown, view: io::Result<View>) {
         Ok(view) => {
             shown.herdr = view;
             picker.refresh(shown.items(), &shown.herdr.open_sections);
-            picker.set_undoable(shown.herdr.undoable);
+            picker.set_undo(shown.herdr.undo.clone());
         }
         Err(error) => picker.notify(format!("herdr: {error}")),
     }
