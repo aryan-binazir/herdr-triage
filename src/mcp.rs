@@ -5,6 +5,7 @@ mod config;
 mod ops;
 
 use std::collections::BTreeMap;
+use std::fs;
 use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
 
@@ -12,6 +13,7 @@ use serde_json::{Value, json};
 
 use crate::herdr;
 use crate::session::Session;
+use crate::store;
 use ops::{Call, Failure, LaunchArgs};
 
 /// Newest first: a client that offers none of these is answered with the first.
@@ -46,6 +48,33 @@ impl Env {
                 .filter(|pane| !pane.is_empty()),
             session: Box::new(|| Session::connect().map(Session::in_background)),
         }
+    }
+}
+
+/// Where MCP clients are told to start the server. Each plugin update puts the binary somewhere
+/// new, so Herdr's hooks keep this link pointing at the one Herdr runs now. Best effort: a client
+/// that finds no link says so when it starts.
+pub fn link_path() -> PathBuf {
+    store::state_root().join("herdr-triage")
+}
+
+pub fn link_for_clients() {
+    let Ok(binary) = std::env::current_exe() else {
+        return;
+    };
+    let link = link_path();
+    if fs::read_link(&link).is_ok_and(|target| target == binary) {
+        return;
+    }
+    let staged = link.with_extension("new");
+    let _ = fs::remove_file(&staged);
+    let linked = link
+        .parent()
+        .map_or(Ok(()), fs::create_dir_all)
+        .and_then(|()| std::os::unix::fs::symlink(&binary, &staged))
+        .and_then(|()| fs::rename(&staged, &link));
+    if linked.is_err() {
+        let _ = fs::remove_file(&staged);
     }
 }
 

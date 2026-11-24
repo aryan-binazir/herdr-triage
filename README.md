@@ -182,27 +182,24 @@ time. It speaks MCP over stdin and stdout; there is no daemon, port or login. In
 
 ### Connect a client
 
-The binary lives in Herdr's copy of the plugin, whose directory name changes between installs, so
-have the client look it up each time it starts the server (needs `jq`):
+The server is the plugin's own binary. Each plugin update installs it in a new directory, so
+Herdr's hooks keep a link to the current one at `~/.local/state/herdr/plugins/ar.triage/herdr-triage`
+(under `$XDG_STATE_HOME` if you set it). It appears at the first agent event after an install.
+Register it once:
 
 ```sh
-herdr_triage_mcp='exec "$(herdr plugin list --plugin ar.triage --json | jq -r ".result.plugins[0].plugin_root")/target/release/herdr-triage" mcp'
-
-# Claude Code
-claude mcp add --scope user herdr -- sh -c "$herdr_triage_mcp"
+claude mcp add --scope user herdr -- ~/.local/state/herdr/plugins/ar.triage/herdr-triage mcp
+codex mcp add herdr -- ~/.local/state/herdr/plugins/ar.triage/herdr-triage mcp
 ```
 
-Codex, in `~/.codex/config.toml`:
+Codex hides your environment from MCP servers, so also add this line to the
+`[mcp_servers.herdr]` table that `codex mcp add` wrote in `~/.codex/config.toml`:
 
 ```toml
-[mcp_servers.herdr]
-command = "sh"
-args = ["-c", 'exec "$(herdr plugin list --plugin ar.triage --json | jq -r ".result.plugins[0].plugin_root")/target/release/herdr-triage" mcp']
 env_vars = ["HERDR_PANE_ID", "HERDR_SOCKET_PATH"]
 ```
 
-Any client that starts a stdio MCP server works the same way. Two environment variables matter,
-and Codex only passes them on when told to, as above:
+Any client that starts a stdio MCP server works the same way. Two environment variables matter:
 
 - `HERDR_PANE_ID`, which Herdr sets in every pane, tells the server which agent is calling. That
   agent's launches are then its own (`mine`), and a launch with no `project` goes to the project

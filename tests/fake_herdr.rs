@@ -315,12 +315,7 @@ fn sync_and_next_do_not_depend_on_tabs() {
 fn unchanged_sync_leaves_the_database_unwritten() {
     let herdr = FakeHerdr::start(vec![agent("w1:p1", "idle", 3)]);
     herdr.run(&["sync"]);
-    let server_dir = std::fs::read_dir(herdr.state_dir())
-        .unwrap()
-        .next()
-        .unwrap()
-        .unwrap()
-        .path();
+    let server_dir = server_dir(&herdr);
     let observer = rusqlite::Connection::open(server_dir.join("triage.sqlite3")).unwrap();
     observer
         .execute("UPDATE threads SET touched_at = touched_at - 1", [])
@@ -384,8 +379,12 @@ fn wakers_share_each_deadline_and_remove_expired_locks() {
     assert_eq!(sleepers, 2, "one sleeper per deadline");
     assert_eq!(locks, 2, "both waiting deadlines have locks in their store");
     assert_eq!(herdr.take("agent.list").len(), 2, "one sync per deadline");
-    for server in std::fs::read_dir(herdr.state_dir()).unwrap() {
-        for entry in std::fs::read_dir(server.unwrap().path()).unwrap() {
+    let servers = std::fs::read_dir(herdr.state_dir()).unwrap();
+    for server in servers
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| path.is_dir())
+    {
+        for entry in std::fs::read_dir(server).unwrap() {
             assert!(
                 !entry
                     .unwrap()
@@ -451,6 +450,21 @@ fn an_overdue_waker_started_during_sync_requests_another_sync() {
     assert!(second.wait().unwrap().success());
     assert!(syncing, "first waker never entered sync");
     assert_eq!(herdr.take("agent.list").len(), 2);
+}
+
+#[test]
+fn hooks_keep_a_link_to_the_binary_where_mcp_clients_start_it() {
+    let herdr = FakeHerdr::start(vec![agent("w1:p1", "idle", 3)]);
+    let link = herdr.dir.path().join("state/herdr-triage");
+    // What an earlier install left: a link to a binary that is gone.
+    std::fs::create_dir_all(link.parent().unwrap()).unwrap();
+    std::os::unix::fs::symlink("/gone/herdr-triage", &link).unwrap();
+    herdr.run(&["sync"]);
+    let binary = std::fs::canonicalize(env!("CARGO_BIN_EXE_herdr-triage")).unwrap();
+    assert_eq!(std::fs::read_link(&link).unwrap(), binary);
+    herdr.run(&["startup"]);
+    assert_eq!(std::fs::read_link(&link).unwrap(), binary);
+    assert!(!link.with_extension("new").exists());
 }
 
 #[test]

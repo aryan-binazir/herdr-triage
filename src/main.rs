@@ -31,8 +31,14 @@ use triage::Action;
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let result = match args.first().map(String::as_str) {
-        Some("sync") => Session::connect().and_then(|mut session| session.sync()),
-        Some("startup") => Session::connect().and_then(|mut session| session.startup()),
+        Some("sync") => {
+            mcp::link_for_clients();
+            Session::connect().and_then(|mut session| session.sync())
+        }
+        Some("startup") => {
+            mcp::link_for_clients();
+            Session::connect().and_then(|mut session| session.startup())
+        }
         Some("next") => Session::connect()
             .and_then(|mut session| session.next(invoked_from(&invocation_context()))),
         Some("open") => Herdr::connect()
