@@ -589,10 +589,8 @@ impl Picker {
             .iter()
             .enumerate()
             .filter_map(|(at, &entry)| match entry {
-                Entry::Agent(i) if self.items[i].target != Target::Closed => {
-                    Some((self.items[i].row.attention()?, at))
-                }
-                _ => None,
+                Entry::Agent(i) => Some((self.items[i].row.attention()?, at)),
+                Entry::Section { .. } => None,
             })
             .min();
         self.selected = needs_you.map_or_else(

@@ -13,8 +13,8 @@ use crate::herdr::{Agent, Herdr, Tab, Workspace};
 use crate::picker::{Item, Target};
 use crate::store::Store;
 use crate::triage::{
-    self, Action, After, CLOSED_FOR_GOOD, Close, Closing, Observed, Rank, Refusal, ReopenPlan, Row,
-    Section, SessionRef, State, Thread, UNTITLED,
+    self, Action, After, CLOSED_FOR_GOOD, Close, Closing, Observed, Rank, Reconciled, Refusal,
+    ReopenPlan, Row, Section, SessionRef, State, Thread, UNTITLED,
 };
 use crate::wakers;
 
@@ -109,7 +109,8 @@ impl Session {
         self.sync()
     }
 
-    /// Focuses the next agent that needs you after the one in `invoked_from` (else the focused one).
+    /// Focuses the next agent that needs you after the one in `invoked_from` (else the focused
+    /// one), reopening it if it was closed.
     pub fn next(&mut self, invoked_from: Option<&str>) -> io::Result<()> {
         let (snapshot, ()) = self.sync_and_serve(false, |_, _, _| ())?;
         let current = snapshot
@@ -121,8 +122,15 @@ impl Session {
             })
             .map(Agent::key);
         let next = triage::next_attention(&snapshot.rows, current.as_deref());
-        match next.and_then(|row| row.agent_index) {
-            Some(index) => self.herdr.focus(&snapshot.agents[index].pane_id),
+        match next {
+            Some(Row {
+                agent_index: Some(index),
+                ..
+            }) => self.herdr.focus(&snapshot.agents[*index].pane_id),
+            Some(closed) => match self.act(&closed.key, Action::Reopen)? {
+                Outcome::Refused(refusal) => self.herdr.notify(&refusal).map(drop),
+                _ => Ok(()),
+            },
             None => self.herdr.notify("Nothing needs you").map(drop),
         }
     }
@@ -235,11 +243,14 @@ impl Session {
             held.store.take_sync_request();
             sync_locked(held, state, fetch_tabs, edit)
         })?;
-        let Some(((exit_checks, synced), wake_failed)) = synced else {
+        let Some(((reconciled, synced), wake_failed)) = synced else {
             return Ok(None);
         };
-        for at in exit_checks {
+        for at in reconciled.exit_checks {
             let _ = (self.waker)(at);
+        }
+        if let Some(title) = woke_notice(&reconciled.woke) {
+            let _ = self.herdr.notify(&title);
         }
         Ok(Some(synced.map(|(snapshot, edited)| {
             let wake_failed = wake_failed.map(|error| error.to_string());
@@ -381,7 +392,7 @@ fn sync_locked<R>(
     state: &mut State,
     fetch_tabs: bool,
     edit: impl FnOnce(&mut State, &[Observed], i64) -> R,
-) -> (Vec<i64>, Synced<R>) {
+) -> (Reconciled, Synced<R>) {
     let HerdrView {
         generation,
         agents,
@@ -389,11 +400,11 @@ fn sync_locked<R>(
         tabs,
     } = match read_herdr(held.herdr, fetch_tabs) {
         Ok(view) => view,
-        Err(error) => return (Vec::new(), Err(error)),
+        Err(error) => return (Reconciled::default(), Err(error)),
     };
     let observed: Vec<Observed> = agents.iter().map(|a| observe(a, &workspaces)).collect();
     let now = held.now();
-    let exit_checks = state.reconcile(&generation, &observed, now);
+    let reconciled = state.reconcile(&generation, &observed, now);
     let edited = edit(state, &observed, now);
     let rows = state.ordered(&observed);
     let published = publish(held.herdr, &agents, &rows, now);
@@ -406,7 +417,7 @@ fn sync_locked<R>(
         undo: state.undo_summary(),
         wake_failed: None,
     };
-    (exit_checks, published.map(|()| (snapshot, edited)))
+    (reconciled, published.map(|()| (snapshot, edited)))
 }
 
 struct HerdrView {
@@ -500,6 +511,15 @@ fn publish(herdr: &mut Herdr, agents: &[Agent], rows: &[Row], now: i64) -> io::R
     }
     let view = herdr.set_view(&view_label(rows), &Rank::hidden_tokens());
     failure.map_or(view, Err)
+}
+
+/// One notice for every snooze that came due in a sync.
+fn woke_notice(woke: &[String]) -> Option<String> {
+    match woke {
+        [] => None,
+        [one] => Some(format!("Woke: {one}")),
+        [first, rest @ ..] => Some(format!("Woke: {first} and {} more", rest.len())),
+    }
 }
 
 fn view_label(rows: &[Row]) -> String {
@@ -1338,6 +1358,44 @@ mod tests {
         });
         assert_eq!(session.act(KEY, Action::ToggleSettle).unwrap(), done(KEY));
         assert!(fake.take("pane.close").is_empty());
+    }
+
+    #[test]
+    fn a_snooze_that_comes_due_says_so_once_and_next_reopens_its_closed_thread() {
+        let fake = two_resumable_agents();
+        let now = Rc::new(std::cell::Cell::new(NOW));
+        let clock = now.clone();
+        let mut session = Session::new(
+            Herdr::at(&fake.socket).unwrap(),
+            store(&fake),
+            move || clock.get(),
+            |_| Ok(()),
+        );
+        session.act(KEY, Action::Snooze(NOW + 3600)).unwrap();
+        assert_eq!(fake.take("pane.close"), [json!({"pane_id": "w1:p1"})]);
+        now.set(NOW + 30);
+        session.sync().unwrap();
+        session.next(Some("w1:p2")).unwrap();
+        assert_eq!(
+            fake.take("notification.show"),
+            [json!({"title": "Nothing needs you"})]
+        );
+
+        now.set(NOW + 3600);
+        session.sync().unwrap();
+        session.sync().unwrap();
+        assert_eq!(
+            fake.take("notification.show"),
+            [json!({"title": "Woke: Untitled thread"})],
+            "once"
+        );
+
+        session.next(Some("w1:p2")).unwrap();
+        assert!(fake.take("notification.show").is_empty());
+        assert_eq!(
+            fake.take("pane.send_input")[0]["text"],
+            "claude --resume id-w1:p1"
+        );
     }
 
     #[test]

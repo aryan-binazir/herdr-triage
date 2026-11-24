@@ -94,7 +94,8 @@ and refused. A time that has passed while the prompt was open is refused too:
   counter advancing).
 - **Snooze** (`z`) parks it until the chosen time; then it returns marked *woke*. The picker shows
   the time left (`snoozed · 45m`). An agent that blocks on you wakes early; other activity, including
-  a snoozed agent finishing its work, does not. Viewing the agent clears *woke*.
+  a snoozed agent finishing its work, does not. Herdr shows a notification when a snooze comes due
+  (`Woke: <thread>`). Viewing the agent clears *woke*.
 - **Closing:** settling an agent closes its pane. If Herdr can resume its session (Claude, Codex,
   OpenCode or Pi with Herdr's integration), the thread stays listed as closed and snoozing closes
   it too. Settling an agent with no session to resume first asks: `y` closes it for good (Herdr
@@ -126,7 +127,8 @@ and refused. A time that has passed while the prompt was open is refused too:
   something new, undo can still bring a thread back but won't park it again. Forgetting a thread
   can't be undone.
 - **Rename** (`r`) gives a thread its own title in the picker; search still finds the automatic one.
-- **`next`** focuses blocked agents first, then done or unread ones, skipping parked and closed threads.
+- **`next`** focuses blocked agents first, then done, unread or woke ones, reopening a closed thread
+  among them; it skips parked threads.
 
 Closed threads are forgotten after 30 days untouched unless pinned; `D` forgets one now. Agents
 without a resumable session are forgotten once they exit.

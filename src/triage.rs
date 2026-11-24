@@ -170,6 +170,24 @@ impl Record {
         self.thread.resume_argv().is_some()
     }
 
+    fn label(&self) -> &str {
+        match &self.title {
+            Some(title) => title,
+            None if self.thread.label.is_empty() => UNTITLED,
+            None => &self.thread.label,
+        }
+    }
+
+    /// A snooze that has come due wakes the thread as unread.
+    fn wake_if_due(&mut self, now: i64) -> bool {
+        let due = matches!(self.park, Some(Park::Snoozed { until }) if until <= now);
+        if due {
+            self.park = None;
+            self.unread = Some(Unread::Woke);
+        }
+        due
+    }
+
     fn end_session(&mut self) {
         if self.park.is_none() && self.unread.is_none() {
             self.park = Some(Park::Settled);
@@ -178,6 +196,16 @@ impl Record {
         self.ended = true;
         self.missing_since = None;
     }
+}
+
+/// What a reconcile leaves for the caller to do.
+#[derive(Debug, Default)]
+pub struct Reconciled {
+    /// When agents that just went missing must be checked again, since nothing else may sync
+    /// once the exit grace period is over.
+    pub exit_checks: Vec<i64>,
+    /// Threads whose snooze came due, by title.
+    pub woke: Vec<String>,
 }
 
 #[derive(Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -658,10 +686,9 @@ fn closed_display(record: &Record) -> Display {
 }
 
 impl State {
-    /// Returns when agents that just went missing must be checked again, since nothing else may
-    /// sync once the exit grace period is over.
-    pub fn reconcile(&mut self, generation: &str, agents: &[Observed], now: i64) -> Vec<i64> {
+    pub fn reconcile(&mut self, generation: &str, agents: &[Observed], now: i64) -> Reconciled {
         let mut exit_checks = Vec::new();
+        let mut woke = Vec::new();
         for agent in agents {
             self.adopt_previous_key(agent, generation, now);
             let existed = self.records.contains_key(&agent.key);
@@ -701,9 +728,8 @@ impl State {
             record.reopen_pane = None;
             record.reopen_at = None;
             record.reopen_generation = None;
-            if matches!(record.park, Some(Park::Snoozed { until }) if until <= now) {
-                record.park = None;
-                record.unread = Some(Unread::Woke);
+            if record.wake_if_due(now) {
+                woke.push(record.label().to_owned());
             }
             match record.unread {
                 Some(Unread::Woke) if agent.focused => record.unread = None,
@@ -740,9 +766,8 @@ impl State {
             }
         }
         for record in self.records.values_mut() {
-            if matches!(record.park, Some(Park::Snoozed { until }) if until <= now) {
-                record.park = None;
-                record.unread = Some(Unread::Woke);
+            if record.wake_if_due(now) {
+                woke.push(record.label().to_owned());
             }
         }
         // Live threads are touched at most once a minute, so allow that minute: never forget early.
@@ -752,7 +777,7 @@ impl State {
                 || (record.resumable() && (record.pinned || now - record.touched_at <= retention))
         });
         self.drop_orphaned_undo();
-        exit_checks
+        Reconciled { exit_checks, woke }
     }
 
     fn adopt_previous_key(&mut self, agent: &Observed, generation: &str, now: i64) {
@@ -946,12 +971,7 @@ impl State {
         } else {
             "read"
         };
-        let label = match &record.title {
-            Some(title) => title.as_str(),
-            None if record.thread.label.is_empty() => UNTITLED,
-            None => record.thread.label.as_str(),
-        };
-        Some((verb, label.to_owned()))
+        Some((verb, record.label().to_owned()))
     }
 
     pub fn undo(&mut self, now: i64) -> Result<(String, After), Refusal> {
@@ -1176,7 +1196,7 @@ fn reopen_plan(key: &str, record: &Record, now: i64) -> Result<After, Refusal> {
 pub fn next_attention<'a>(rows: &'a [Row], current: Option<&str>) -> Option<&'a Row> {
     let mut queue: Vec<&Row> = rows
         .iter()
-        .filter(|row| row.live() && row.attention().is_some())
+        .filter(|row| row.attention().is_some())
         .collect();
     queue.sort_by_key(|row| row.attention());
     let start = current
@@ -3182,14 +3202,15 @@ mod tests {
         assert!(
             state
                 .reconcile(GEN, std::slice::from_ref(&idle), NOW)
+                .exit_checks
                 .is_empty()
         );
         assert_eq!(
-            state.reconcile(GEN, &[], NOW + 1),
+            state.reconcile(GEN, &[], NOW + 1).exit_checks,
             [NOW + 1 + EXIT_GRACE_SECS]
         );
         assert!(
-            state.reconcile(GEN, &[], NOW + 3).is_empty(),
+            state.reconcile(GEN, &[], NOW + 3).exit_checks.is_empty(),
             "armed once per disappearance"
         );
     }
@@ -3221,9 +3242,58 @@ mod tests {
         let mut state = State::default();
         state.reconcile(GEN, &agents, NOW);
         assert_eq!(
-            state.reconcile(GEN, &[], NOW + 1),
+            state.reconcile(GEN, &[], NOW + 1).exit_checks,
             [NOW + 1 + EXIT_GRACE_SECS]
         );
+    }
+
+    #[test]
+    fn reconcile_reports_each_snooze_that_comes_due_once() {
+        let live = resumable("live", Status::Idle, 4);
+        let closed = resumable("closed", Status::Idle, 5);
+        let mut state = State::default();
+        state.reconcile(GEN, &[live.clone(), closed.clone()], NOW);
+        act(&mut state, &live, Action::Snooze(NOW + 60)).unwrap();
+        act(&mut state, &closed, Action::Snooze(NOW + 60)).unwrap();
+        state.reconcile(GEN, std::slice::from_ref(&live), NOW + 1);
+        state.reconcile(GEN, std::slice::from_ref(&live), NOW + 20);
+        assert!(
+            state
+                .reconcile(GEN, std::slice::from_ref(&live), NOW + 59)
+                .woke
+                .is_empty()
+        );
+        let mut woke = state
+            .reconcile(GEN, std::slice::from_ref(&live), NOW + 60)
+            .woke;
+        woke.sort();
+        assert_eq!(woke, ["thread closed", "thread live"]);
+        assert!(
+            state
+                .reconcile(GEN, std::slice::from_ref(&live), NOW + 61)
+                .woke
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn next_reopens_a_closed_thread_that_woke_after_live_agents_that_block() {
+        let blocked = resumable("blocked", Status::Blocked, 4);
+        let closed = resumable("closed", Status::Idle, 5);
+        let mut state = State::default();
+        state.reconcile(GEN, &[blocked.clone(), closed.clone()], NOW);
+        act(&mut state, &closed, Action::Snooze(NOW + 60)).unwrap();
+        state.reconcile(GEN, std::slice::from_ref(&blocked), NOW + 1);
+        state.reconcile(GEN, std::slice::from_ref(&blocked), NOW + 20);
+        state.reconcile(GEN, std::slice::from_ref(&blocked), NOW + 60);
+        let rows = state.ordered(std::slice::from_ref(&blocked));
+        let order: Vec<&str> = std::iter::successors(next_attention(&rows, None), |row| {
+            next_attention(&rows, Some(&row.key)).filter(|next| next.key != "blocked")
+        })
+        .map(|row| row.key.as_str())
+        .collect();
+        assert_eq!(order, ["blocked", "closed"]);
+        assert!(!rows.iter().find(|row| row.key == "closed").unwrap().live());
     }
 
     #[test]
