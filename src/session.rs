@@ -1040,7 +1040,7 @@ mod tests {
             .unwrap();
         assert!(keys.contains(&"terminal:t-w1:p1".to_owned()), "{keys:?}");
         session
-            .act("terminal:t-w1:p1", Action::ToggleSettle)
+            .act("terminal:t-w1:p1", Action::CloseForGood)
             .unwrap();
         assert_eq!(fake.take("pane.close"), [json!({"pane_id": "w1:p1"})]);
         let kept = store(&fake)
@@ -1246,7 +1246,7 @@ mod tests {
                 "a snooze keeps a pane it could not reopen to wake"
             );
             methods(&fake);
-            assert_eq!(session.act(key, Action::ToggleSettle).unwrap(), done(key));
+            assert_eq!(session.act(key, Action::CloseForGood).unwrap(), done(key));
             let calls: Vec<Value> = fake
                 .requests
                 .lock()
@@ -1279,7 +1279,7 @@ mod tests {
         let (mut session, _) = connect(&fake);
         let key = "terminal:t-w1:p1";
         *fake.fail_method.lock().unwrap() = Some("pane.close".into());
-        assert!(session.act(key, Action::ToggleSettle).is_err());
+        assert!(session.act(key, Action::CloseForGood).is_err());
         assert!(fake.take("notification.show").is_empty());
         let kept = store(&fake)
             .transact(|state| state.records.contains_key(key))
@@ -1299,7 +1299,7 @@ mod tests {
             let kept = store.transact(|state| state.records.contains_key(key));
             *seen.lock().unwrap() = kept.ok();
         });
-        session.act(key, Action::ToggleSettle).unwrap();
+        session.act(key, Action::CloseForGood).unwrap();
         assert_eq!(
             *unreported.lock().unwrap(),
             Some(true),
@@ -1315,7 +1315,7 @@ mod tests {
         let key = "terminal:t-w1:p1";
         *fake.notification_shown.lock().unwrap() = false;
         assert_eq!(
-            session.act(key, Action::ToggleSettle).unwrap(),
+            session.act(key, Action::CloseForGood).unwrap(),
             Outcome::Done {
                 key: key.into(),
                 notice: Some("closed for good: it has no session to resume".into()),
@@ -1332,7 +1332,7 @@ mod tests {
         let key = "terminal:t-w1:p1";
         *fake.fail_method.lock().unwrap() = Some("notification.show".into());
         assert_eq!(
-            session.act(key, Action::ToggleSettle).unwrap(),
+            session.act(key, Action::CloseForGood).unwrap(),
             Outcome::Done {
                 key: key.into(),
                 notice: Some("closed for good: it has no session to resume".into()),

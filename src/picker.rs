@@ -252,8 +252,8 @@ impl Picker {
         }
         if let Some(prompt) = self.close.take() {
             let action = match key.code {
-                KeyCode::Char('y') => Action::ToggleSettle,
-                KeyCode::Char('n') => Action::SettleKeepingOpen,
+                KeyCode::Char('y') => Action::CloseForGood,
+                KeyCode::Char('n') => Action::ToggleSettle,
                 _ => return Effect::None,
             };
             return Effect::Apply {
@@ -347,7 +347,7 @@ impl Picker {
             }
             KeyCode::Char('s') => {
                 if let Some(item) = self.selected()
-                    && item.row.settle_closes_for_good()
+                    && item.row.can_close_for_good()
                 {
                     self.close = Some(ClosePrompt {
                         key: item.row.key.clone(),
@@ -1161,8 +1161,8 @@ mod tests {
             key: "k-p2".into(),
             action,
         };
-        assert_eq!(settle(KeyCode::Char('y')), apply(Action::ToggleSettle));
-        assert_eq!(settle(KeyCode::Char('n')), apply(Action::SettleKeepingOpen));
+        assert_eq!(settle(KeyCode::Char('y')), apply(Action::CloseForGood));
+        assert_eq!(settle(KeyCode::Char('n')), apply(Action::ToggleSettle));
         assert_eq!(settle(KeyCode::Esc), Effect::None);
         assert_eq!(settle(KeyCode::Char('q')), Effect::None);
 
