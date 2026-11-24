@@ -268,8 +268,8 @@ impl Server {
         {
             return first.clone();
         }
-        let result =
-            Call::open(&self.env, &who).and_then(|mut call| ops::launch_tool(&mut call, &args));
+        let result = Call::open(&self.env, &who)
+            .and_then(|mut call| ops::launch_tool(&mut call, &args, ops::LAUNCH_BUDGET));
         // A failure naming a branch came once the worktree was asked for.
         let opened = result
             .as_ref()
@@ -293,17 +293,19 @@ impl Server {
             return invalid(&Value::Null, "batches are not supported");
         }
         let method = request["method"].as_str();
-        let id = request.get("id").filter(|id| !id.is_null());
-        let id = match (id, method) {
-            (Some(id), _) if id.is_string() || id.is_number() => id.clone(),
+        let id = match (request.get("id"), method) {
+            (Some(id), _) if id.is_string() || id.is_i64() || id.is_u64() => id.clone(),
             // A notification: nothing to answer.
             (None, Some(_)) if request["jsonrpc"] == "2.0" => return None,
-            _ => return invalid(&Value::Null, "a request needs a string or number `id`"),
+            _ => return invalid(&Value::Null, "a request needs a string or integer `id`"),
         };
         let Some(method) = method.filter(|_| request["jsonrpc"] == "2.0") else {
             return invalid(&id, "a request needs `jsonrpc: \"2.0\"` and a `method`");
         };
         let params = &request["params"];
+        if !(params.is_object() || params.is_null()) {
+            return invalid(&id, "`params` must be an object");
+        }
         let result = match method {
             "initialize" => {
                 if let Some(name) = params["clientInfo"]["name"].as_str() {
@@ -606,6 +608,9 @@ mod tests {
             json!({}),
             json!({"jsonrpc": "1.0", "id": 1, "method": "ping"}),
             json!({"jsonrpc": "2.0", "id": true, "method": "ping"}),
+            json!({"jsonrpc": "2.0", "id": null, "method": "ping"}),
+            json!({"jsonrpc": "2.0", "id": 1.5, "method": "ping"}),
+            json!({"jsonrpc": "2.0", "id": 1, "method": "ping", "params": [1]}),
         ] {
             let reply = rig.server.answer(&malformed);
             assert_eq!(reply.unwrap()["error"]["code"], -32600, "{malformed}");
@@ -955,6 +960,21 @@ mod tests {
         assert!(error["branch"].as_str().unwrap().starts_with("big-repo-"));
         assert_eq!(rig.failure("herdr_launch", arguments), error);
         assert_eq!(rig.fake.take("worktree.create").len(), 1);
+    }
+
+    #[test]
+    fn a_launch_past_its_budget_stops_before_its_next_step() {
+        let rig = rig(vec![], None);
+        rig.fake.on("workspace.list", |_| {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        });
+        let args = LaunchArgs::decode(json!({"project": "acme-api", "title": "Slow"})).unwrap();
+        let mut call = Call::open(&rig.server.env, "test-client:i1").unwrap();
+        let budget = std::time::Duration::from_millis(20);
+        let error = ops::launch_tool(&mut call, &args, budget).unwrap_err();
+        assert_eq!(error.code, "launch_timeout");
+        assert!(rig.fake.take("worktree.create").is_empty());
+        assert!(rig.fake.take("agent.start").is_empty());
     }
 
     #[test]

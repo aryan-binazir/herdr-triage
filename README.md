@@ -189,8 +189,8 @@ after an install, such as when you switch panes.
 Register it once:
 
 ```sh
-claude mcp add --scope user herdr -- ~/.local/state/herdr/plugins/ar.triage/herdr-triage mcp
-codex mcp add herdr -- ~/.local/state/herdr/plugins/ar.triage/herdr-triage mcp
+claude mcp add --scope user herdr -- "${XDG_STATE_HOME:-$HOME/.local/state}/herdr/plugins/ar.triage/herdr-triage" mcp
+codex mcp add herdr -- "${XDG_STATE_HOME:-$HOME/.local/state}/herdr/plugins/ar.triage/herdr-triage" mcp
 ```
 
 Codex hides your environment from MCP servers, so also add these lines to the
@@ -289,9 +289,10 @@ stops launches with the parse error, rather than launching something you did not
 - **Any thread can be messaged or triaged**, not only the caller's own, so one agent can pick up
   another's work when you ask. Threads the caller launched are marked `mine` and listed first, and
   the tools tell agents to prefer them. A message to an agent mid-turn is refused rather than
-  queued behind the turn (Herdr cannot tell a turn the message started from one that began in the
-  instant before it, so a wait could otherwise report the wrong turn), and a message holding control characters (other than line breaks and
-  tabs) is refused, since the terminal would act on them as keys.
+  queued behind the turn. Herdr cannot tie a turn to a message, so a turn someone else starts in
+  the same instant would end first and satisfy the wait; the answer says so, and the reply shows
+  which turn it was. A message holding control characters (other than line breaks and tabs) is
+  refused, since the terminal would act on them as keys.
 - **Triage follows the rules above**, with one difference: the caller names the state it wants, so
   settling a settled thread changes nothing where the picker's key would unsettle it. Settling or
   snoozing can close an agent's pane; settling a working or blocked agent is refused, so an agent

@@ -19,7 +19,7 @@ use crate::triage::{Action, Display, Park, Want};
 
 /// A whole launch, inside the five minutes the README tells Codex to allow (it allows 60 by
 /// default); most of it is for checking out a large repository's worktree.
-const LAUNCH_BUDGET: Duration = Duration::from_secs(240);
+pub const LAUNCH_BUDGET: Duration = Duration::from_secs(240);
 /// What a launch keeps back after its worktree to start the agent and give it its message.
 const AFTER_CHECKOUT: Duration = Duration::from_secs(60);
 const START_TIMEOUT: Duration = Duration::from_secs(40);
@@ -529,8 +529,8 @@ struct Opened {
     detail: Map<String, Value>,
 }
 
-pub fn launch_tool(call: &mut Call, args: &LaunchArgs) -> Done {
-    let deadline = Instant::now() + LAUNCH_BUDGET;
+pub fn launch_tool(call: &mut Call, args: &LaunchArgs, budget: Duration) -> Done {
+    let deadline = Instant::now() + budget;
     let config = call.config()?;
     let caller = call.caller();
     let workspaces = call.workspaces()?;
@@ -545,6 +545,7 @@ pub fn launch_tool(call: &mut Call, args: &LaunchArgs) -> Done {
             )
         })?;
     let project = place(call, &workspaces, query)?;
+    in_time(deadline)?;
     let selection = config.select(
         &project.names(),
         args.harness.as_deref(),
@@ -583,6 +584,7 @@ pub fn launch_tool(call: &mut Call, args: &LaunchArgs) -> Done {
         "args": command,
         "timeout_ms": START_TIMEOUT.as_millis(),
     });
+    in_time(deadline).map_err(with_place)?;
     let ready = match start_agent(call, &start, deadline) {
         Ok(ready) => ready,
         // No agent means no thread to read, so the pane's last words go with the refusal.
@@ -601,6 +603,7 @@ pub fn launch_tool(call: &mut Call, args: &LaunchArgs) -> Done {
         .filter(|text| !text.trim().is_empty());
     let sent = match message {
         Some(text) if ready => {
+            in_time(deadline).map_err(with_place)?;
             Some(prompt(call, &opened.pane, text, deadline).map_err(with_place)?)
         }
         _ => None,
@@ -623,6 +626,18 @@ pub fn launch_tool(call: &mut Call, args: &LaunchArgs) -> Done {
     result.insert("sent".into(), sent.is_some().into());
     result.insert("next".into(), next.into());
     Ok(Value::Object(result))
+}
+
+/// A launch past its budget stops before its next step: the client may have given up on it, and
+/// the failure names what was opened, for a retry with the same `request_id` to find.
+fn in_time(deadline: Instant) -> Result<(), Failure> {
+    if Instant::now() < deadline {
+        return Ok(());
+    }
+    Err(Failure::new(
+        "launch_timeout",
+        "the launch ran out of time before its next step",
+    ))
 }
 
 /// Starts the agent and stays until it takes input. `false` when it stopped first at a dialog of
@@ -691,6 +706,12 @@ fn open_worktree(
     }
     // Herdr runs `git worktree add`, which checks out the whole tree.
     let checkout = deadline.saturating_duration_since(Instant::now() + AFTER_CHECKOUT);
+    if checkout.is_zero() {
+        return Err(Failure::new(
+            "launch_timeout",
+            "too little of the launch's time is left to check out a worktree",
+        ));
+    }
     let made = call.ask("worktree.create", &worktree, checkout)?;
     let pane = pane_of(&made)?;
     Ok(Opened {
@@ -833,7 +854,9 @@ pub fn send_tool(call: &mut Call, arguments: Value) -> Done {
         "thread": item.row.key,
         "sent": true,
         "mine": mine,
-        "next": "herdr_wait for the turn to end, then herdr_read.",
+        "next": "herdr_wait for the turn to end, then herdr_read. Herdr cannot tie a turn to a \
+                 message, so check the reply answers yours: a turn someone else started in the \
+                 same instant would end first.",
     }))
 }
 
