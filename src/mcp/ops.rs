@@ -75,7 +75,10 @@ impl From<Refused> for Failure {
             "worktree_create_failed" => " If the branch is taken, pass another `branch`.",
             _ => "",
         };
-        Failure::new(&refused.code, format!("{}{hint}", refused.message))
+        Failure::new(
+            &refused.code,
+            format!("{}.{hint}", refused.message.trim_end_matches('.')),
+        )
     }
 }
 
