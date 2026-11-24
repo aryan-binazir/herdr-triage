@@ -210,6 +210,10 @@ fn apply(
             if let Some(notice) = notice {
                 picker.inform(notice);
             }
+            let pending = |item: &picker::Item| item.row.key == key && item.row.settle_pending;
+            if action == Action::ToggleSettle && picker.items().iter().any(pending) {
+                picker.inform("settles when its turn ends".into());
+            }
             if matches!(
                 action,
                 Action::ToggleSettle | Action::SettleKeepingOpen | Action::Snooze(_)

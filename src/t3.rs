@@ -182,6 +182,7 @@ fn item(snapshot: &Snapshot, thread: &T3Thread, now: i64) -> Item {
         pinned: thread.pinned && !thread.settled,
         changed_at: Some(thread.updated_at),
         status: Status::Unknown,
+        settle_pending: false,
         thread: Thread {
             label: thread.title.clone(),
             agent: Some(kind.clone()),

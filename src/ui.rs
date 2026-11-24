@@ -711,6 +711,8 @@ fn footer_line(picker: &Picker, width: usize) -> (Line<'static>, Option<usize>) 
                         "s",
                         if parked(Section::Settled) {
                             "unsettle"
+                        } else if item.row.settle_pending {
+                            "keep open"
                         } else {
                             "settle"
                         },

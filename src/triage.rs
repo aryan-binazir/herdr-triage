@@ -149,6 +149,9 @@ pub struct Record {
     pub restored_at: Option<i64>,
     #[serde(default)]
     pub title: Option<String>,
+    /// When you asked to settle it while it was working; it settles once its turn ends.
+    #[serde(default)]
+    pub settle_requested: Option<i64>,
 }
 
 fn live_by_default() -> bool {
@@ -175,6 +178,43 @@ impl Record {
             Some(title) => title,
             None if self.thread.label.is_empty() => UNTITLED,
             None => &self.thread.label,
+        }
+    }
+
+    /// Settles the thread, closing its pane unless Herdr can't tell its state and can't resume
+    /// it. A working agent settles once its turn ends instead; asking again takes that back.
+    fn settle(&mut self, seq: u64, shown: Display, agent: Option<&Observed>, now: i64) -> After {
+        if self.settle_requested.take().is_some() {
+            return After::Nothing;
+        }
+        if shown == Display::Working {
+            self.settle_requested = Some(now);
+            return After::Nothing;
+        }
+        self.pinned = false;
+        let resumable = self.resumable();
+        let closing = agent.filter(|agent| resumable || agent.status != Status::Unknown);
+        park(self, seq, Park::Settled, closing)
+    }
+
+    /// Settles a thread asked to settle while it worked once its turn ends, unless it ends
+    /// blocked on you. Returns the pane to close, if it can be resumed.
+    fn settle_if_turn_ended(&mut self, agent: &Observed) -> Option<Close> {
+        self.settle_requested?;
+        match agent.status {
+            Status::Working | Status::Unknown => None,
+            Status::Blocked => {
+                self.settle_requested = None;
+                None
+            }
+            Status::Idle | Status::Done => {
+                self.pinned = false;
+                let closing = self.resumable().then_some(agent);
+                match park(self, agent.seq, Park::Settled, closing) {
+                    After::ClosePane(close) => Some(close),
+                    _ => None,
+                }
+            }
         }
     }
 
@@ -206,6 +246,8 @@ pub struct Reconciled {
     pub exit_checks: Vec<i64>,
     /// Threads whose snooze came due, by title.
     pub woke: Vec<String>,
+    /// Panes of agents that settled as their turn ended, to close as a settle would.
+    pub closes: Vec<Close>,
 }
 
 #[derive(Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -237,6 +279,8 @@ struct Triage {
     unread: Option<Unread>,
     ack_seq: Option<u64>,
     title: Option<String>,
+    #[serde(default)]
+    settle_requested: Option<i64>,
 }
 
 impl Triage {
@@ -247,6 +291,7 @@ impl Triage {
             unread: record.unread,
             ack_seq: record.ack_seq,
             title: record.title.clone(),
+            settle_requested: record.settle_requested,
         }
     }
 
@@ -258,6 +303,11 @@ impl Triage {
         }
         undo(&mut record.pinned, self.pinned, &after.pinned);
         undo(&mut record.title, self.title, &after.title);
+        undo(
+            &mut record.settle_requested,
+            self.settle_requested,
+            &after.settle_requested,
+        );
         let unparks = self.park.is_none();
         let marks_unread = self.unread.is_some();
         if !moved_on || unparks {
@@ -433,6 +483,8 @@ pub struct Row {
     pub changed_at: Option<i64>,
     /// Herdr's own state for a live agent; `Unknown` otherwise.
     pub status: Status,
+    /// It settles once its turn ends.
+    pub settle_pending: bool,
     pub thread: Thread,
     pub title: Option<String>,
 }
@@ -473,6 +525,8 @@ impl Row {
     pub fn settle_closes_for_good(&self) -> bool {
         self.live()
             && self.park != Some(Park::Settled)
+            && self.display != Display::Working
+            && !self.settle_pending
             && self.status != Status::Unknown
             && self.thread.resume_argv().is_none()
             && self.refusal(Action::ToggleSettle).is_none()
@@ -489,6 +543,7 @@ impl Row {
         match (self.live(), self.park) {
             (false, _) => format!("{text} · closed"),
             (true, Some(_)) => format!("{text} · stays open"),
+            (true, None) if self.settle_pending => format!("{text} · settles when done"),
             (true, None) => text,
         }
     }
@@ -647,17 +702,19 @@ pub fn snooze_presets<Tz: TimeZone>(now: i64, tz: &Tz) -> Vec<(SnoozePreset, boo
 }
 
 fn refusal(action: Action, shown: Display, live: bool) -> Option<Refusal> {
-    let verb = match action {
-        Action::Forget if live => {
-            return Some(Refusal("only closed threads can be forgotten".into()));
-        }
-        Action::ToggleSettle | Action::SettleKeepingOpen => "settle",
-        Action::ToggleUnread => "mark unread",
-        _ => return None,
-    };
+    if action == Action::Forget && live {
+        return Some(Refusal("only closed threads can be forgotten".into()));
+    }
     let busy = match shown {
         Display::Working => "working",
         Display::Blocked => "blocked",
+        _ => return None,
+    };
+    let verb = match action {
+        // A working agent settles once its turn ends.
+        Action::ToggleSettle if shown == Display::Working => return None,
+        Action::ToggleSettle | Action::SettleKeepingOpen => "settle",
+        Action::ToggleUnread => "mark unread",
         _ => return None,
     };
     Some(Refusal(format!("can't {verb} a {busy} agent")))
@@ -688,6 +745,7 @@ impl State {
     pub fn reconcile(&mut self, generation: &str, agents: &[Observed], now: i64) -> Reconciled {
         let mut exit_checks = Vec::new();
         let mut woke = Vec::new();
+        let mut closes = Vec::new();
         for agent in agents {
             self.adopt_previous_key(agent, generation, now);
             let existed = self.records.contains_key(&agent.key);
@@ -727,6 +785,9 @@ impl State {
             record.reopen_pane = None;
             record.reopen_at = None;
             record.reopen_generation = None;
+            if let Some(close) = record.settle_if_turn_ended(agent) {
+                closes.push(close);
+            }
             if record.wake_if_due(now) {
                 woke.push(record.label().to_owned());
             }
@@ -776,7 +837,11 @@ impl State {
                 || (record.resumable() && (record.pinned || now - record.touched_at <= retention))
         });
         self.drop_orphaned_undo();
-        Reconciled { exit_checks, woke }
+        Reconciled {
+            exit_checks,
+            woke,
+            closes,
+        }
     }
 
     fn adopt_previous_key(&mut self, agent: &Observed, generation: &str, now: i64) {
@@ -963,6 +1028,12 @@ impl State {
                 (Some(Park::Settled), None) => "unsettle",
                 _ => "wake",
             }
+        } else if before.settle_requested != after.settle_requested {
+            if after.settle_requested.is_some() {
+                "settle"
+            } else {
+                "unsettle"
+            }
         } else if before.pinned && !after.pinned {
             "unpin"
         } else if after.unread.is_some() {
@@ -1073,20 +1144,12 @@ impl State {
             }
             Action::TogglePin => {
                 record.pinned = !record.pinned;
+                record.settle_requested = None;
                 Ok(After::Nothing)
             }
             Action::Wake | Action::Reopen => unpark(record),
             Action::ToggleSettle if record.park == Some(Park::Settled) => unpark(record),
-            Action::ToggleSettle => {
-                record.pinned = false;
-                let resumable = record.resumable();
-                Ok(park(
-                    record,
-                    seq,
-                    Park::Settled,
-                    live_agent.filter(|agent| resumable || agent.status != Status::Unknown),
-                ))
-            }
+            Action::ToggleSettle => Ok(record.settle(seq, shown, live_agent, now)),
             Action::SettleKeepingOpen => {
                 record.pinned = false;
                 Ok(park(record, seq, Park::Settled, None))
@@ -1131,6 +1194,7 @@ impl State {
                 pinned: record.is_some_and(|r| r.pinned),
                 changed_at: record.and_then(|r| r.changed_at),
                 status: agent.status,
+                settle_pending: record.is_some_and(|r| r.settle_requested.is_some()),
                 thread: agent.thread.clone(),
                 title: record.and_then(|r| r.title.clone()),
             }
@@ -1148,6 +1212,7 @@ impl State {
                 pinned: record.pinned,
                 changed_at: record.changed_at,
                 status: Status::Unknown,
+                settle_pending: false,
                 thread: record.thread.clone(),
                 title: record.title.clone(),
             });
@@ -1213,6 +1278,7 @@ pub fn next_attention<'a>(rows: &'a [Row], current: Option<&str>) -> Option<&'a 
 
 fn park(record: &mut Record, seq: u64, park: Park, closing: Option<&Observed>) -> After {
     record.park = Some(park);
+    record.settle_requested = None;
     record.unread = None;
     record.ack_seq = Some(seq);
     closing.map_or(After::Nothing, |agent| {
@@ -1555,8 +1621,7 @@ mod tests {
                 (
                     "working".into(),
                     vec![
-                        "can't settle a working agent".to_owned(),
-                        "can't mark unread a working agent".into(),
+                        "can't mark unread a working agent".to_owned(),
                         "only closed threads can be forgotten".into(),
                     ]
                 ),
@@ -1702,6 +1767,86 @@ mod tests {
         let asks_again = resumable("a", Status::Blocked, 6);
         state.reconcile(GEN, std::slice::from_ref(&asks_again), NOW + 3);
         assert_eq!(shown(&state, &asks_again), (Display::Blocked, None));
+    }
+
+    #[test]
+    fn a_working_agent_asked_to_settle_settles_when_its_turn_ends() {
+        let working = resumable("a", Status::Working, 4);
+        let mut state = State::default();
+        state.reconcile(GEN, std::slice::from_ref(&working), NOW);
+        assert_eq!(
+            act(&mut state, &working, Action::ToggleSettle),
+            Ok(After::Nothing)
+        );
+        let row = state.ordered(std::slice::from_ref(&working)).remove(0);
+        assert_eq!(
+            (row.rank(), row.status_text(NOW)),
+            (Rank::Open, "working · settles when done".into())
+        );
+        assert!(
+            state
+                .reconcile(GEN, std::slice::from_ref(&working), NOW + 1)
+                .closes
+                .is_empty()
+        );
+
+        let done = resumable("a", Status::Done, 5);
+        let closes = state
+            .reconcile(GEN, std::slice::from_ref(&done), NOW + 2)
+            .closes;
+        assert_eq!(shown(&state, &done), (Display::Idle, Some(Park::Settled)));
+        assert_eq!(
+            closes
+                .iter()
+                .map(|close| close.pane_id.as_str())
+                .collect::<Vec<_>>(),
+            ["pane-a"]
+        );
+        assert!(
+            state
+                .reconcile(GEN, std::slice::from_ref(&done), NOW + 3)
+                .closes
+                .is_empty(),
+            "closes once"
+        );
+    }
+
+    type Step = fn(&mut State, &Observed);
+
+    #[test]
+    fn a_pending_settle_keeps_a_sessionless_pane_and_yields_to_a_block_s_or_snooze() {
+        let mut state = State::default();
+        let plain = agent("plain", Status::Working, 4);
+        state.reconcile(GEN, std::slice::from_ref(&plain), NOW);
+        act(&mut state, &plain, Action::ToggleSettle).unwrap();
+        let idle = agent("plain", Status::Idle, 5);
+        let landed = state.reconcile(GEN, std::slice::from_ref(&idle), NOW + 1);
+        assert!(landed.closes.is_empty(), "never closed for good unasked");
+        assert_eq!(shown(&state, &idle), (Display::Idle, Some(Park::Settled)));
+
+        let unpend: [(&str, Step); 3] = [
+            ("it blocks on you", |state, _| {
+                let blocked = resumable("a", Status::Blocked, 5);
+                state.reconcile(GEN, std::slice::from_ref(&blocked), NOW + 1);
+            }),
+            ("s again", |state, working| {
+                act(state, working, Action::ToggleSettle).unwrap();
+            }),
+            ("a snooze", |state, working| {
+                act(state, working, Action::Snooze(NOW + 60)).unwrap();
+            }),
+        ];
+        for (unpending, step) in unpend {
+            let working = resumable("a", Status::Working, 4);
+            let mut state = State::default();
+            state.reconcile(GEN, std::slice::from_ref(&working), NOW);
+            act(&mut state, &working, Action::ToggleSettle).unwrap();
+            step(&mut state, &working);
+            let done = resumable("a", Status::Done, 6);
+            let landed = state.reconcile(GEN, std::slice::from_ref(&done), NOW + 2);
+            assert!(landed.closes.is_empty(), "{unpending}");
+            assert_ne!(shown(&state, &done).1, Some(Park::Settled), "{unpending}");
+        }
     }
 
     #[test]

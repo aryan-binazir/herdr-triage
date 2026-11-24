@@ -252,6 +252,11 @@ impl Session {
         if let Some(title) = woke_notice(&reconciled.woke) {
             let _ = self.herdr.notify(&title);
         }
+        if let Ok((snapshot, _)) = &synced {
+            for close in &reconciled.closes {
+                let _ = self.close_session(snapshot, close);
+            }
+        }
         Ok(Some(synced.map(|(snapshot, edited)| {
             let wake_failed = wake_failed.map(|error| error.to_string());
             (
@@ -762,7 +767,7 @@ mod tests {
         let closing = [&read[..], &[report, view_set, list, "pane.close"]].concat();
         assert_eq!(methods(&fake), closing);
 
-        let refused = session.act("terminal:t-w1:p3", Action::ToggleSettle);
+        let refused = session.act("terminal:t-w1:p3", Action::ToggleUnread);
         assert!(matches!(refused, Ok(Outcome::Refused(_))));
         assert_eq!(methods(&fake), [&read[..], &[view_set]].concat());
 
@@ -1331,10 +1336,16 @@ mod tests {
             let fake = opencode_and_claude();
             fake.agents.lock().unwrap()[0]["agent_status"] = json!(status);
             let (mut session, _) = connect(&fake);
-            assert!(matches!(
-                session.act(key, Action::ToggleSettle).unwrap(),
-                Outcome::Refused(_)
-            ));
+            let settled = session.act(key, Action::ToggleSettle).unwrap();
+            assert_eq!(
+                matches!(settled, Outcome::Refused(_)),
+                status == "blocked",
+                "a working agent settles when its turn ends"
+            );
+            assert!(fake.take("pane.close").is_empty());
+            if status == "working" {
+                session.act(key, Action::ToggleSettle).unwrap();
+            }
             assert_eq!(
                 session.act(key, Action::Snooze(NOW + 3600)).unwrap(),
                 done(key)
@@ -1514,6 +1525,34 @@ mod tests {
     }
 
     #[test]
+    fn settling_a_working_agent_closes_its_pane_once_its_turn_ends() {
+        let fake = FakeHerdr::start(vec![
+            resumable_agent("w1:p1", "working", 3),
+            resumable_agent("w1:p2", "idle", 4),
+        ]);
+        let (mut session, _) = connect(&fake);
+        assert_eq!(session.act(KEY, Action::ToggleSettle).unwrap(), done(KEY));
+        assert!(fake.take("pane.close").is_empty());
+        session.sync().unwrap();
+        assert!(fake.take("pane.close").is_empty());
+        {
+            let mut agents = fake.agents.lock().unwrap();
+            agents[0]["agent_status"] = json!("done");
+            agents[0]["state_change_seq"] = json!(5);
+        }
+        session.sync().unwrap();
+        assert_eq!(fake.take("pane.close"), [json!({"pane_id": "w1:p1"})]);
+        let view = session.view().unwrap();
+        let row = &view
+            .items
+            .iter()
+            .find(|item| item.row.key == KEY)
+            .unwrap()
+            .row;
+        assert_eq!(row.status_text(NOW), "settled · closed");
+    }
+
+    #[test]
     fn a_snooze_arms_its_wake_only_once_triage_accepts_it() {
         let fake = FakeHerdr::start(vec![fake_herdr::agent("w1:p1", "idle", 3)]);
         let (mut session, armed) = connect(&fake);
@@ -1612,6 +1651,7 @@ mod tests {
             pinned: false,
             changed_at: None,
             status: triage::Status::Idle,
+            settle_pending: false,
             title: None,
             thread: Thread::default(),
         };

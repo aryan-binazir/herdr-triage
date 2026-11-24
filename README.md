@@ -121,8 +121,10 @@ and refused. A time that has passed while the prompt was open is refused too:
   without reopening it.
 - A thread whose session ends some other way settles as closed, even if you hadn't seen its result,
   unless you marked it unread or a snooze woke it: then it stays open as `unread · closed` or
-  `woke · closed`. Settle and unread are refused while an agent is working or blocked; snooze
-  works in any state.
+  `woke · closed`. Settling a working agent settles it when its turn ends (`working · settles
+  when done`, closing its pane then if it can be resumed; `s` again calls it off), unless the turn
+  ends blocked on you. Settle is refused while an agent is blocked, unread while it is working or
+  blocked; snooze works in any state.
 - **Undo** (`U`) takes back the last settle, snooze, wake, unread, pin or rename, once. It never closes
   a pane; undoing a settle or snooze that closed a session reopens it, unless it closed for good.
   Once the agent has done
