@@ -44,6 +44,7 @@ fn main() -> ExitCode {
         Some("open") => Herdr::connect()
             .and_then(|mut herdr| herdr.open_picker(invoked_from(&invocation_context()))),
         Some("picker") => run_picker(),
+        Some("mcp") if args.get(1).is_some_and(|arg| arg == "connect") => mcp::connect(),
         Some("mcp") => mcp::serve(
             mcp::Env::of_process(),
             io::stdin().lock(),
@@ -54,7 +55,7 @@ fn main() -> ExitCode {
             None => Err(io::Error::other("wake-at needs a unix time")),
         },
         _ => Err(io::Error::other(
-            "usage: herdr-triage <open|sync|startup|next|mcp|wake-at TIME>",
+            "usage: herdr-triage <open|sync|startup|next|mcp [connect]|wake-at TIME>",
         )),
     };
     match result {

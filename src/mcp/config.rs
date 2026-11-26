@@ -9,7 +9,10 @@ pub const HARNESSES: [&str; 3] = ["pi", "claude", "codex"];
 
 const TEMPLATE: &str = "\
 # herdr-triage MCP server: what `herdr_launch` starts when the caller does not say.
-# Read on every launch, so edits apply at once. Delete this file to get the defaults back.
+# Read on every tool call, so edits apply at once. Delete this file to get the defaults back.
+
+# false turns the server off on this machine: a client that starts it is offered no tools.
+enabled: true
 
 # The agent to launch: pi, claude or codex.
 default_harness: pi
@@ -74,6 +77,8 @@ pub struct Worktree {
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
+    #[serde(default = "enabled")]
+    pub enabled: bool,
     #[serde(default = "default_harness")]
     pub default_harness: String,
     #[serde(default)]
@@ -82,6 +87,10 @@ pub struct Config {
     pub projects: BTreeMap<String, Project>,
     #[serde(default)]
     pub worktree: Worktree,
+}
+
+fn enabled() -> bool {
+    true
 }
 
 fn default_harness() -> String {
@@ -223,15 +232,18 @@ fn builtin(harness: &str) -> Harness {
 }
 
 pub fn path() -> Option<PathBuf> {
-    let config = std::env::var_os("XDG_CONFIG_HOME")
+    Some(xdg_config_home()?.join("herdr-triage").join("mcp.yaml"))
+}
+
+pub fn xdg_config_home() -> Option<PathBuf> {
+    std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .filter(|dir| dir.is_absolute())
         .or_else(|| {
             std::env::var_os("HOME")
                 .map(|home| PathBuf::from(home).join(".config"))
                 .filter(|dir| dir.is_absolute())
-        })?;
-    Some(config.join("herdr-triage").join("mcp.yaml"))
+        })
 }
 
 pub fn write_template(path: &Path) {
@@ -305,6 +317,13 @@ mod tests {
             elsewhere.argv().unwrap(),
             ["--model", "opus", "--thinking", "medium"]
         );
+    }
+
+    #[test]
+    fn the_server_is_on_unless_the_file_turns_it_off() {
+        assert!(Config::load(None).unwrap().enabled);
+        assert!(config("default_harness: codex\n").enabled);
+        assert!(!config("enabled: false\n").enabled);
     }
 
     #[test]

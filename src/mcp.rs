@@ -1,14 +1,15 @@
 mod config;
+mod connect;
 mod ops;
 
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::{self, BufRead, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde_json::{Value, json};
 
-use crate::herdr;
+use crate::herdr::{self, Herdr};
 use crate::session::Session;
 use crate::store;
 use ops::{Call, Failure, LaunchArgs};
@@ -24,6 +25,11 @@ then herdr_wait for its turn to end and herdr_read what it did. Reach for \
 threads marked `mine` (the ones you launched) unless the user names another. A thread whose state \
 is `blocked` is waiting on an approval or a question that is the user's to answer: report it, never \
 answer it. Use herdr_organize's `forget` only when the user asks for it.";
+
+const TURNED_OFF: &str = "\
+Starts and drives coding agents in the user's Herdr terminal session, but the user has turned it \
+off on this machine, so it offers no tools here. If asked to use Herdr, say that it is turned off \
+(`enabled: false` in the server's settings file); do not look for another way to do it.";
 
 pub struct Env {
     pub socket: PathBuf,
@@ -51,7 +57,8 @@ impl Env {
 
 /// Each plugin update puts the binary somewhere new.
 pub fn link_for_clients() {
-    let Ok(binary) = std::env::current_exe() else {
+    // macOS reports the path a program was started by: run by hand, that can be this link.
+    let Ok(binary) = std::env::current_exe().and_then(fs::canonicalize) else {
         return;
     };
     let link = store::state_root().join("herdr-triage");
@@ -68,6 +75,36 @@ pub fn link_for_clients() {
     if linked.is_err() {
         let _ = fs::remove_file(&staged);
     }
+}
+
+pub fn connect() -> io::Result<()> {
+    let settings = config::path();
+    if let Some(path) = &settings {
+        config::write_template(path);
+    }
+    let done = match config::Config::load(settings.as_deref()) {
+        Ok(config) if config.enabled => {
+            link_for_clients();
+            connect::connect()
+        }
+        Ok(_) => Err(format!(
+            "Herdr MCP is turned off on this machine: {}",
+            switched_off_in(settings.as_deref())
+        )),
+        Err(error) => Err(error.to_string()),
+    };
+    let (title, said) = match &done {
+        Ok(said) => ("Herdr MCP connected", said),
+        Err(said) => ("Herdr MCP connect failed", said),
+    };
+    let _ = Herdr::connect().and_then(|mut herdr| herdr.notify_at_length(title, said));
+    done.map(|said| println!("{said}"))
+        .map_err(io::Error::other)
+}
+
+fn switched_off_in(settings: Option<&Path>) -> String {
+    let file = settings.map_or_else(String::new, |path| format!(" in {}", path.display()));
+    format!("`enabled: false`{file}")
 }
 
 struct Tool {
@@ -229,10 +266,25 @@ struct Server {
 }
 
 impl Server {
+    fn off(&self) -> bool {
+        ops::config(&self.env).is_ok_and(|config| !config.enabled)
+    }
+
     fn call(&mut self, name: &str, arguments: Value) -> Result<Value, Failure> {
+        let config = ops::config(&self.env)?;
+        if !config.enabled {
+            return Err(Failure::new(
+                "disabled",
+                format!(
+                    "The user turned this server off on this machine ({}). Tell them so; do \
+                     not look for another way to do it.",
+                    switched_off_in(self.env.config.as_deref())
+                ),
+            ));
+        }
         let who = format!("{}:{}", self.client, self.instance);
         if name != "herdr_launch" {
-            let mut call = Call::open(&self.env, &who)?;
+            let mut call = Call::open(&self.env, &who, &config)?;
             return match name {
                 "herdr_projects" => ops::projects_tool(&mut call, arguments),
                 "herdr_capabilities" => ops::capabilities_tool(&mut call, arguments),
@@ -251,7 +303,7 @@ impl Server {
         {
             return first.clone();
         }
-        let result = Call::open(&self.env, &who)
+        let result = Call::open(&self.env, &who, &config)
             .and_then(|mut call| ops::launch_tool(&mut call, &args, ops::LAUNCH_BUDGET));
         let worktree_asked_for = result
             .as_ref()
@@ -297,11 +349,14 @@ impl Server {
                     "protocolVersion": protocol.unwrap_or(&NEWEST_PROTOCOL),
                     "capabilities": {"tools": {}},
                     "serverInfo": {"name": "herdr-triage", "version": env!("CARGO_PKG_VERSION")},
-                    "instructions": INSTRUCTIONS,
+                    "instructions": if self.off() { TURNED_OFF } else { INSTRUCTIONS },
                 }))
             }
             "ping" => Ok(json!({})),
-            "tools/list" => Ok(json!({"tools": tools().iter().map(listing).collect::<Vec<_>>()})),
+            "tools/list" => {
+                let offered = if self.off() { Vec::new() } else { tools() };
+                Ok(json!({"tools": offered.iter().map(listing).collect::<Vec<_>>()}))
+            }
             "tools/call" => {
                 let name = params["name"].as_str().unwrap_or_default();
                 let arguments = params["arguments"].clone();
@@ -884,7 +939,7 @@ mod tests {
     }
 
     #[test]
-    fn a_config_file_that_does_not_parse_stops_a_launch() {
+    fn a_config_file_that_does_not_parse_stops_every_tool() {
         let mut rig = rig(vec![], None);
         rig.config("default_harness: [\n");
         let error = rig.failure(
@@ -893,6 +948,34 @@ mod tests {
         );
         assert_eq!(error["code"], "bad_config");
         assert!(rig.worktrees().is_empty());
+        let off_switch_unread = rig.failure("herdr_threads", json!({}));
+        assert_eq!(off_switch_unread["code"], "bad_config");
+        let listed = rig.request("tools/list", json!({}));
+        assert_eq!(listed["result"]["tools"].as_array().unwrap().len(), 8);
+    }
+
+    #[test]
+    fn a_server_the_user_turned_off_offers_no_tools_and_runs_none() {
+        let mut rig = rig(vec![resumable("w1:p1", "idle", 3)], None);
+        rig.config("enabled: false\n");
+        let hello = rig.request("initialize", json!({}));
+        let instructions = hello["result"]["instructions"].as_str().unwrap();
+        assert!(instructions.contains("turned it off"), "{instructions}");
+        let listed = rig.request("tools/list", json!({}));
+        assert_eq!(listed["result"]["tools"], json!([]));
+        let error = rig.failure("herdr_send", json!({"thread": "w1:p1", "message": "go"}));
+        assert_eq!(error["code"], "disabled");
+        let message = error["message"].as_str().unwrap();
+        assert!(message.contains("`enabled: false` in "), "{message}");
+        assert!(message.contains("mcp.yaml"), "{message}");
+        assert!(rig.fake.requests.lock().unwrap().is_empty());
+
+        rig.config("enabled: true\n");
+        let hello = rig.request("initialize", json!({}));
+        assert_eq!(hello["result"]["instructions"], INSTRUCTIONS);
+        let listed = rig.request("tools/list", json!({}));
+        assert_eq!(listed["result"]["tools"].as_array().unwrap().len(), 8);
+        assert_eq!(rig.threads().len(), 1);
     }
 
     #[test]
@@ -950,7 +1033,8 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(50));
         });
         let args = LaunchArgs::decode(json!({"project": "acme-api", "title": "Slow"})).unwrap();
-        let mut call = Call::open(&rig.server.env, "test-client:i1").unwrap();
+        let config = ops::config(&rig.server.env).unwrap();
+        let mut call = Call::open(&rig.server.env, "test-client:i1", &config).unwrap();
         let budget = std::time::Duration::from_millis(20);
         let error = ops::launch_tool(&mut call, &args, budget).unwrap_err();
         assert_eq!(error.code, "launch_timeout");
@@ -962,7 +1046,8 @@ mod tests {
     fn too_little_time_for_a_checkout_fails_before_asking_and_is_not_kept_for_retries() {
         let rig = rig(vec![], None);
         let args = LaunchArgs::decode(json!({"project": "acme-api", "title": "t"})).unwrap();
-        let mut call = Call::open(&rig.server.env, "test-client:i1").unwrap();
+        let config = ops::config(&rig.server.env).unwrap();
+        let mut call = Call::open(&rig.server.env, "test-client:i1", &config).unwrap();
         let budget = std::time::Duration::from_secs(5);
         let error = ops::launch_tool(&mut call, &args, budget).unwrap_err();
         assert_eq!(error.code, "launch_timeout");
