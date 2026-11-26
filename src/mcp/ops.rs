@@ -89,7 +89,7 @@ pub struct Call<'a> {
     client: &'a str,
     herdr: Herdr,
     session: Session,
-    config: Config,
+    config: &'a Config,
     caller: Option<Caller>,
     deadline: Option<Instant>,
 }
@@ -101,7 +101,7 @@ struct Caller {
 }
 
 impl<'a> Call<'a> {
-    pub fn open(env: &'a Env, client: &'a str, config: Config) -> Result<Self, Failure> {
+    pub fn open(env: &'a Env, client: &'a str, config: &'a Config) -> Result<Self, Failure> {
         Ok(Self {
             env,
             client,
@@ -441,7 +441,7 @@ pub fn projects_tool(call: &mut Call, arguments: Value) -> Done {
     #[serde(deny_unknown_fields)]
     struct Args {}
     let Args {} = decode(arguments)?;
-    let config = call.config.clone();
+    let config = call.config;
     let workspaces = call.workspaces()?;
     let threads = call.threads()?;
     let listed: Vec<Value> = projects(&workspaces)
@@ -479,7 +479,7 @@ pub fn capabilities_tool(call: &mut Call, arguments: Value) -> Done {
     #[serde(deny_unknown_fields)]
     struct Args {}
     let Args {} = decode(arguments)?;
-    let config = call.config.clone();
+    let config = call.config;
     let harnesses: Map<String, Value> = HARNESSES
         .iter()
         .map(|name| {
@@ -544,7 +544,7 @@ struct Opened {
 pub fn launch_tool(call: &mut Call, args: &LaunchArgs, budget: Duration) -> Done {
     let deadline = Instant::now() + budget;
     call.deadline = Some(deadline);
-    let config = call.config.clone();
+    let config = call.config;
     let caller = call.caller();
     let workspaces = call.workspaces()?;
     let query = args
@@ -579,7 +579,7 @@ pub fn launch_tool(call: &mut Call, args: &LaunchArgs, budget: Duration) -> Done
     }
     let opened = open_worktree(
         call,
-        &config,
+        config,
         &project,
         &branch,
         args.base.as_deref(),

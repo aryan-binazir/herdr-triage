@@ -38,7 +38,13 @@ fn apps() -> Vec<App> {
         home.as_ref()
             .map(|home| home.join("Library/Application Support"))
     } else {
+        // Herdr can be given a config home the desktop never sees: Claude is then in the usual one.
+        let usual = home.as_ref().map(|home| home.join(".config"));
+        let has_claude = |dir: &PathBuf| dir.join("Claude").is_dir();
         config::xdg_config_home()
+            .into_iter()
+            .chain(usual)
+            .find(has_claude)
     };
     let codex = std::env::var_os("CODEX_HOME")
         .map(PathBuf::from)

@@ -57,7 +57,8 @@ impl Env {
 
 /// Each plugin update puts the binary somewhere new.
 pub fn link_for_clients() {
-    let Ok(binary) = std::env::current_exe() else {
+    // macOS names the path a program was started by, which for a client is this link itself.
+    let Ok(binary) = std::env::current_exe().and_then(fs::canonicalize) else {
         return;
     };
     let link = store::state_root().join("herdr-triage");
@@ -79,21 +80,26 @@ pub fn link_for_clients() {
 /// Sets Claude Desktop, `ChatGPT` and Codex, where they are on this machine, to start this server,
 /// and says in Herdr what came of it.
 pub fn connect() -> io::Result<()> {
-    link_for_clients();
     let settings = config::path();
     if let Some(path) = &settings {
         config::write_template(path);
     }
     let done = match config::Config::load(settings.as_deref()) {
-        Ok(config) if config.enabled => connect::connect(),
+        Ok(config) if config.enabled => {
+            link_for_clients();
+            connect::connect()
+        }
         Ok(_) => Err(format!(
             "Herdr MCP is turned off on this machine: {}",
             switched_off_in(settings.as_deref())
         )),
         Err(error) => Err(error.to_string()),
     };
-    let (Ok(said) | Err(said)) = &done;
-    let _ = Herdr::connect().and_then(|mut herdr| herdr.notify(said));
+    let (title, said) = match &done {
+        Ok(said) => ("Herdr MCP connected", said),
+        Err(said) => ("Herdr MCP connect failed", said),
+    };
+    let _ = Herdr::connect().and_then(|mut herdr| herdr.notify_at_length(title, said));
     done.map(|said| println!("{said}"))
         .map_err(io::Error::other)
 }
@@ -282,7 +288,7 @@ impl Server {
         }
         let who = format!("{}:{}", self.client, self.instance);
         if name != "herdr_launch" {
-            let mut call = Call::open(&self.env, &who, config)?;
+            let mut call = Call::open(&self.env, &who, &config)?;
             return match name {
                 "herdr_projects" => ops::projects_tool(&mut call, arguments),
                 "herdr_capabilities" => ops::capabilities_tool(&mut call, arguments),
@@ -301,7 +307,7 @@ impl Server {
         {
             return first.clone();
         }
-        let result = Call::open(&self.env, &who, config)
+        let result = Call::open(&self.env, &who, &config)
             .and_then(|mut call| ops::launch_tool(&mut call, &args, ops::LAUNCH_BUDGET));
         let worktree_asked_for = result
             .as_ref()
@@ -1031,12 +1037,8 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(50));
         });
         let args = LaunchArgs::decode(json!({"project": "acme-api", "title": "Slow"})).unwrap();
-        let mut call = Call::open(
-            &rig.server.env,
-            "test-client:i1",
-            ops::config(&rig.server.env).unwrap(),
-        )
-        .unwrap();
+        let config = ops::config(&rig.server.env).unwrap();
+        let mut call = Call::open(&rig.server.env, "test-client:i1", &config).unwrap();
         let budget = std::time::Duration::from_millis(20);
         let error = ops::launch_tool(&mut call, &args, budget).unwrap_err();
         assert_eq!(error.code, "launch_timeout");
@@ -1048,12 +1050,8 @@ mod tests {
     fn too_little_time_for_a_checkout_fails_before_asking_and_is_not_kept_for_retries() {
         let rig = rig(vec![], None);
         let args = LaunchArgs::decode(json!({"project": "acme-api", "title": "t"})).unwrap();
-        let mut call = Call::open(
-            &rig.server.env,
-            "test-client:i1",
-            ops::config(&rig.server.env).unwrap(),
-        )
-        .unwrap();
+        let config = ops::config(&rig.server.env).unwrap();
+        let mut call = Call::open(&rig.server.env, "test-client:i1", &config).unwrap();
         let budget = std::time::Duration::from_secs(5);
         let error = ops::launch_tool(&mut call, &args, budget).unwrap_err();
         assert_eq!(error.code, "launch_timeout");

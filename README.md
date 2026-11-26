@@ -208,8 +208,9 @@ installed app once first) and leaves the rest of the settings as they were: `mcp
 Claude's `claude_desktop_config.json`, and `[mcp_servers.herdr]` in `~/.codex/config.toml`
 (`$CODEX_HOME` if set to an absolute path). The ChatGPT app and the Codex command share that
 file, so every Codex session gets the tools, including the agents this server launches. Herdr
-shows a notification saying what it connected. Running it again is safe; it refuses a `herdr`
-entry that is some other server, and keeps the file's owner, group and mode.
+shows a notification saying what it connected, and the command prints the same. Running it again
+is safe; it refuses a `herdr` entry that is some other server, and keeps the file's owner, group
+and mode.
 
 The server is the plugin's own binary. Each plugin update installs it in a new directory, so
 Herdr's hooks keep a link to the current one at `~/.local/state/herdr/plugins/ar.triage/herdr-triage`
@@ -221,9 +222,10 @@ they keep working across updates.
 These apps start a server with little of your environment, so the action also writes where the
 plugin keeps its settings and state (`XDG_CONFIG_HOME` and `HERDR_PLUGIN_STATE_DIR`) into each
 entry: the server reads the same off switch and triage database as the plugin, whatever started
-it. In Codex's entry, `env_vars` lets `HERDR_PANE_ID` and `HERDR_SOCKET_PATH` through, and
-`tool_timeout_sec = 300` leaves room for a large repository's worktree checkout (Codex allows 60
-seconds otherwise; a launch takes at most four minutes).
+it. A new Codex entry also gets `env_vars`, which lets `HERDR_PANE_ID` and `HERDR_SOCKET_PATH`
+through, and `tool_timeout_sec = 300`, which leaves room for a large repository's worktree
+checkout (Codex allows 60 seconds otherwise; a launch takes at most four minutes). An entry that
+already sets either keeps its own.
 
 For Claude Code, register it once:
 

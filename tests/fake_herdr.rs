@@ -565,9 +565,12 @@ impl Desktop {
             Err(said.trim().trim_start_matches("herdr-triage: ").to_owned())
         };
         let notes = self.herdr.take("notification.show");
-        let (Ok(shown) | Err(shown)) = &said;
+        let (title, shown) = match &said {
+            Ok(shown) => ("Herdr MCP connected", shown),
+            Err(shown) => ("Herdr MCP connect failed", shown),
+        };
         assert_eq!(notes.len(), 1, "{shown}");
-        assert_eq!(notes[0]["title"], *shown);
+        assert_eq!(notes[0], json!({"title": title, "body": shown}));
         said
     }
 
@@ -684,6 +687,7 @@ fn connect_changes_nothing_on_a_machine_where_the_server_is_turned_off() {
     assert!(refused.contains("mcp.yaml"), "{refused}");
     assert!(!desktop.claude.exists());
     assert!(!desktop.codex.exists());
+    assert!(!desktop.herdr.state_dir().join("herdr-triage").exists());
 }
 
 #[test]
@@ -818,15 +822,16 @@ fn connect_keeps_the_owner_group_and_mode_of_the_settings_it_rewrites() {
 }
 
 #[test]
-fn a_server_an_app_starts_obeys_the_off_switch_the_plugin_reads() {
+fn a_server_an_app_starts_drives_the_plugins_herdr_and_obeys_its_off_switch() {
     use std::io::Write;
     use std::process::Stdio;
 
     let desktop = desktop();
+    let home = desktop.herdr.dir.path().join("home");
     let elsewhere = desktop.herdr.dir.path().join("xdg");
     let connect = Command::new(env!("CARGO_BIN_EXE_herdr-triage"))
         .args(["mcp", "connect"])
-        .env("HOME", desktop.herdr.dir.path().join("home"))
+        .env("HOME", &home)
         .env("XDG_CONFIG_HOME", &elsewhere)
         .env("CODEX_HOME", desktop.codex.parent().unwrap())
         .env("HERDR_SOCKET_PATH", &desktop.herdr.socket)
@@ -834,32 +839,46 @@ fn a_server_an_app_starts_obeys_the_off_switch_the_plugin_reads() {
         .output()
         .unwrap();
     assert!(connect.status.success());
-    std::fs::write(elsewhere.join("herdr-triage/mcp.yaml"), "enabled: false\n").unwrap();
+    let claude = desktop.claude_server();
+    assert_eq!(
+        claude["env"]["XDG_CONFIG_HOME"],
+        json!(elsewhere),
+        "found in the usual folder, pinned to the plugin's"
+    );
+    std::fs::create_dir_all(elsewhere.join("herdr")).unwrap();
+    std::os::unix::fs::symlink(&desktop.herdr.socket, elsewhere.join("herdr/herdr.sock")).unwrap();
 
-    let entry = desktop.codex_server();
-    let pinned = entry["env"].as_table().unwrap();
-    let mut server = Command::new(entry["command"].as_str().unwrap())
-        .args(
-            entry["args"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .map(|arg| arg.as_str().unwrap()),
-        )
-        .env_clear()
-        .env("HOME", desktop.herdr.dir.path().join("home"))
-        .envs(
-            pinned
-                .iter()
-                .map(|(name, value)| (name, value.as_str().unwrap())),
-        )
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .spawn()
-        .unwrap();
-    let list = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"});
-    writeln!(server.stdin.take().unwrap(), "{list}").unwrap();
-    let output = server.wait_with_output().unwrap();
-    let reply: Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(reply["result"]["tools"], json!([]));
+    let ask = |request: Value| {
+        let pinned = claude["env"].as_object().unwrap();
+        let mut server = Command::new(claude["command"].as_str().unwrap())
+            .arg("mcp")
+            .env_clear()
+            .env("HOME", &home)
+            .envs(
+                pinned
+                    .iter()
+                    .map(|(name, value)| (name, value.as_str().unwrap())),
+            )
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        writeln!(server.stdin.take().unwrap(), "{request}").unwrap();
+        let output = server.wait_with_output().unwrap();
+        serde_json::from_slice::<Value>(&output.stdout).unwrap()
+    };
+    let threads = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                         "params": {"name": "herdr_threads", "arguments": {}}});
+    desktop.herdr.take("agent.list");
+    let listed = ask(threads.clone());
+    assert_eq!(listed["result"]["isError"], false, "{listed}");
+    assert!(!desktop.herdr.take("agent.list").is_empty());
+
+    std::fs::write(elsewhere.join("herdr-triage/mcp.yaml"), "enabled: false\n").unwrap();
+    let tools = ask(json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}));
+    assert_eq!(tools["result"]["tools"], json!([]));
+    let refused = ask(threads);
+    let refused = &refused["result"]["structuredContent"]["error"];
+    assert_eq!(refused["code"], "disabled");
+    assert!(desktop.herdr.take("agent.list").is_empty());
 }
