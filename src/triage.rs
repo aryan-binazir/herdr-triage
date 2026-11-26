@@ -249,8 +249,8 @@ impl Record {
         }
     }
 
-    /// Closes a pane snoozed mid-turn once that turn has ended, but never the agent you are on.
-    fn close_if_turn_ended(&mut self, agent: &Observed, on_it: bool) -> Option<Close> {
+    /// Closes a pane snoozed mid-turn once that turn has ended and you are on another agent.
+    fn close_if_turn_ended(&mut self, agent: &Observed, away: bool) -> Option<Close> {
         let terminal = self.close_requested.as_deref()?;
         let Some(park @ Park::Snoozed { .. }) = self.park.filter(|_| terminal == agent.terminal_id)
         else {
@@ -258,9 +258,12 @@ impl Record {
             return None;
         };
         match agent.status {
-            Status::Idle | Status::Done if !on_it => {
+            Status::Idle | Status::Done if away => {
                 self.close_requested = None;
-                Some(Close::of(agent, park))
+                Some(Close {
+                    when_done: true,
+                    ..Close::of(agent, park)
+                })
             }
             _ => None,
         }
@@ -324,8 +327,9 @@ impl<'a> Focus<'a> {
             .or(self.before.as_deref())
     }
 
-    fn is_on(&self, agent: &Observed) -> bool {
-        names(self.on(), agent)
+    /// You are known to be on an agent other than `agent`.
+    fn elsewhere(&self, agent: &Observed) -> bool {
+        self.on().is_some() && !names(self.on(), agent)
     }
 
     /// You came to `agent` from another agent.
@@ -544,6 +548,8 @@ pub struct Close {
     terminal_id: String,
     seq: u64,
     workspace_panes: usize,
+    /// Asked for at a snooze and landing at its turn's end: it spares the agent you are on.
+    when_done: bool,
 }
 
 impl Close {
@@ -555,6 +561,7 @@ impl Close {
             terminal_id: agent.terminal_id.clone(),
             seq: agent.seq,
             workspace_panes: agent.workspace_panes,
+            when_done: false,
         }
     }
 }
@@ -693,7 +700,9 @@ impl Row {
         let text = self.state_text(now, self.live());
         match (self.live(), self.park) {
             (false, _) => format!("{text} · closed"),
-            (true, Some(_)) if self.close_pending => format!("{text} · closes when done"),
+            (true, Some(_)) if self.close_pending && self.workspace_panes > 1 => {
+                format!("{text} · closes when done")
+            }
             (true, Some(_)) => format!("{text} · stays open"),
             (true, None) if self.settle_pending => format!("{text} · settles when done"),
             (true, None) => text,
@@ -950,7 +959,7 @@ impl State {
                 woke.push(record.label().to_owned());
             }
             record.see(agent, &focus);
-            closes.extend(record.close_if_turn_ended(agent, focus.is_on(agent)));
+            closes.extend(record.close_if_turn_ended(agent, focus.elsewhere(agent)));
             if now.saturating_sub(record.touched_at) >= LIVE_TOUCH_INTERVAL_SECS {
                 record.touch(now);
             }
@@ -1118,12 +1127,18 @@ impl State {
         };
         let restoring = record.restoring(now);
         let resumable = record.resumable();
+        if !resumable && matches!(close.park, Park::Snoozed { .. }) {
+            return Ok(Closing::Skip);
+        }
         let shown = look()?;
         let mut panes = shown.iter().filter(|agent| agent.key == close.key);
         let (Some(pane), None) = (panes.next(), panes.next()) else {
             return Ok(Closing::Skip);
         };
-        let quiet_since_action = pane.terminal_id == close.terminal_id
+        let reached =
+            close.when_done && !Focus::of(&shown, self.last_focused.clone()).elsewhere(pane);
+        let quiet_since_action = !reached
+            && pane.terminal_id == close.terminal_id
             && !matches!(pane.status, Status::Working | Status::Blocked)
             && (resumable || pane.status != Status::Unknown)
             && (pane.seq == close.seq || (restoring && resumable));
@@ -2016,7 +2031,11 @@ mod tests {
     fn a_working_agent_snoozed_closes_its_pane_once_its_turn_ends() {
         let working = resumable("a", Status::Working, 4);
         let mut state = State::default();
-        state.reconcile(GEN, std::slice::from_ref(&working), NOW);
+        state.reconcile(
+            GEN,
+            &[working.clone(), on(&agent("b", Status::Idle, 1))],
+            NOW,
+        );
         assert_eq!(
             state.apply("a", Some(&working), Action::Snooze(NOW + 3600), NOW),
             Ok(After::Nothing),
@@ -2037,6 +2056,7 @@ mod tests {
                 terminal_id: "term-a".into(),
                 seq: 5,
                 workspace_panes: 2,
+                when_done: true,
             }]
         );
         assert_eq!(shown(&state, &done).1, Some(snoozed), "it stays snoozed");
@@ -2044,10 +2064,15 @@ mod tests {
         assert!(again.closes.is_empty(), "one close per turn");
     }
 
+    /// "a" snoozed mid-turn while you are on "b".
     fn snoozed_mid_turn(until: i64) -> State {
         let working = resumable("a", Status::Working, 4);
         let mut state = State::default();
-        state.reconcile(GEN, std::slice::from_ref(&working), NOW);
+        state.reconcile(
+            GEN,
+            &[working.clone(), on(&agent("b", Status::Idle, 1))],
+            NOW,
+        );
         state
             .apply("a", Some(&working), Action::Snooze(until), NOW)
             .unwrap();
@@ -2151,6 +2176,66 @@ mod tests {
             .unwrap();
         let late = woken.confirm_close(&closes[0], GEN, NOW + 2, || Ok(vec![done]));
         assert!(matches!(late, Ok(Closing::Skip)), "woken by hand");
+    }
+
+    #[test]
+    fn a_snooze_close_spares_an_agent_you_reached_before_it_landed() {
+        let a = resumable("a", Status::Working, 4);
+        let b = resumable("b", Status::Idle, 4);
+        let mut state = State::default();
+        state.reconcile(GEN, &[a.clone(), on(&b)], NOW);
+        state
+            .apply("a", Some(&a), Action::Snooze(NOW + 3600), NOW)
+            .unwrap();
+        let done = resumable("a", Status::Done, 5);
+        let closes = state
+            .reconcile(GEN, &[done.clone(), on(&b)], NOW + 1)
+            .closes;
+        let reached = state.confirm_close(&closes[0], GEN, NOW + 1, || Ok(vec![on(&done), b]));
+        assert!(matches!(reached, Ok(Closing::Skip)));
+    }
+
+    #[test]
+    fn a_snooze_close_waits_to_learn_which_agent_you_are_on() {
+        let working = resumable("a", Status::Working, 4);
+        let mut state = State::default();
+        state.reconcile(GEN, std::slice::from_ref(&working), NOW);
+        act(&mut state, &working, Action::Snooze(NOW + 3600)).unwrap();
+        let done = resumable("a", Status::Done, 5);
+        let other = resumable("b", Status::Idle, 4);
+        let unknown = state.reconcile(GEN, &[done.clone(), other.clone()], NOW + 1);
+        assert!(unknown.closes.is_empty(), "no agent seen focused yet");
+        let elsewhere = state.reconcile(GEN, &[done, on(&other)], NOW + 2);
+        assert_eq!(elsewhere.closes.len(), 1);
+    }
+
+    #[test]
+    fn the_last_pane_of_a_workspace_does_not_promise_to_close() {
+        let working = Observed {
+            workspace_panes: 1,
+            ..resumable("a", Status::Working, 4)
+        };
+        let mut state = State::default();
+        state.reconcile(GEN, std::slice::from_ref(&working), NOW);
+        act(&mut state, &working, Action::Snooze(NOW + 3600)).unwrap();
+        let row = state.ordered(std::slice::from_ref(&working)).remove(0);
+        assert_eq!(row.status_text(NOW), "snoozed · 1h · stays open");
+    }
+
+    #[test]
+    fn a_snooze_never_closes_an_agent_for_good() {
+        let mut state = snoozed_mid_turn(NOW + 3600);
+        let done = resumable("a", Status::Done, 5);
+        let closes = state
+            .reconcile(
+                GEN,
+                &[done.clone(), on(&resumable("b", Status::Idle, 4))],
+                NOW + 1,
+            )
+            .closes;
+        state.records.get_mut("a").unwrap().thread.session = None;
+        let closing = state.confirm_close(&closes[0], GEN, NOW + 1, || Ok(vec![done]));
+        assert!(matches!(closing, Ok(Closing::Skip)), "{closing:?}");
     }
 
     #[test]

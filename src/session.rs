@@ -1619,10 +1619,9 @@ mod tests {
 
     #[test]
     fn snoozing_a_working_agent_closes_its_pane_once_its_turn_ends() {
-        let fake = FakeHerdr::start(vec![
-            resumable_agent("w1:p1", "working", 3),
-            resumable_agent("w1:p2", "idle", 4),
-        ]);
+        let mut elsewhere = resumable_agent("w1:p2", "idle", 4);
+        elsewhere["focused"] = json!(true);
+        let fake = FakeHerdr::start(vec![resumable_agent("w1:p1", "working", 3), elsewhere]);
         let (mut session, _) = connect(&fake);
         session.act(KEY, Action::Snooze(NOW + 3600)).unwrap();
         session.sync().unwrap();
