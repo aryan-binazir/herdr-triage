@@ -7,7 +7,7 @@ use rusqlite::{Connection, OptionalExtension, Transaction, params};
 
 use crate::triage::{Park, Record, Section, SessionRef, State, Status, Thread, Unread};
 
-const SCHEMA_VERSION: i32 = 7;
+const SCHEMA_VERSION: i32 = 8;
 
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS threads (
@@ -39,7 +39,8 @@ CREATE TABLE IF NOT EXISTS threads (
     restored_at INTEGER,
     title TEXT,
     launched_by TEXT,
-    settle_requested TEXT
+    settle_requested TEXT,
+    close_requested TEXT
 );
 CREATE TABLE IF NOT EXISTS settings (name TEXT PRIMARY KEY, value TEXT NOT NULL);
 ";
@@ -176,11 +177,13 @@ impl Store {
             records,
             open_sections,
             undo,
+            last_focused,
         } = &state;
         let before = State {
             records: records.clone(),
             open_sections: open_sections.clone(),
             undo: undo.clone(),
+            last_focused: last_focused.clone(),
         };
         let result = change(&mut state);
         save(&tx, &state, &before).map_err(broken)?;
@@ -222,13 +225,14 @@ impl std::fmt::Display for DatabaseError {
 
 impl std::error::Error for DatabaseError {}
 
-const LATER_COLUMNS: [(&str, &str); 6] = [
+const LATER_COLUMNS: [(&str, &str); 7] = [
     ("ended", "INTEGER NOT NULL DEFAULT 0"),
     ("reopen_generation", "TEXT"),
     ("restored_at", "INTEGER"),
     ("title", "TEXT"),
     ("launched_by", "TEXT"),
     ("settle_requested", "TEXT"),
+    ("close_requested", "TEXT"),
 ];
 
 fn add_missing_columns(connection: &Connection) -> rusqlite::Result<()> {
@@ -260,7 +264,7 @@ fn load(tx: &Transaction) -> rusqlite::Result<State> {
          changed_at, touched_at, live, ended, missing_since, last_status, label, agent, cwd, \
          workspace_id, workspace_label, session_source, session_kind, session_value, \
          reopen_pane, reopen_at, reopen_generation, restored_at, title, launched_by, \
-         settle_requested FROM threads",
+         settle_requested, close_requested FROM threads",
     )?;
     let rows = threads.query_map([], |row| {
         let park = match (row.get::<_, Option<String>>(2)?.as_deref(), row.get(3)?) {
@@ -311,6 +315,7 @@ fn load(tx: &Transaction) -> rusqlite::Result<State> {
             title: row.get(26)?,
             launched_by: row.get(27)?,
             settle_requested: row.get(28)?,
+            close_requested: row.get(29)?,
         };
         Ok((row.get::<_, String>(0)?, record))
     })?;
@@ -343,6 +348,13 @@ fn load(tx: &Transaction) -> rusqlite::Result<State> {
         )
         .optional()?;
     state.undo = undo.and_then(|json| serde_json::from_str(&json).ok());
+    state.last_focused = tx
+        .query_row(
+            "SELECT value FROM settings WHERE name = 'last_focused'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
     Ok(state)
 }
 
@@ -362,9 +374,10 @@ fn save(tx: &Transaction, state: &State, before: &State) -> rusqlite::Result<()>
         "INSERT OR REPLACE INTO threads (key, pinned, park, snooze_until, unread, ack_seq, generation, \
          last_seq, changed_at, touched_at, live, ended, missing_since, last_status, label, agent, \
          cwd, workspace_id, workspace_label, session_source, session_kind, session_value, \
-         reopen_pane, reopen_at, reopen_generation, restored_at, title, launched_by, settle_requested) \
+         reopen_pane, reopen_at, reopen_generation, restored_at, title, launched_by, settle_requested, \
+         close_requested) \
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, \
-         ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29)",
+         ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30)",
     )?;
     for (key, r) in &state.records {
         if before.records.get(key) == Some(r) {
@@ -411,6 +424,7 @@ fn save(tx: &Transaction, state: &State, before: &State) -> rusqlite::Result<()>
             r.title,
             r.launched_by,
             r.settle_requested,
+            r.close_requested,
         ])?;
     }
     if before.open_sections != state.open_sections {
@@ -438,6 +452,20 @@ fn save(tx: &Transaction, state: &State, before: &State) -> rusqlite::Result<()>
             None => tx.execute("DELETE FROM settings WHERE name = 'undo'", [])?,
         };
     }
+    if before.last_focused != state.last_focused {
+        save_last_focused(tx, state.last_focused.as_deref())?;
+    }
+    Ok(())
+}
+
+fn save_last_focused(tx: &Transaction, key: Option<&str>) -> rusqlite::Result<()> {
+    match key {
+        Some(key) => tx.execute(
+            "INSERT OR REPLACE INTO settings VALUES ('last_focused', ?1)",
+            [key],
+        )?,
+        None => tx.execute("DELETE FROM settings WHERE name = 'last_focused'", [])?,
+    };
     Ok(())
 }
 
@@ -477,9 +505,10 @@ mod tests {
             "INSERT INTO threads (key, pinned, park, snooze_until, unread, ack_seq, generation, \
              last_seq, changed_at, touched_at, live, ended, missing_since, last_status, label, agent, \
              cwd, workspace_id, workspace_label, session_source, session_kind, session_value, \
-             reopen_pane, reopen_at, reopen_generation, restored_at, title, launched_by, settle_requested) \
+             reopen_pane, reopen_at, reopen_generation, restored_at, title, launched_by, settle_requested, \
+         close_requested) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, \
-             ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29)",
+             ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30)",
         )?;
         for (key, r) in &state.records {
             let (park, until) = match r.park {
@@ -523,6 +552,7 @@ mod tests {
                 r.title,
                 r.launched_by,
                 r.settle_requested,
+                r.close_requested,
             ])?;
         }
         let sections: Vec<&str> = state
@@ -546,7 +576,7 @@ mod tests {
             )?,
             None => tx.execute("DELETE FROM settings WHERE name = 'undo'", [])?,
         };
-        Ok(())
+        save_last_focused(tx, state.last_focused.as_deref())
     }
 
     fn record() -> Record {
@@ -582,6 +612,7 @@ mod tests {
             title: Some("checkout flow".into()),
             launched_by: Some("client:claude-code".into()),
             settle_requested: Some("term-7".into()),
+            close_requested: Some("term-8".into()),
         }
     }
 
@@ -804,18 +835,21 @@ mod tests {
                 state.open_sections.insert(Section::Settled);
                 state.open_sections.insert(Section::Working);
                 state.rename("terminal:t1", Some("release notes".into()), 9);
+                state.last_focused = Some("terminal:t1".into());
                 state.undo.clone()
             })
             .unwrap();
-        let (records, sections, undo) = store
+        let (records, sections, undo, last_focused) = store
             .transact(|state| {
                 (
                     state.records.clone(),
                     state.open_sections.clone(),
                     state.undo.clone(),
+                    state.last_focused.clone(),
                 )
             })
             .unwrap();
+        assert_eq!(last_focused.as_deref(), Some("terminal:t1"));
         assert!(undo.is_some());
         assert_eq!(undo, saved_undo);
         assert_eq!(records["session:codex:id:0199-abc"], record());

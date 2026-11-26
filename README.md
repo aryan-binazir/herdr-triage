@@ -96,17 +96,20 @@ and refused. A time that has passed while the prompt was open is refused too:
 - **Settle** (`s`) marks the thread read and parks it until it does something new (Herdr's change
   counter advancing).
 - **Snooze** (`z`) parks it until the chosen time; then it returns marked *woke*. The picker shows
-  the time left (`snoozed · 45m`). An agent that blocks on you wakes early; other activity, including
-  a snoozed agent finishing its work, does not. Herdr shows a notification when a snooze comes due
-  (`Woke: <thread>`). Viewing the agent clears *woke*.
+  the time left (`snoozed · 45m`). An agent that blocks on you wakes early, and so does one you go to
+  from another agent; other activity, including a snoozed agent finishing its work, does not.
+  Snoozing the agent you are on and closing the picker leaves it snoozed. Herdr shows a
+  notification when a snooze comes due (`Woke: <thread>`). Viewing the agent clears *woke*.
 - **Closing:** settling an agent closes its pane. If Herdr can resume its session (Claude, Codex,
   OpenCode or Pi with Herdr's integration), the thread stays listed as closed and snoozing closes
   it too. Settling an agent with no session to resume first asks: `y` closes it for good (Herdr
   notifies you, the thread leaves the picker and undo can't bring it back), `n` settles it and
   keeps its pane open. Snoozing one, or settling one whose
-  state Herdr can't tell (`unknown`), leaves it open, as does snoozing an agent that is still
-  working or blocked, and so does the last pane of a workspace; these are marked `stays open`. Codex only reports its session to Herdr when it runs without its shared
-  app-server: start it with `codex --no-daemon` (or alias `codex` to that).
+  state Herdr can't tell (`unknown`), leaves it open, and so does the last pane of a workspace;
+  these are marked `stays open`. Snoozing a resumable agent that is working or blocked closes it
+  once its turn ends (`snoozed · 45m · closes when done`), but never while you are on it: then it
+  closes once you are on another agent. Codex only reports its session to Herdr when it runs
+  without its shared app-server: start it with `codex --no-daemon` (or alias `codex` to that).
 - **After a Herdr restart,** Herdr relaunches restored agents; state changes in the first 20 seconds
   are not treated as new activity, so parked threads stay parked.
 - **Reopening:** unsettling, waking or opening a closed thread starts a new tab in its workspace (or
@@ -306,9 +309,9 @@ stops launches with the parse error, rather than launching something you did not
   refused, since the terminal would act on them as keys.
 - **Triage follows the rules above**, with one difference: the caller names the state it wants, so
   settling a settled thread changes nothing where the picker's key would unsettle it. Settling or
-  snoozing can close an agent's pane; settling a working or blocked agent is refused, so an agent
-  cannot close the pane it is running in. Reopening starts a tab in the background. `undo` takes
-  back the last change whoever made it, yours included.
+  snoozing can close an agent's pane; settling a working or blocked agent is refused and snoozing
+  one leaves its pane open, so an agent cannot close the pane it is running in. Reopening starts a
+  tab in the background. `undo` takes back the last change whoever made it, yours included.
 - **A thread launched into a worktree stays open when settled**, because its pane is the only one
   in its workspace. It leaves the list; closing the workspace and removing the worktree are yours
   to do.
