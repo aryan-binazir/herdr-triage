@@ -23,6 +23,12 @@ title = "Jump to the next agent that needs you"
 contexts = ["workspace"]
 command = ["./target/release/herdr-triage", "next"]
 
+[[actions]]
+id = "connect-mcp"
+title = "Connect the MCP server to Claude Desktop, ChatGPT and Codex"
+contexts = ["workspace"]
+command = ["./target/release/herdr-triage", "mcp", "connect"]
+
 [[events]]
 on = "pane.agent_status_changed"
 command = ["./target/release/herdr-triage", "sync"]

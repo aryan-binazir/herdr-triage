@@ -521,3 +521,345 @@ fn mcp_serves_a_client_over_stdio_and_leaves_a_settings_file_to_edit() {
     let settings = std::fs::read_to_string(config.join("herdr-triage/mcp.yaml")).unwrap();
     assert!(settings.contains("default_harness: pi"));
 }
+
+struct Desktop {
+    herdr: FakeHerdr,
+    claude: std::path::PathBuf,
+    codex: std::path::PathBuf,
+}
+
+/// A machine with both desktop apps installed and neither set up.
+fn desktop() -> Desktop {
+    let herdr = FakeHerdr::start(vec![]);
+    let home = herdr.dir.path().join("home");
+    let claude = if cfg!(target_os = "macos") {
+        home.join("Library/Application Support/Claude")
+    } else {
+        home.join(".config/Claude")
+    };
+    let codex = home.join(".codex");
+    std::fs::create_dir_all(&claude).unwrap();
+    std::fs::create_dir_all(&codex).unwrap();
+    Desktop {
+        herdr,
+        claude: claude.join("claude_desktop_config.json"),
+        codex: codex.join("config.toml"),
+    }
+}
+
+impl Desktop {
+    fn connect(&self) -> Result<String, String> {
+        let output = Command::new(env!("CARGO_BIN_EXE_herdr-triage"))
+            .args(["mcp", "connect"])
+            .env("HOME", self.herdr.dir.path().join("home"))
+            .env_remove("XDG_CONFIG_HOME")
+            .env_remove("CODEX_HOME")
+            .env("HERDR_SOCKET_PATH", &self.herdr.socket)
+            .env("HERDR_PLUGIN_STATE_DIR", self.herdr.state_dir())
+            .output()
+            .unwrap();
+        let said = if output.status.success() {
+            Ok(String::from_utf8(output.stdout).unwrap().trim().to_owned())
+        } else {
+            let said = String::from_utf8(output.stderr).unwrap();
+            Err(said.trim().trim_start_matches("herdr-triage: ").to_owned())
+        };
+        let notes = self.herdr.take("notification.show");
+        let (Ok(shown) | Err(shown)) = &said;
+        assert_eq!(notes.len(), 1, "{shown}");
+        assert_eq!(notes[0]["title"], *shown);
+        said
+    }
+
+    fn link(&self) -> String {
+        let link = self.herdr.state_dir().join("herdr-triage");
+        link.to_str().unwrap().to_owned()
+    }
+
+    fn claude_server(&self) -> Value {
+        let settings = std::fs::read_to_string(&self.claude).unwrap();
+        serde_json::from_str::<Value>(&settings).unwrap()["mcpServers"]["herdr"].clone()
+    }
+
+    fn codex_server(&self) -> toml::Value {
+        let settings = std::fs::read_to_string(&self.codex).unwrap();
+        settings.parse::<toml::Table>().unwrap()["mcp_servers"]["herdr"].clone()
+    }
+}
+
+#[test]
+fn connect_sets_both_desktop_apps_to_start_the_server_and_keeps_their_other_settings() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let desktop = desktop();
+    let claude_before =
+        "{\n  \"preferences\": {\n    \"sidebarMode\": \"chat\"\n  },\n  \"alpha\": true\n}";
+    std::fs::write(&desktop.claude, claude_before).unwrap();
+    std::fs::set_permissions(&desktop.claude, std::fs::Permissions::from_mode(0o640)).unwrap();
+    let codex_before = "# mine\nmodel = \"gpt-5.2-codex\"   # keep\n\n[mcp_servers.linear]\nurl = \"https://mcp.linear.app/mcp\"\n\n[projects.\"/src\"]\ntrust_level = \"trusted\"\n";
+    std::fs::write(&desktop.codex, codex_before).unwrap();
+
+    assert_eq!(
+        desktop.connect().unwrap(),
+        "Herdr MCP connected to Claude Desktop, ChatGPT and Codex: restart to load it"
+    );
+
+    let link = desktop.link();
+    assert_eq!(
+        std::fs::canonicalize(&link).unwrap(),
+        std::fs::canonicalize(env!("CARGO_BIN_EXE_herdr-triage")).unwrap()
+    );
+    let home = desktop.herdr.dir.path().join("home");
+    let pinned = json!({
+        "HERDR_PLUGIN_STATE_DIR": desktop.herdr.state_dir(),
+        "XDG_CONFIG_HOME": home.join(".config"),
+    });
+    assert_eq!(
+        desktop.claude_server(),
+        json!({"command": link, "args": ["mcp"], "env": pinned})
+    );
+    let claude_after = std::fs::read_to_string(&desktop.claude).unwrap();
+    let unchanged = claude_before.strip_suffix("\n}").unwrap();
+    assert!(claude_after.starts_with(unchanged), "{claude_after}");
+    let mode = std::fs::metadata(&desktop.claude).unwrap().permissions();
+    assert_eq!(mode.mode() & 0o777, 0o640);
+
+    let server = desktop.codex_server();
+    assert_eq!(server["command"].as_str(), Some(link.as_str()));
+    assert_eq!(server["args"], toml::Value::from(vec!["mcp"]));
+    assert_eq!(
+        server["env_vars"],
+        toml::Value::from(vec!["HERDR_PANE_ID", "HERDR_SOCKET_PATH"])
+    );
+    assert_eq!(server["tool_timeout_sec"].as_integer(), Some(300));
+    assert_eq!(serde_json::to_value(&server["env"]).unwrap(), pinned);
+    let codex_after = std::fs::read_to_string(&desktop.codex).unwrap();
+    for kept in codex_before.split("\n\n") {
+        assert!(codex_after.contains(kept.trim_end()), "{codex_after}");
+    }
+
+    let settings = std::fs::read_to_string(home.join(".config/herdr-triage/mcp.yaml")).unwrap();
+    assert!(settings.contains("enabled: true"));
+
+    desktop.connect().unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&desktop.claude).unwrap(),
+        claude_after
+    );
+    assert_eq!(
+        std::fs::read_to_string(&desktop.codex).unwrap(),
+        codex_after
+    );
+}
+
+#[test]
+fn connect_passes_over_an_app_that_is_not_installed() {
+    let desktop = desktop();
+    std::fs::remove_dir(desktop.claude.parent().unwrap()).unwrap();
+    assert_eq!(
+        desktop.connect().unwrap(),
+        "Herdr MCP connected to ChatGPT and Codex: restart to load it"
+    );
+    assert!(!desktop.claude.parent().unwrap().exists());
+    assert_eq!(
+        desktop.codex_server()["args"],
+        toml::Value::from(vec!["mcp"])
+    );
+
+    std::fs::remove_dir_all(desktop.codex.parent().unwrap()).unwrap();
+    assert_eq!(
+        desktop.connect().unwrap_err(),
+        "No Claude Desktop, ChatGPT or Codex found to connect: open a new app once first"
+    );
+}
+
+#[test]
+fn connect_changes_nothing_on_a_machine_where_the_server_is_turned_off() {
+    let desktop = desktop();
+    let settings = desktop.herdr.dir.path().join("home/.config/herdr-triage");
+    std::fs::create_dir_all(&settings).unwrap();
+    std::fs::write(settings.join("mcp.yaml"), "enabled: false\n").unwrap();
+    let refused = desktop.connect().unwrap_err();
+    assert!(refused.contains("turned off on this machine"), "{refused}");
+    assert!(refused.contains("mcp.yaml"), "{refused}");
+    assert!(!desktop.claude.exists());
+    assert!(!desktop.codex.exists());
+}
+
+#[test]
+fn connect_leaves_settings_it_cannot_read_alone_and_still_connects_the_other_app() {
+    let desktop = desktop();
+    std::fs::write(&desktop.claude, "{ not json").unwrap();
+    let said = desktop.connect().unwrap_err();
+    let (connected, failed) = said.split_once(". ").unwrap();
+    assert_eq!(
+        connected,
+        "Herdr MCP connected to ChatGPT and Codex: restart to load it"
+    );
+    assert!(
+        failed.starts_with("Not connected to Claude Desktop: "),
+        "{failed}"
+    );
+    assert!(failed.contains("claude_desktop_config.json"), "{failed}");
+    assert_eq!(
+        std::fs::read_to_string(&desktop.claude).unwrap(),
+        "{ not json"
+    );
+    assert_eq!(
+        desktop.codex_server()["args"],
+        toml::Value::from(vec!["mcp"])
+    );
+
+    let secret = "token = \"hunter2\" oops\n";
+    std::fs::write(&desktop.codex, secret).unwrap();
+    let said = desktop.connect().unwrap_err();
+    assert!(said.contains("config.toml"), "{said}");
+    assert!(!said.contains("hunter2"), "{said}");
+    assert_eq!(std::fs::read_to_string(&desktop.codex).unwrap(), secret);
+}
+
+#[test]
+fn connect_repoints_an_entry_already_there_through_a_link_to_the_settings() {
+    let desktop = desktop();
+    let dotfiles = desktop.herdr.dir.path().join("dotfiles.toml");
+    std::fs::write(
+        &dotfiles,
+        "[mcp_servers.herdr]\ncommand = \"/gone/herdr-triage\"\nargs = [\"mcp\"]\nenv_vars = [\"HERDR_PANE_ID\"]\n",
+    )
+    .unwrap();
+    std::os::unix::fs::symlink(&dotfiles, &desktop.codex).unwrap();
+    desktop.connect().unwrap();
+    assert_eq!(std::fs::read_link(&desktop.codex).unwrap(), dotfiles);
+    let server = desktop.codex_server();
+    assert_eq!(server["command"].as_str(), Some(desktop.link().as_str()));
+    assert_eq!(server["env_vars"], toml::Value::from(vec!["HERDR_PANE_ID"]));
+    assert_eq!(server["tool_timeout_sec"].as_integer(), Some(300));
+}
+
+#[test]
+fn connect_adds_the_server_to_settings_that_keep_their_servers_inline() {
+    let desktop = desktop();
+    for inline in [
+        "mcp_servers = {}\n",
+        "mcp_servers = { linear = { url = \"https://mcp.linear.app/mcp\" } }\n",
+        "[mcp_servers]\nherdr = { command = \"/gone/herdr-triage\" }\n",
+    ] {
+        std::fs::write(&desktop.codex, inline).unwrap();
+        desktop.connect().unwrap();
+        let server = desktop.codex_server();
+        assert_eq!(
+            server["command"].as_str(),
+            Some(desktop.link().as_str()),
+            "{inline}"
+        );
+        assert!(server["env"]["XDG_CONFIG_HOME"].is_str(), "{inline}");
+    }
+}
+
+#[test]
+fn connect_refuses_settings_it_would_break_or_replace() {
+    let desktop = desktop();
+    let other_server = "[mcp_servers.herdr]\nurl = \"https://herdr.example/mcp\"\n";
+    std::fs::write(&desktop.codex, other_server).unwrap();
+    let dotfiles = desktop.herdr.dir.path().join("not-checked-out.json");
+    std::os::unix::fs::symlink(&dotfiles, &desktop.claude).unwrap();
+
+    let said = desktop.connect().unwrap_err();
+    assert!(
+        said.contains("another server named `herdr` is already there"),
+        "{said}"
+    );
+    assert!(
+        said.contains("a link to a file that is not there"),
+        "{said}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&desktop.codex).unwrap(),
+        other_server
+    );
+    assert_eq!(std::fs::read_link(&desktop.claude).unwrap(), dotfiles);
+    assert!(!dotfiles.exists());
+
+    let other_program =
+        "{\"mcpServers\":{\"herdr\":{\"command\":\"node\",\"args\":[\"herdr.js\"]}}}";
+    std::fs::write(&dotfiles, other_program).unwrap();
+    let other_program_inline = "mcp_servers = { herdr = { command = \"/opt/different-mcp\" } }\n";
+    std::fs::write(&desktop.codex, other_program_inline).unwrap();
+    let said = desktop.connect().unwrap_err();
+    assert_eq!(said.matches("another server named `herdr`").count(), 2);
+    assert_eq!(std::fs::read_to_string(&dotfiles).unwrap(), other_program);
+    assert_eq!(
+        std::fs::read_to_string(&desktop.codex).unwrap(),
+        other_program_inline
+    );
+}
+
+#[test]
+fn connect_keeps_the_owner_group_and_mode_of_the_settings_it_rewrites() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let desktop = desktop();
+    std::fs::write(&desktop.codex, "model = \"gpt-5.2-codex\"\n").unwrap();
+    let groups = Command::new("id").arg("-G").output().unwrap();
+    let groups = String::from_utf8(groups.stdout).unwrap();
+    let mine = std::fs::metadata(&desktop.codex).unwrap().gid();
+    let another = groups
+        .split_whitespace()
+        .map(|group| group.parse::<u32>().unwrap())
+        .find(|group| *group != mine);
+    std::os::unix::fs::chown(&desktop.codex, None, another).unwrap();
+    std::fs::set_permissions(&desktop.codex, std::fs::Permissions::from_mode(0o640)).unwrap();
+
+    desktop.connect().unwrap();
+    let rewritten = std::fs::metadata(&desktop.codex).unwrap();
+    assert_eq!(rewritten.gid(), another.unwrap_or(mine));
+    assert_eq!(rewritten.mode() & 0o777, 0o640);
+    assert!(desktop.codex_server()["command"].is_str());
+}
+
+#[test]
+fn a_server_an_app_starts_obeys_the_off_switch_the_plugin_reads() {
+    use std::io::Write;
+    use std::process::Stdio;
+
+    let desktop = desktop();
+    let elsewhere = desktop.herdr.dir.path().join("xdg");
+    let connect = Command::new(env!("CARGO_BIN_EXE_herdr-triage"))
+        .args(["mcp", "connect"])
+        .env("HOME", desktop.herdr.dir.path().join("home"))
+        .env("XDG_CONFIG_HOME", &elsewhere)
+        .env("CODEX_HOME", desktop.codex.parent().unwrap())
+        .env("HERDR_SOCKET_PATH", &desktop.herdr.socket)
+        .env("HERDR_PLUGIN_STATE_DIR", desktop.herdr.state_dir())
+        .output()
+        .unwrap();
+    assert!(connect.status.success());
+    std::fs::write(elsewhere.join("herdr-triage/mcp.yaml"), "enabled: false\n").unwrap();
+
+    let entry = desktop.codex_server();
+    let pinned = entry["env"].as_table().unwrap();
+    let mut server = Command::new(entry["command"].as_str().unwrap())
+        .args(
+            entry["args"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|arg| arg.as_str().unwrap()),
+        )
+        .env_clear()
+        .env("HOME", desktop.herdr.dir.path().join("home"))
+        .envs(
+            pinned
+                .iter()
+                .map(|(name, value)| (name, value.as_str().unwrap())),
+        )
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let list = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"});
+    writeln!(server.stdin.take().unwrap(), "{list}").unwrap();
+    let output = server.wait_with_output().unwrap();
+    let reply: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(reply["result"]["tools"], json!([]));
+}

@@ -195,44 +195,81 @@ time. It speaks MCP over stdin and stdout; there is no daemon, port or login. In
 
 ### Connect a client
 
+For Claude Desktop, the ChatGPT desktop app and the Codex command, quit the apps, run the
+plugin's **Connect the MCP server to Claude Desktop, ChatGPT and Codex** action once per machine,
+and start them again:
+
+```sh
+herdr plugin action invoke connect-mcp --plugin ar.triage
+```
+
+It adds a `herdr` server to each one whose settings folder is on the machine (open a newly
+installed app once first) and leaves the rest of the settings as they were: `mcpServers` in
+Claude's `claude_desktop_config.json`, and `[mcp_servers.herdr]` in `~/.codex/config.toml`
+(`$CODEX_HOME` if set to an absolute path). The ChatGPT app and the Codex command share that
+file, so every Codex session gets the tools, including the agents this server launches. Herdr
+shows a notification saying what it connected. Running it again is safe; it refuses a `herdr`
+entry that is some other server, and keeps the file's owner, group and mode.
+
 The server is the plugin's own binary. Each plugin update installs it in a new directory, so
 Herdr's hooks keep a link to the current one at `~/.local/state/herdr/plugins/ar.triage/herdr-triage`
 (under `$XDG_STATE_HOME` if you set it to an absolute path; a relative one is ignored, so leave
-it out of the commands below). It appears the first time one of the plugin's hooks runs
-after an install, such as when you switch panes.
-Register it once:
+it out of the command below). It appears the first time one of the plugin's hooks runs
+after an install, such as when you switch panes. The action points the apps at that link, so
+they keep working across updates.
+
+These apps start a server with little of your environment, so the action also writes where the
+plugin keeps its settings and state (`XDG_CONFIG_HOME` and `HERDR_PLUGIN_STATE_DIR`) into each
+entry: the server reads the same off switch and triage database as the plugin, whatever started
+it. In Codex's entry, `env_vars` lets `HERDR_PANE_ID` and `HERDR_SOCKET_PATH` through, and
+`tool_timeout_sec = 300` leaves room for a large repository's worktree checkout (Codex allows 60
+seconds otherwise; a launch takes at most four minutes).
+
+For Claude Code, register it once:
 
 ```sh
 claude mcp add --scope user herdr -- "${XDG_STATE_HOME:-$HOME/.local/state}/herdr/plugins/ar.triage/herdr-triage" mcp
-codex mcp add herdr -- "${XDG_STATE_HOME:-$HOME/.local/state}/herdr/plugins/ar.triage/herdr-triage" mcp
 ```
 
-Codex hides your environment from MCP servers, so also add these lines to the
-`[mcp_servers.herdr]` table that `codex mcp add` wrote in `~/.codex/config.toml`. Without
-`env_vars` the server cannot tell which pane is calling, and with `XDG_*` set it would read other
-settings and another triage database than the plugin's. The timeout leaves room for a large
-repository's worktree checkout (Codex allows 60 seconds otherwise; a launch takes at most four
-minutes):
-
-```toml
-env_vars = ["HERDR_PANE_ID", "HERDR_SOCKET_PATH", "XDG_CONFIG_HOME", "XDG_STATE_HOME"]
-tool_timeout_sec = 300
-```
-
-Any client that starts a stdio MCP server works the same way. Two environment variables matter:
+Any client that starts a stdio MCP server works the same way. These environment variables matter:
 
 - `HERDR_PANE_ID`, which Herdr sets in every pane, tells the server which terminal is calling.
   What it launches is then its own (`mine`), and a launch with no `project` goes to the project
   it runs in. A client outside Herdr owns what it launches for as long as its session lasts, and
   has to name a project.
 - `HERDR_SOCKET_PATH` picks the Herdr session to drive when you run more than the default one.
+  The desktop apps drive the default session; to aim one at another, add the variable to the
+  `env` of its `herdr` entry, which the connect action leaves in place.
+- `XDG_CONFIG_HOME`, and `XDG_STATE_HOME` or `HERDR_PLUGIN_STATE_DIR`, if you set them for
+  Herdr: a client that does not pass them on has the server read other settings, with the off
+  switch in them, and another triage database.
+
+### Turn it off on a machine
+
+The server is on wherever the plugin is installed. To turn it off on one machine, set this in
+`~/.config/herdr-triage/mcp.yaml` there:
+
+```yaml
+enabled: false
+```
+
+A client that starts the server is then offered no tools, a tool called anyway is refused, and
+the connect action does nothing. The file is read on every tool call, so a running server
+refuses the next one; a launch already under way finishes. A client lists the tools when it
+starts, so it shows the change, either way, after a restart. Set it back to `true`, or delete the
+line, to turn the server on again. It is a switch for you, not a lock against an agent that can
+edit your files.
 
 ### What it launches
 
 `~/.config/herdr-triage/mcp.yaml` (under `$XDG_CONFIG_HOME` if set, on Linux and macOS alike). The
-server writes this file with its defaults the first time it runs and reads it on every launch:
+server writes this file with its defaults the first time it runs, as does the connect action, and
+reads it on every tool call:
 
 ```yaml
+# false turns the server off on this machine: a client that starts it is offered no tools.
+enabled: true
+
 # The agent to launch: pi, claude or codex.
 default_harness: pi
 
@@ -273,7 +310,8 @@ settings apply, then the harness's, then the built-in defaults above, so a file 
 `worktree` still launches pi on Opus 5.5 at medium. They become `pi --model M --thinking E`,
 `claude --model M --effort E` or `codex --model M --config model_reasoning_effort=E`, followed by
 `args`. Put flags you always want there, such as a permission mode. A file that does not parse
-stops launches with the parse error, rather than launching something you did not ask for.
+stops every tool with the parse error, rather than launching something you did not ask for or
+missing that you turned the server off.
 
 ### What to expect
 

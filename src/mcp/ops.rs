@@ -89,6 +89,7 @@ pub struct Call<'a> {
     client: &'a str,
     herdr: Herdr,
     session: Session,
+    config: Config,
     caller: Option<Caller>,
     deadline: Option<Instant>,
 }
@@ -100,10 +101,11 @@ struct Caller {
 }
 
 impl<'a> Call<'a> {
-    pub fn open(env: &'a Env, client: &'a str) -> Result<Self, Failure> {
+    pub fn open(env: &'a Env, client: &'a str, config: Config) -> Result<Self, Failure> {
         Ok(Self {
             env,
             client,
+            config,
             herdr: Herdr::at(&env.socket)?,
             session: (env.session)()?,
             caller: None,
@@ -223,11 +225,11 @@ impl<'a> Call<'a> {
         }
         Ok(workspaces)
     }
+}
 
-    fn config(&self) -> Result<Config, Failure> {
-        Config::load(self.env.config.as_deref())
-            .map_err(|error| Failure::new("bad_config", error.to_string()))
-    }
+pub fn config(env: &Env) -> Result<Config, Failure> {
+    Config::load(env.config.as_deref())
+        .map_err(|error| Failure::new("bad_config", error.to_string()))
 }
 
 struct Threads {
@@ -439,7 +441,7 @@ pub fn projects_tool(call: &mut Call, arguments: Value) -> Done {
     #[serde(deny_unknown_fields)]
     struct Args {}
     let Args {} = decode(arguments)?;
-    let config = call.config()?;
+    let config = call.config.clone();
     let workspaces = call.workspaces()?;
     let threads = call.threads()?;
     let listed: Vec<Value> = projects(&workspaces)
@@ -477,7 +479,7 @@ pub fn capabilities_tool(call: &mut Call, arguments: Value) -> Done {
     #[serde(deny_unknown_fields)]
     struct Args {}
     let Args {} = decode(arguments)?;
-    let config = call.config()?;
+    let config = call.config.clone();
     let harnesses: Map<String, Value> = HARNESSES
         .iter()
         .map(|name| {
@@ -542,7 +544,7 @@ struct Opened {
 pub fn launch_tool(call: &mut Call, args: &LaunchArgs, budget: Duration) -> Done {
     let deadline = Instant::now() + budget;
     call.deadline = Some(deadline);
-    let config = call.config()?;
+    let config = call.config.clone();
     let caller = call.caller();
     let workspaces = call.workspaces()?;
     let query = args
