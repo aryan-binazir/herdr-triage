@@ -207,10 +207,18 @@ It adds a `herdr` server to each one whose settings folder is on the machine (op
 installed app once first) and leaves the rest of the settings as they were: `mcpServers` in
 Claude's `claude_desktop_config.json`, and `[mcp_servers.herdr]` in `~/.codex/config.toml`
 (`$CODEX_HOME` if set to an absolute path). The ChatGPT app and the Codex command share that
-file, so every Codex session gets the tools, including the agents this server launches. Herdr
-shows a notification saying what it connected, and the command prints the same. Running it again
-is safe; it refuses a `herdr` entry that is some other server, and keeps the file's owner, group
-and mode.
+file, so every Codex session gets the tools, including the agents this server launches. Running
+it again is safe; it refuses a `herdr` entry that is some other server, and keeps the file's
+owner, group and mode.
+
+What it connected, or why it could not, is in the plugin's command log, under the last
+`mcp connect`:
+
+```sh
+herdr plugin log list --plugin ar.triage --limit 5
+```
+
+Herdr also shows it as a notification if you have turned its toasts on; they are off by default.
 
 The server is the plugin's own binary. Each plugin update installs it in a new directory, so
 Herdr's hooks keep a link to the current one at `~/.local/state/herdr/plugins/ar.triage/herdr-triage`
