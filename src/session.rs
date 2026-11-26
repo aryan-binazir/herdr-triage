@@ -403,7 +403,6 @@ impl Session {
         let closing = self.locked(|held, state| {
             let generation = held.herdr.server_generation();
             state.confirm_close(close, &generation, held.now(), || {
-                // Focus is read last: a close spares the agent you are on by then.
                 let workspaces = held.herdr.workspaces()?;
                 let agents = held.herdr.agents()?;
                 Ok(agents

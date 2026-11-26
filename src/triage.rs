@@ -151,7 +151,6 @@ pub struct Record {
     #[serde(default)]
     pub launched_by: Option<String>,
     pub settle_requested: Option<String>,
-    /// The terminal whose snooze, taken mid-turn, closes its pane once that turn ends.
     #[serde(default)]
     pub close_requested: Option<String>,
 }
@@ -210,8 +209,6 @@ impl Record {
         park(self, seq, Park::Settled, closing)
     }
 
-    /// Closes a quiet agent that can be resumed now, and a busy one once its turn ends if
-    /// `closes_when_done`; any other stays open.
     fn snooze(
         &mut self,
         until: i64,
@@ -249,7 +246,6 @@ impl Record {
         }
     }
 
-    /// Closes a pane snoozed mid-turn once that turn has ended and you are on another agent.
     fn close_if_turn_ended(&mut self, agent: &Observed, away: bool) -> Option<Close> {
         let terminal = self.close_requested.as_deref()?;
         let Some(park @ Park::Snoozed { .. }) = self.park.filter(|_| terminal == agent.terminal_id)
@@ -308,8 +304,6 @@ impl Record {
     }
 }
 
-/// The agent you are on: the focused one, else the one you were on before the picker or a pane
-/// that is not an agent took focus.
 struct Focus<'a> {
     focused: Option<&'a Observed>,
     before: Option<String>,
@@ -327,18 +321,15 @@ impl<'a> Focus<'a> {
             .or(self.before.as_deref())
     }
 
-    /// You are known to be on an agent other than `agent`.
     fn elsewhere(&self, agent: &Observed) -> bool {
         self.on().is_some() && !names(self.on(), agent)
     }
 
-    /// You came to `agent` from another agent.
     fn arrived(&self, agent: &Observed) -> bool {
         agent.focused && self.before.is_some() && !names(self.before.as_deref(), agent)
     }
 }
 
-/// Whether `key` is `agent`'s, or the one it had before Herdr learned its session.
 fn names(key: Option<&str>, agent: &Observed) -> bool {
     key.is_some_and(|key| key == agent.key || agent.pre_session_key.as_deref() == Some(key))
 }
@@ -357,8 +348,6 @@ pub struct State {
     pub open_sections: BTreeSet<Section>,
     #[serde(default)]
     pub undo: Option<Undo>,
-    /// The agent you are on: the one last seen focused, kept while the picker or another pane
-    /// that is not an agent has focus.
     #[serde(default)]
     pub last_focused: Option<String>,
 }
@@ -548,7 +537,6 @@ pub struct Close {
     terminal_id: String,
     seq: u64,
     workspace_panes: usize,
-    /// Asked for at a snooze and landing at its turn's end: it spares the agent you are on.
     when_done: bool,
 }
 
@@ -2064,7 +2052,6 @@ mod tests {
         assert!(again.closes.is_empty(), "one close per turn");
     }
 
-    /// "a" snoozed mid-turn while you are on "b".
     fn snoozed_mid_turn(until: i64) -> State {
         let working = resumable("a", Status::Working, 4);
         let mut state = State::default();
