@@ -183,6 +183,7 @@ fn item(snapshot: &Snapshot, thread: &T3Thread, now: i64) -> Item {
         changed_at: Some(thread.updated_at),
         status: Status::Unknown,
         settle_pending: false,
+        close_pending: false,
         workspace_panes: 0,
         thread: Thread {
             label: thread.title.clone(),

@@ -343,7 +343,7 @@ impl Session {
             if let Err(error) = self.close_session(close) {
                 let _ = self
                     .herdr
-                    .notify(&format!("A settled agent's pane didn't close: {error}"));
+                    .notify(&format!("A parked agent's pane didn't close: {error}"));
             }
         }
         Ok(Some(synced.map(|(snapshot, edited)| {
@@ -1618,6 +1618,62 @@ mod tests {
     }
 
     #[test]
+    fn snoozing_a_working_agent_closes_its_pane_once_its_turn_ends() {
+        let fake = FakeHerdr::start(vec![
+            resumable_agent("w1:p1", "working", 3),
+            resumable_agent("w1:p2", "idle", 4),
+        ]);
+        let (mut session, _) = connect(&fake);
+        session.act(KEY, Action::Snooze(NOW + 3600)).unwrap();
+        session.sync().unwrap();
+        assert!(fake.take("pane.close").is_empty(), "its turn is running");
+        {
+            let mut agents = fake.agents.lock().unwrap();
+            agents[0]["agent_status"] = json!("done");
+            agents[0]["state_change_seq"] = json!(5);
+        }
+        session.sync().unwrap();
+        assert_eq!(fake.take("pane.close"), [json!({"pane_id": "w1:p1"})]);
+        let view = session.view().unwrap();
+        let row = &view
+            .items
+            .iter()
+            .find(|item| item.row.key == KEY)
+            .unwrap()
+            .row;
+        assert_eq!(row.status_text(NOW), "snoozed · 1h · closed");
+    }
+
+    #[test]
+    fn going_to_a_snoozed_agent_from_another_wakes_it() {
+        let fake = FakeHerdr::start(vec![
+            resumable_agent("w1:p1", "working", 3),
+            resumable_agent("w1:p2", "idle", 4),
+        ]);
+        let focus = |pane: usize| {
+            for (index, agent) in fake.agents.lock().unwrap().iter_mut().enumerate() {
+                agent["focused"] = json!(index == pane);
+            }
+        };
+        let (mut session, _) = connect(&fake);
+        focus(1);
+        session.act(KEY, Action::Snooze(NOW + 3600)).unwrap();
+        session.sync().unwrap();
+        let park = |session: &mut Session| {
+            let view = session.view().unwrap();
+            let item = view.items.iter().find(|item| item.row.key == KEY);
+            item.unwrap().row.park
+        };
+        assert_eq!(
+            park(&mut session),
+            Some(Park::Snoozed { until: NOW + 3600 })
+        );
+        focus(0);
+        session.sync().unwrap();
+        assert_eq!(park(&mut session), None);
+    }
+
+    #[test]
     fn a_new_agent_starts_in_a_new_tab_or_a_new_worktree() {
         let fake = FakeHerdr::start(vec![]);
         let (mut session, _) = connect(&fake);
@@ -1816,7 +1872,7 @@ mod tests {
         assert!(
             notices.iter().any(|n| n["title"]
                 .as_str()
-                .is_some_and(|t| t.starts_with("A settled agent's pane didn't close"))),
+                .is_some_and(|t| t.starts_with("A parked agent's pane didn't close"))),
             "{notices:?}"
         );
     }
@@ -1936,6 +1992,7 @@ mod tests {
             changed_at: None,
             status: triage::Status::Idle,
             settle_pending: false,
+            close_pending: false,
             workspace_panes: 0,
             title: None,
             launched_by: None,

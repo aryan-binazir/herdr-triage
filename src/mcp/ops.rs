@@ -1065,7 +1065,10 @@ pub fn organize_tool(call: &mut Call, arguments: Value) -> Done {
             Verb::Rename => None,
             Verb::Settle => Some(Action::Ensure(Want::Settled)),
             Verb::Unsettle => Some(Action::Ensure(Want::Unsettled)),
-            Verb::Snooze => Some(Action::Snooze(args.snooze_until(call.session.now())?)),
+            // A busy agent's pane may be the caller's own, so its snooze never queues a close.
+            Verb::Snooze => Some(Action::SnoozeKeepingBusyOpen(
+                args.snooze_until(call.session.now())?,
+            )),
             Verb::Wake => Some(Action::Ensure(Want::Awake)),
             Verb::Reopen => Some(Action::Ensure(Want::Open)),
             Verb::Pin => Some(Action::Ensure(Want::Pinned)),

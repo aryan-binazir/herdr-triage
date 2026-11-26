@@ -186,7 +186,7 @@ fn thread_tools() -> Vec<Tool> {
         Tool {
             name: "herdr_organize",
             title: "Triage a thread",
-            description: "Change a thread's place in the user's triage list. settle / unsettle: done with it, or not after all. snooze / wake: hide it until `until` or for `minutes`. reopen: bring a closed thread's agent back with its conversation. pin / unpin. mark_unread / mark_read. rename: set `title` (empty restores the automatic one). undo: take back the last change, by anyone; needs no `thread`. forget: drop a closed thread for good, only when the user asks. An action already in effect changes nothing. Settling closes the agent's pane, and snoozing closes it when the agent can be reopened later and is not working; the last pane of a workspace stays open. Settling a working or blocked agent is refused, as is snoozing a blocked one.",
+            description: "Change a thread's place in the user's triage list. settle / unsettle: done with it, or not after all. snooze / wake: hide it until `until` or for `minutes`. reopen: bring a closed thread's agent back with its conversation. pin / unpin. mark_unread / mark_read. rename: set `title` (empty restores the automatic one). undo: take back the last change, by anyone; needs no `thread`. forget: drop a closed thread for good, only when the user asks. An action already in effect changes nothing. Settling closes the agent's pane, and snoozing closes it when the agent can be reopened later and is neither working nor blocked; the last pane of a workspace stays open. Settling a working or blocked agent is refused.",
             properties: json!({
                 "action": {"type": "string", "enum": ["settle", "unsettle", "snooze", "wake", "reopen", "pin", "unpin", "mark_unread", "mark_read", "rename", "undo", "forget"]},
                 "thread": thread,
@@ -1078,6 +1078,27 @@ mod tests {
         let waited = rig.ok("herdr_wait", json!({"thread": "w1:p1"}));
         assert_eq!(waited["timed_out"], false);
         assert!(waited["next"].as_str().unwrap().contains("ask the user"));
+    }
+
+    #[test]
+    fn a_working_agent_snoozed_by_an_agent_keeps_its_pane_after_its_turn() {
+        let mut rig = rig(
+            vec![
+                resumable("w1:p1", "working", 3),
+                resumable("w1:p2", "idle", 4),
+            ],
+            None,
+        );
+        let snooze = json!({"action": "snooze", "thread": key("w1:p1"), "minutes": 30});
+        assert_eq!(rig.ok("herdr_organize", snooze)["thread"]["open"], true);
+        {
+            let mut agents = rig.fake.agents.lock().unwrap();
+            agents[0]["agent_status"] = json!("done");
+            agents[0]["state_change_seq"] = json!(5);
+        }
+        rig.ok("herdr_threads", json!({}));
+        rig.ok("herdr_threads", json!({}));
+        assert!(rig.fake.take("pane.close").is_empty());
     }
 
     #[test]
