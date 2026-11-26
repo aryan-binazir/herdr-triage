@@ -403,8 +403,9 @@ impl Session {
         let closing = self.locked(|held, state| {
             let generation = held.herdr.server_generation();
             state.confirm_close(close, &generation, held.now(), || {
-                let agents = held.herdr.agents()?;
+                // Focus is read last: a close spares the agent you are on by then.
                 let workspaces = held.herdr.workspaces()?;
+                let agents = held.herdr.agents()?;
                 Ok(agents
                     .iter()
                     .map(|agent| observe(agent, &workspaces))
@@ -866,7 +867,8 @@ mod tests {
         assert_eq!(methods(&fake), first_view);
 
         assert_eq!(session.act(KEY, Action::ToggleSettle).unwrap(), done(KEY));
-        let closing = [&read[..], &[report, view_set], &read[..], &["pane.close"]].concat();
+        let confirm = ["workspace.list", list, "pane.close"];
+        let closing = [&read[..], &[report, view_set], &confirm[..]].concat();
         assert_eq!(methods(&fake), closing);
 
         let refused = session.act("terminal:t-w1:p3", Action::ToggleUnread);
@@ -1641,6 +1643,34 @@ mod tests {
             .unwrap()
             .row;
         assert_eq!(row.status_text(NOW), "snoozed · 1h · closed");
+    }
+
+    #[test]
+    fn a_snooze_close_reads_focus_last_before_closing() {
+        let mut elsewhere = resumable_agent("w1:p2", "idle", 4);
+        elsewhere["focused"] = json!(true);
+        let fake = FakeHerdr::start(vec![resumable_agent("w1:p1", "working", 3), elsewhere]);
+        let (mut session, _) = connect(&fake);
+        session.act(KEY, Action::Snooze(NOW + 3600)).unwrap();
+        session.sync().unwrap();
+        {
+            let mut agents = fake.agents.lock().unwrap();
+            agents[0]["agent_status"] = json!("done");
+            agents[0]["state_change_seq"] = json!(5);
+        }
+        let mut lists = 0;
+        fake.on("workspace.list", move |agents| {
+            lists += 1;
+            if lists == 2 {
+                agents[0]["focused"] = json!(true);
+                agents[1]["focused"] = json!(false);
+            }
+        });
+        session.sync().unwrap();
+        assert!(
+            fake.take("pane.close").is_empty(),
+            "you went to it while the close was being confirmed"
+        );
     }
 
     #[test]

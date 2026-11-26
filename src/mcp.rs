@@ -1082,13 +1082,9 @@ mod tests {
 
     #[test]
     fn a_working_agent_snoozed_by_an_agent_keeps_its_pane_after_its_turn() {
-        let mut rig = rig(
-            vec![
-                resumable("w1:p1", "working", 3),
-                resumable("w1:p2", "idle", 4),
-            ],
-            None,
-        );
+        let mut elsewhere = resumable("w1:p2", "idle", 4);
+        elsewhere["focused"] = json!(true);
+        let mut rig = rig(vec![resumable("w1:p1", "working", 3), elsewhere], None);
         let snooze = json!({"action": "snooze", "thread": key("w1:p1"), "minutes": 30});
         assert_eq!(rig.ok("herdr_organize", snooze)["thread"]["open"], true);
         {
