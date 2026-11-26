@@ -6,21 +6,15 @@ use std::path::{Path, PathBuf};
 use serde_json::{Value, json};
 use toml_edit::{Array, DocumentMut, InlineTable, Item, Table, TomlError, value};
 
-use super::config;
+use super::{config, ops};
 use crate::store;
 
 const NAME: &str = "herdr";
-/// Codex hides its environment from an MCP server, bar the variables named here.
 const CODEX_ENV_VARS: [&str; 2] = ["HERDR_PANE_ID", "HERDR_SOCKET_PATH"];
-/// Codex gives a tool 60 seconds otherwise; a launch into a large repository takes up to four
-/// minutes.
-const CODEX_TOOL_TIMEOUT_SECS: i64 = 300;
+const CODEX_TOOL_TIMEOUT_SECS: i64 = ops::LAUNCH_BUDGET.as_secs().cast_signed() + 60;
 
 struct Server {
     command: String,
-    /// An app starts the server with little of the environment Herdr runs the plugin in (Claude
-    /// passes on `HOME` and `PATH`, Codex what it is told to), so where the plugin keeps its
-    /// settings and state is pinned: the server reads the same off switch and triage database.
     env: Vec<(&'static str, String)>,
 }
 
@@ -30,7 +24,6 @@ struct App {
     with_server: fn(&str, &Server) -> Result<String, String>,
 }
 
-/// The app that calls itself `ChatGPT` runs Codex, and shares its settings with the Codex command.
 fn apps() -> Vec<App> {
     let absolute = |dir: &PathBuf| dir.is_absolute();
     let home = std::env::var_os("HOME").map(PathBuf::from).filter(absolute);
@@ -38,7 +31,6 @@ fn apps() -> Vec<App> {
         home.as_ref()
             .map(|home| home.join("Library/Application Support"))
     } else {
-        // Herdr can be given a config home the desktop never sees: Claude is then in the usual one.
         let usual = home.as_ref().map(|home| home.join(".config"));
         let has_claude = |dir: &PathBuf| dir.join("Claude").is_dir();
         config::xdg_config_home()
@@ -63,9 +55,6 @@ fn apps() -> Vec<App> {
     claude.into_iter().chain(codex).collect()
 }
 
-/// Sets each app whose settings folder is on this machine to start the plugin's server, leaving
-/// the rest of its settings as they were, and says what it did: as an `Err` when there was an app
-/// it could not set.
 pub fn connect() -> Result<String, String> {
     let text = |path: &Path| {
         let unusable = || {
@@ -79,9 +68,10 @@ pub fn connect() -> Result<String, String> {
     let state = store::state_root();
     let state = std::path::absolute(&state).unwrap_or(state);
     let binary = state.join("herdr-triage");
-    // A link left at an older binary would start a server that has no off switch.
-    let running = std::env::current_exe().and_then(fs::canonicalize);
-    if running.is_err() || fs::canonicalize(&binary).ok() != running.ok() {
+    let links_to_this_binary = std::env::current_exe()
+        .and_then(fs::canonicalize)
+        .is_ok_and(|running| fs::canonicalize(&binary).is_ok_and(|linked| linked == running));
+    if !links_to_this_binary {
         return Err(format!(
             "The link to the server's binary at {} could not be brought up to date",
             binary.display()
@@ -130,7 +120,6 @@ pub fn connect() -> Result<String, String> {
 }
 
 fn write(app: &App, server: &Server) -> io::Result<()> {
-    // Settings kept in a dotfiles repository are a link, which a rename would replace.
     let file = match fs::canonicalize(&app.settings) {
         Ok(file) => file,
         Err(_) if app.settings.is_symlink() => {
@@ -149,7 +138,6 @@ fn write(app: &App, server: &Server) -> io::Result<()> {
     if before.as_ref() == Some(&after) {
         return Ok(());
     }
-    // A file already at this name is not this run's to write over or remove.
     let staged = file.with_extension(format!("herdr-triage-{}", std::process::id()));
     let mut staging = OpenOptions::new()
         .write(true)
@@ -159,8 +147,6 @@ fn write(app: &App, server: &Server) -> io::Result<()> {
     let replaced = staging
         .write_all(after.as_bytes())
         .and_then(|()| match fs::metadata(&file) {
-            // These files hold other servers' tokens, and a new file is its writer's: without
-            // the old one's owner and group, its mode would open them to someone else.
             Ok(old) => fchown(&staging, Some(old.uid()), Some(old.gid()))
                 .and_then(|()| staging.set_permissions(old.permissions())),
             Err(_) => Ok(()),
@@ -181,8 +167,6 @@ fn write(app: &App, server: &Server) -> io::Result<()> {
     replaced
 }
 
-/// An entry under the server's name that this action did not write, or one from before a plugin
-/// update moved the binary.
 fn is_another_server(command: Option<&str>, has_url: bool) -> bool {
     let ours = |command: &str| {
         let program = Path::new(command).file_name();
@@ -237,7 +221,6 @@ fn claude_settings(text: &str, server: &Server) -> Result<String, String> {
 }
 
 fn codex_settings(text: &str, server: &Server) -> Result<String, String> {
-    // The error in full quotes the line it is about, which can hold another server's token.
     let unquoted = |error: TomlError| error.message().replace('\n', ", ");
     let mut settings: DocumentMut = text.parse().map_err(unquoted)?;
     let misshapen = || format!("`mcp_servers.{NAME}` has no table to go in");
@@ -246,7 +229,6 @@ fn codex_settings(text: &str, server: &Server) -> Result<String, String> {
     let servers = settings
         .entry("mcp_servers")
         .or_insert(Item::Table(servers));
-    // An inline table holds only values: it drops a table put in it without a word.
     let new_entry = if servers.is_inline_table() {
         value(InlineTable::new())
     } else {

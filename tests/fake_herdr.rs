@@ -528,7 +528,6 @@ struct Desktop {
     codex: std::path::PathBuf,
 }
 
-/// A machine with both desktop apps installed and neither set up.
 fn desktop() -> Desktop {
     let herdr = FakeHerdr::start(vec![]);
     let home = herdr.dir.path().join("home");

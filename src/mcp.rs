@@ -57,7 +57,7 @@ impl Env {
 
 /// Each plugin update puts the binary somewhere new.
 pub fn link_for_clients() {
-    // macOS names the path a program was started by, which for a client is this link itself.
+    // macOS reports the path a program was started by: run by hand, that can be this link.
     let Ok(binary) = std::env::current_exe().and_then(fs::canonicalize) else {
         return;
     };
@@ -77,8 +77,6 @@ pub fn link_for_clients() {
     }
 }
 
-/// Sets Claude Desktop, `ChatGPT` and Codex, where they are on this machine, to start this server,
-/// and says in Herdr what came of it.
 pub fn connect() -> io::Result<()> {
     let settings = config::path();
     if let Some(path) = &settings {
@@ -272,8 +270,6 @@ impl Server {
         ops::config(&self.env).is_ok_and(|config| !config.enabled)
     }
 
-    /// The settings are read for each call, so the user's switch takes hold in a server already
-    /// running, and the call runs on the settings that let it through.
     fn call(&mut self, name: &str, arguments: Value) -> Result<Value, Failure> {
         let config = ops::config(&self.env)?;
         if !config.enabled {

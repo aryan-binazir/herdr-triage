@@ -254,7 +254,6 @@ impl Herdr {
         Ok(result["shown"].as_bool().unwrap_or(true))
     }
 
-    /// Herdr cuts a title short; a body is shown whole.
     pub fn notify_at_length(&mut self, title: &str, body: &str) -> io::Result<()> {
         let params = json!({"title": title, "body": body});
         self.call("notification.show", &params).map(drop)
