@@ -1,6 +1,6 @@
 id = "ar.triage"
 name = "Triage"
-version = "0.2.6"
+version = "0.2.7"
 min_herdr_version = "0.9.1"
 description = "Agent picker with T3 Code-style triage: settle, snooze, unread and pin, with closed threads you can reopen"
 platforms = ["linux", "macos"]
