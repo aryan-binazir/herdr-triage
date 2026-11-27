@@ -328,7 +328,7 @@ impl Herdr {
     ) -> io::Result<Result<Worktrees, Refused>> {
         let params = match of {
             Repository::Active => json!({}),
-            Repository::Of(workspace_id) => json!({"workspace_id": workspace_id}),
+            Repository::Workspace(workspace_id) => json!({"workspace_id": workspace_id}),
             Repository::Containing(cwd) => json!({"cwd": cwd}),
         };
         let listed = self.request("worktree.list", &params, within)?;
@@ -336,7 +336,7 @@ impl Herdr {
     }
 
     pub fn repository_root(&mut self, workspace_id: Option<&str>) -> io::Result<String> {
-        let of = workspace_id.map_or(Repository::Active, Repository::Of);
+        let of = workspace_id.map_or(Repository::Active, Repository::Workspace);
         self.worktrees(of, TIMEOUT)?
             .map_err(|refused| refusal("worktree.list", &refused))?
             .repo_root
@@ -379,9 +379,7 @@ pub fn root_pane(created: &Value) -> Option<String> {
 pub enum Repository<'a> {
     /// The active workspace's.
     Active,
-    /// A workspace's, by its id.
-    Of(&'a str),
-    /// The one holding a path.
+    Workspace(&'a str),
     Containing(&'a str),
 }
 

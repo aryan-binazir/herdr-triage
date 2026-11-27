@@ -121,7 +121,7 @@ impl<'a> Call<'a> {
         asked.map_err(|error| self.late(error))
     }
 
-    /// Herdr cuts a request short at the launch's deadline, and the launch then ran out of time.
+    /// An io error at or after the launch's deadline means the launch ran out of time.
     fn late(&self, error: io::Error) -> Failure {
         match self.herdr.deadline {
             Some(deadline) if Instant::now() >= deadline => out_of_time(),
@@ -192,7 +192,7 @@ impl<'a> Call<'a> {
             if workspaces[at].worktree.is_some() {
                 continue;
             }
-            let of = Repository::Of(&workspaces[at].workspace_id);
+            let of = Repository::Workspace(&workspaces[at].workspace_id);
             let Ok(Ok(listed)) = self.herdr.worktrees(of, QUICK) else {
                 continue;
             };

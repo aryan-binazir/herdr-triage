@@ -1494,6 +1494,27 @@ mod tests {
             json!({"project": "/src/notes/docs", "title": "t"}),
         );
         assert_eq!(error["code"], "project_not_open");
+        let lists = rig.fake.take("worktree.list");
+        assert!(
+            lists.contains(&json!({"cwd": "/src/notes/docs"})),
+            "{lists:?}"
+        );
         assert!(rig.fake.take("worktree.create").is_empty());
+    }
+
+    #[test]
+    fn a_herdr_reply_slower_than_the_launch_budget_is_cut_off_at_the_deadline() {
+        let rig = rig(vec![], None);
+        rig.fake.on("workspace.list", |_| {
+            std::thread::sleep(std::time::Duration::from_secs(2));
+        });
+        let args = LaunchArgs::decode(json!({"project": "acme-api", "title": "Slow"})).unwrap();
+        let config = ops::config(&rig.server.env).unwrap();
+        let mut call = Call::open(&rig.server.env, "test-client:i1", &config).unwrap();
+        let started = std::time::Instant::now();
+        let budget = std::time::Duration::from_millis(200);
+        let error = ops::launch_tool(&mut call, &args, budget).unwrap_err();
+        assert_eq!(error.code, "launch_timeout");
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
     }
 }
