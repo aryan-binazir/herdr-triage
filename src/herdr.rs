@@ -369,15 +369,12 @@ fn refusal(method: &str, refused: &Refused) -> io::Error {
     io::Error::other(format!("{method}: {}", refused.message))
 }
 
-/// The pane that `tab.create` or `worktree.create` opened.
 pub fn root_pane(created: &Value) -> Option<String> {
     created["root_pane"]["pane_id"].as_str().map(str::to_owned)
 }
 
-/// Which repository `worktree.list` lists.
 #[derive(Clone, Copy)]
 pub enum Repository<'a> {
-    /// The active workspace's.
     Active,
     Workspace(&'a str),
     Containing(&'a str),
@@ -388,15 +385,14 @@ pub enum Repository<'a> {
 pub struct Worktrees {
     pub repo_key: Option<String>,
     pub repo_root: Option<String>,
-    /// Each checkout open in a workspace, with that workspace's id.
-    pub open: Vec<(String, Checkout)>,
+    pub open_by_workspace_id: Vec<(String, Checkout)>,
 }
 
 impl Worktrees {
     fn read(listed: &Value) -> Self {
         let source = &listed["source"];
         let text = |value: &Value| value.as_str().unwrap_or_default().to_owned();
-        let open = listed["worktrees"]
+        let open_by_workspace_id = listed["worktrees"]
             .as_array()
             .into_iter()
             .flatten()
@@ -415,7 +411,7 @@ impl Worktrees {
         Self {
             repo_key: source["repo_key"].as_str().map(str::to_owned),
             repo_root: source["repo_root"].as_str().map(str::to_owned),
-            open,
+            open_by_workspace_id,
         }
     }
 }
