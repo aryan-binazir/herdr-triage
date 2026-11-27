@@ -162,8 +162,6 @@ impl FakeHerdr {
             .push((method.to_owned(), Box::new(hook)));
     }
 
-    /// Refuses every call to `method` until `stop_failing`, answering with `fail_code`.
-    #[allow(dead_code, reason = "the benches never fail a call")]
     pub fn fail(&self, method: &str) {
         *self.fail_method.lock().unwrap() = Some(method.to_owned());
     }

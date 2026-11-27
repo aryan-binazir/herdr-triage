@@ -7,13 +7,7 @@ use std::process::{Command, Output};
 use serde_json::{Value, json};
 use support::fake_herdr::{FakeHerdr, agent};
 
-trait RunBinary {
-    fn command(&self, args: &[&str]) -> Command;
-    fn run(&self, args: &[&str]) -> Output;
-}
-
-impl RunBinary for FakeHerdr {
-    /// The binary as Herdr starts it for a plugin hook or keybinding.
+impl FakeHerdr {
     fn command(&self, args: &[&str]) -> Command {
         let mut command = Command::new(env!("CARGO_BIN_EXE_herdr-triage"));
         command
