@@ -1408,4 +1408,113 @@ mod tests {
             json!({"model": null, "effort": null})
         );
     }
+
+    #[test]
+    fn a_launch_asks_herdr_the_same_things_in_the_same_order() {
+        let mut rig = rig(vec![], None);
+        rig.ok(
+            "herdr_launch",
+            json!({"project": "acme-api", "title": "Order", "message": "go"}),
+        );
+        let asked: Vec<String> = rig
+            .fake
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|request| request["method"].as_str().unwrap().to_owned())
+            .collect();
+        let sync = ["agent.list", "workspace.list", "pane.report_metadata"];
+        let expected = [
+            &[
+                "workspace.list",
+                "worktree.list",
+                "worktree.create",
+                "agent.start",
+                "agent.get",
+            ][..],
+            &sync,
+            &["agent.view.set", "agent.get", "agent.prompt"],
+        ]
+        .concat();
+        assert_eq!(asked, expected);
+    }
+
+    #[test]
+    fn a_checkout_row_herdr_garbles_still_places_its_workspace_and_spares_the_rest() {
+        let mut rig = rig(vec![], None);
+        *rig.fake.workspaces.lock().unwrap() = vec![
+            json!({"workspace_id": "w1", "label": "main", "tab_count": 1, "pane_count": 1}),
+            json!({"workspace_id": "w2", "label": "fix", "tab_count": 1, "pane_count": 1}),
+        ];
+        let listing = json!({
+            "source": {"repo_key": "/src/acme-api/.git", "repo_name": "acme-api",
+                       "repo_root": "/src/acme-api"},
+            "worktrees": [
+                {"path": 7, "is_linked_worktree": "yes", "open_workspace_id": "w1"},
+                {"path": "/wt/fix", "is_linked_worktree": true, "open_workspace_id": "w2"},
+            ],
+        });
+        rig.fake
+            .worktree_lists
+            .lock()
+            .unwrap()
+            .insert("w1".into(), listing);
+
+        let projects = rig.ok("herdr_projects", json!({}))["projects"].clone();
+        assert_eq!(projects.as_array().unwrap().len(), 1);
+        assert_eq!(
+            projects[0]["workspaces"],
+            json!([
+                {"workspace_id": "w1", "label": "main", "path": "", "linked_worktree": false},
+                {"workspace_id": "w2", "label": "fix", "path": "/wt/fix", "linked_worktree": true},
+            ])
+        );
+        assert_eq!(rig.fake.take("worktree.list").len(), 1);
+    }
+
+    #[test]
+    fn a_path_herdr_names_no_repository_for_matches_no_project() {
+        let mut rig = rig(vec![], None);
+        *rig.fake.workspaces.lock().unwrap() = vec![json!(
+            {"workspace_id": "w1", "label": "notes", "tab_count": 1, "pane_count": 1}
+        )];
+        let listing = json!({
+            "source": {"repo_root": "/src/notes"},
+            "worktrees": [{"path": "/src/notes", "open_workspace_id": "w1"}],
+        });
+        rig.fake
+            .worktree_lists
+            .lock()
+            .unwrap()
+            .insert("w1".into(), listing);
+
+        let error = rig.failure(
+            "herdr_launch",
+            json!({"project": "/src/notes/docs", "title": "t"}),
+        );
+        assert_eq!(error["code"], "project_not_open");
+        let lists = rig.fake.take("worktree.list");
+        assert!(
+            lists.contains(&json!({"cwd": "/src/notes/docs"})),
+            "{lists:?}"
+        );
+        assert!(rig.fake.take("worktree.create").is_empty());
+    }
+
+    #[test]
+    fn a_herdr_reply_slower_than_the_launch_budget_is_cut_off_at_the_deadline() {
+        let rig = rig(vec![], None);
+        rig.fake.on("workspace.list", |_| {
+            std::thread::sleep(std::time::Duration::from_secs(2));
+        });
+        let args = LaunchArgs::decode(json!({"project": "acme-api", "title": "Slow"})).unwrap();
+        let config = ops::config(&rig.server.env).unwrap();
+        let mut call = Call::open(&rig.server.env, "test-client:i1", &config).unwrap();
+        let started = std::time::Instant::now();
+        let budget = std::time::Duration::from_millis(200);
+        let error = ops::launch_tool(&mut call, &args, budget).unwrap_err();
+        assert_eq!(error.code, "launch_timeout");
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+    }
 }

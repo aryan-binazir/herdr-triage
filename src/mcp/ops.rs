@@ -9,7 +9,7 @@ use serde_json::{Map, Value, json};
 
 use super::Env;
 use super::config::{Config, HARNESSES, Selection};
-use crate::herdr::{self, Herdr, Refused, Workspace};
+use crate::herdr::{self, Herdr, Refused, Repository, Workspace};
 use crate::picker::{Item, Target};
 use crate::session::{Outcome, Session};
 use crate::triage::{Action, Display, Park, Want};
@@ -91,7 +91,6 @@ pub struct Call<'a> {
     session: Session,
     config: &'a Config,
     caller: Option<Caller>,
-    deadline: Option<Instant>,
 }
 
 #[derive(Clone)]
@@ -109,7 +108,6 @@ impl<'a> Call<'a> {
             herdr: Herdr::at(&env.socket)?,
             session: (env.session)()?,
             caller: None,
-            deadline: None,
         })
     }
 
@@ -119,22 +117,15 @@ impl<'a> Call<'a> {
         params: &Value,
         within: Duration,
     ) -> Result<Result<Value, Refused>, Failure> {
-        let Some(deadline) = self.deadline else {
-            return Ok(self.herdr.request(method, params, within)?);
-        };
-        let left = deadline.saturating_duration_since(Instant::now());
-        if left.is_zero() {
-            return Err(out_of_time());
+        let asked = self.herdr.request(method, params, within);
+        asked.map_err(|error| self.late(error))
+    }
+
+    fn late(&self, error: io::Error) -> Failure {
+        match self.herdr.deadline {
+            Some(deadline) if Instant::now() >= deadline => out_of_time(),
+            _ => error.into(),
         }
-        self.herdr
-            .request(method, params, within.min(left))
-            .map_err(|error| {
-                if Instant::now() < deadline {
-                    error.into()
-                } else {
-                    out_of_time()
-                }
-            })
     }
 
     fn ask(&mut self, method: &str, params: &Value, within: Duration) -> Done {
@@ -200,27 +191,17 @@ impl<'a> Call<'a> {
             if workspaces[at].worktree.is_some() {
                 continue;
             }
-            let params = json!({"workspace_id": workspaces[at].workspace_id});
-            let Ok(Ok(listed)) = self.request("worktree.list", &params, QUICK) else {
+            let of = Repository::Workspace(&workspaces[at].workspace_id);
+            let Ok(Ok(listed)) = self.herdr.worktrees(of, QUICK) else {
                 continue;
             };
-            let source = &listed["source"];
-            for worktree in listed["worktrees"].as_array().into_iter().flatten() {
-                let open_in = worktree["open_workspace_id"].as_str();
-                let Some(workspace) = workspaces
+            for (open_in, checkout) in listed.open_by_workspace_id {
+                let unplaced = workspaces
                     .iter_mut()
-                    .find(|w| Some(w.workspace_id.as_str()) == open_in && w.worktree.is_none())
-                else {
-                    continue;
-                };
-                let text = |value: &Value| value.as_str().unwrap_or_default().to_owned();
-                workspace.worktree = Some(herdr::Checkout {
-                    repo_key: text(&source["repo_key"]),
-                    repo_name: text(&source["repo_name"]),
-                    repo_root: text(&source["repo_root"]),
-                    checkout_path: text(&worktree["path"]),
-                    is_linked_worktree: worktree["is_linked_worktree"] == true,
-                });
+                    .find(|w| w.workspace_id == open_in && w.worktree.is_none());
+                if let Some(workspace) = unplaced {
+                    workspace.worktree = Some(checkout);
+                }
             }
         }
         Ok(workspaces)
@@ -388,9 +369,12 @@ fn find_project<'a>(
         return Ok(all.swap_remove(at));
     }
     if Path::new(query).is_absolute() {
-        let found = call.ask("worktree.list", &json!({"cwd": query}), QUICK)?;
-        let key = found["source"]["repo_key"].as_str();
-        return match all.iter().position(|project| Some(project.key) == key) {
+        let found = call.herdr.worktrees(Repository::Containing(query), QUICK);
+        let key = found.map_err(|error| call.late(error))??.repo_key;
+        return match all
+            .iter()
+            .position(|project| Some(project.key) == key.as_deref())
+        {
             Some(at) => Ok(all.swap_remove(at)),
             None => Err(Failure::new(
                 "project_not_open",
@@ -543,7 +527,7 @@ struct Opened {
 
 pub fn launch_tool(call: &mut Call, args: &LaunchArgs, budget: Duration) -> Done {
     let deadline = Instant::now() + budget;
-    call.deadline = Some(deadline);
+    call.herdr.deadline = Some(deadline);
     let config = call.config;
     let caller = call.caller();
     let workspaces = call.workspaces()?;
@@ -728,7 +712,8 @@ fn open_worktree(
         None => worktree["cwd"] = json!(project.root),
     }
     let made = call.ask("worktree.create", &worktree, checkout)?;
-    let pane = pane_of(&made)?;
+    let pane = herdr::root_pane(&made)
+        .ok_or_else(|| Failure::new("herdr_unavailable", "Herdr opened no pane"))?;
     Ok(Opened {
         detail: detail(&[
             ("workspace_id", made["workspace"]["workspace_id"].clone()),
@@ -755,13 +740,6 @@ fn detail(fields: &[(&str, Value)]) -> Map<String, Value> {
         .iter()
         .map(|(name, value)| ((*name).to_owned(), value.clone()))
         .collect()
-}
-
-fn pane_of(made: &Value) -> Result<String, Failure> {
-    made["root_pane"]["pane_id"]
-        .as_str()
-        .map(str::to_owned)
-        .ok_or_else(|| Failure::new("herdr_unavailable", "Herdr opened no pane"))
 }
 
 /// Herdr's `agent.prompt` wait counts a turn already running, so a message to an agent mid-turn

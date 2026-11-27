@@ -167,7 +167,7 @@ impl Herdr {
         timeout: Duration,
     ) -> io::Result<Value> {
         self.request(method, params, timeout)?
-            .map_err(|refused| io::Error::other(format!("{method}: {}", refused.message)))
+            .map_err(|refused| refusal(method, &refused))
     }
 
     pub fn request(
@@ -318,28 +318,35 @@ impl Herdr {
     ) -> io::Result<String> {
         let params = json!({"workspace_id": workspace_id, "cwd": cwd, "focus": focus});
         let result = self.call("tab.create", &params)?;
-        result["root_pane"]["pane_id"]
-            .as_str()
-            .map(str::to_owned)
-            .ok_or_else(|| io::Error::other("tab.create returned no pane"))
+        root_pane(&result).ok_or_else(|| io::Error::other("tab.create returned no pane"))
+    }
+
+    pub fn worktrees(
+        &mut self,
+        of: Repository,
+        within: Duration,
+    ) -> io::Result<Result<Worktrees, Refused>> {
+        let params = match of {
+            Repository::Active => json!({}),
+            Repository::Workspace(workspace_id) => json!({"workspace_id": workspace_id}),
+            Repository::Containing(cwd) => json!({"cwd": cwd}),
+        };
+        let listed = self.request("worktree.list", &params, within)?;
+        Ok(listed.map(|listed| Worktrees::read(&listed)))
     }
 
     pub fn repository_root(&mut self, workspace_id: Option<&str>) -> io::Result<String> {
-        let params = workspace_id.map_or_else(|| json!({}), |id| json!({"workspace_id": id}));
-        let result = self.call("worktree.list", &params)?;
-        result["source"]["repo_root"]
-            .as_str()
-            .map(str::to_owned)
+        let of = workspace_id.map_or(Repository::Active, Repository::Workspace);
+        self.worktrees(of, TIMEOUT)?
+            .map_err(|refused| refusal("worktree.list", &refused))?
+            .repo_root
             .ok_or_else(|| io::Error::other("worktree.list returned no repository"))
     }
 
     pub fn create_worktree(&mut self, root: &str, branch: &str) -> io::Result<String> {
         let params = json!({"cwd": root, "branch": branch, "focus": true});
         let result = self.call_within("worktree.create", &params, WORKTREE_TIMEOUT)?;
-        result["root_pane"]["pane_id"]
-            .as_str()
-            .map(str::to_owned)
-            .ok_or_else(|| io::Error::other("worktree.create returned no pane"))
+        root_pane(&result).ok_or_else(|| io::Error::other("worktree.create returned no pane"))
     }
 
     pub fn run_command(&mut self, pane_id: &str, command: &str) -> io::Result<()> {
@@ -355,6 +362,57 @@ impl Herdr {
         let params =
             json!({"plugin_id": plugin_id(), "entrypoint": "picker", "focus": true, "env": env});
         self.call("plugin.pane.open", &params).map(drop)
+    }
+}
+
+fn refusal(method: &str, refused: &Refused) -> io::Error {
+    io::Error::other(format!("{method}: {}", refused.message))
+}
+
+pub fn root_pane(created: &Value) -> Option<String> {
+    created["root_pane"]["pane_id"].as_str().map(str::to_owned)
+}
+
+#[derive(Clone, Copy)]
+pub enum Repository<'a> {
+    Active,
+    Workspace(&'a str),
+    Containing(&'a str),
+}
+
+/// A `worktree.list` reply. Herdr leaves fields out, so each is read on its own and one bad row
+/// spares the rest.
+pub struct Worktrees {
+    pub repo_key: Option<String>,
+    pub repo_root: Option<String>,
+    pub open_by_workspace_id: Vec<(String, Checkout)>,
+}
+
+impl Worktrees {
+    fn read(listed: &Value) -> Self {
+        let source = &listed["source"];
+        let text = |value: &Value| value.as_str().unwrap_or_default().to_owned();
+        let open_by_workspace_id = listed["worktrees"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|worktree| {
+                let workspace_id = worktree["open_workspace_id"].as_str()?.to_owned();
+                let checkout = Checkout {
+                    repo_key: text(&source["repo_key"]),
+                    repo_name: text(&source["repo_name"]),
+                    repo_root: text(&source["repo_root"]),
+                    checkout_path: text(&worktree["path"]),
+                    is_linked_worktree: worktree["is_linked_worktree"] == true,
+                };
+                Some((workspace_id, checkout))
+            })
+            .collect();
+        Self {
+            repo_key: source["repo_key"].as_str().map(str::to_owned),
+            repo_root: source["repo_root"].as_str().map(str::to_owned),
+            open_by_workspace_id,
+        }
     }
 }
 
