@@ -497,6 +497,10 @@ fn fnv1a(bytes: &[u8]) -> u64 {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
+    use rusqlite::types::Value;
+
     use super::*;
 
     fn save_full(tx: &Transaction, state: &State) -> rusqlite::Result<()> {
@@ -765,8 +769,21 @@ mod tests {
         }
     }
 
+    fn raw_row(connection: &Connection) -> BTreeMap<String, Value> {
+        let mut select = connection.prepare("SELECT * FROM threads").unwrap();
+        let names: Vec<String> = select.column_names().into_iter().map(Into::into).collect();
+        select
+            .query_row([], |row| {
+                names
+                    .iter()
+                    .map(|name| Ok((name.clone(), row.get(name.as_str())?)))
+                    .collect()
+            })
+            .unwrap()
+    }
+
     #[test]
-    fn columns_added_in_a_different_order_load_correctly() {
+    fn rows_written_by_v0_2_6_load_and_are_rewritten_unchanged() {
         let dir = tempfile::tempdir().unwrap();
         let old = Connection::open(dir.path().join("triage.sqlite3")).unwrap();
         let mut schema = SCHEMA.to_owned();
@@ -776,22 +793,37 @@ mod tests {
                 .replace(&format!(",\n    {name} {definition}\n"), "\n");
         }
         old.execute_batch(&schema).unwrap();
-        for (name, definition) in LATER_COLUMNS.into_iter().rev() {
+        for (name, definition) in LATER_COLUMNS.iter().rev() {
             old.execute_batch(&format!(
                 "ALTER TABLE threads ADD COLUMN {name} {definition}"
             ))
             .unwrap();
         }
-        let tx = old.unchecked_transaction().unwrap();
-        let mut expected = State::default();
-        expected.records.insert("k".into(), record());
-        save_full(&tx, &expected).unwrap();
-        tx.commit().unwrap();
+        old.execute_batch(
+            "INSERT INTO threads (key, pinned, park, snooze_until, unread, ack_seq, generation, \
+             last_seq, changed_at, touched_at, live, ended, missing_since, last_status, label, agent, \
+             cwd, workspace_id, workspace_label, session_source, session_kind, session_value, \
+             reopen_pane, reopen_at, reopen_generation, restored_at, title, launched_by, \
+             settle_requested, close_requested) \
+             VALUES ('k', 1, 'snoozed', 1800, 'woke', 7, 'g1', 9, 1000, 1100, 0, 1, 1050, 'done', \
+             'fix flaky test', 'codex', '/work/api', 'w2', 'acme-api', 'herdr:codex', 'id', \
+             '0199-abc', 'w2:p4', 1200, 'g0', 1300, 'checkout flow', 'client:claude-code', \
+             'term-7', 'term-8')",
+        )
+        .unwrap();
+        let written = raw_row(&old);
         let store = Store::at(dir.path().to_owned());
         assert_eq!(
             store.transact(|s| s.records["k"].clone()).unwrap(),
             record()
         );
+        store
+            .transact(|s| s.records.get_mut("k").unwrap().title = None)
+            .unwrap();
+        store
+            .transact(|s| s.records.insert("k".into(), record()))
+            .unwrap();
+        assert_eq!(raw_row(&old), written);
     }
 
     #[test]
