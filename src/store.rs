@@ -358,7 +358,7 @@ fn save(tx: &Transaction, state: &State, before: &State) -> rusqlite::Result<()>
             }
         }
     }
-    // Nothing reads last_status, but the column is NOT NULL and older releases still read it.
+    // Nothing uses last_status any more; v0.2.6 still needs the NOT NULL column and accepts any text.
     let mut insert = tx.prepare(
         "INSERT OR REPLACE INTO threads (key, pinned, park, snooze_until, unread, ack_seq, generation, \
          last_seq, changed_at, touched_at, live, ended, missing_since, last_status, label, agent, \
@@ -649,7 +649,7 @@ mod tests {
     }
 
     #[test]
-    fn rows_written_by_v0_2_6_load_and_are_rewritten_unchanged() {
+    fn rows_written_by_v0_2_6_load_and_are_rewritten_in_the_same_shape() {
         let dir = tempfile::tempdir().unwrap();
         let old = Connection::open(dir.path().join("triage.sqlite3")).unwrap();
         let mut schema = SCHEMA.to_owned();
@@ -665,6 +665,7 @@ mod tests {
             ))
             .unwrap();
         }
+        old.pragma_update(None, "user_version", 8).unwrap();
         old.execute_batch(
             "INSERT INTO threads (key, pinned, park, snooze_until, unread, ack_seq, generation, \
              last_seq, changed_at, touched_at, live, ended, missing_since, last_status, label, agent, \
@@ -742,23 +743,14 @@ mod tests {
                 state.undo.clone()
             })
             .unwrap();
-        let (records, sections, undo, last_focused) = store
-            .transact(|state| {
-                (
-                    state.records.clone(),
-                    state.open_sections.clone(),
-                    state.undo.clone(),
-                    state.last_focused.clone(),
-                )
-            })
-            .unwrap();
-        assert_eq!(last_focused.as_deref(), Some("terminal:t1"));
-        assert!(undo.is_some());
-        assert_eq!(undo, saved_undo);
-        assert_eq!(records["session:codex:id:0199-abc"], record());
-        assert_eq!(records.len(), 2);
+        let state = store.transact(|state| state.clone()).unwrap();
+        assert_eq!(state.last_focused.as_deref(), Some("terminal:t1"));
+        assert!(state.undo.is_some());
+        assert_eq!(state.undo, saved_undo);
+        assert_eq!(state.records["session:codex:id:0199-abc"], record());
+        assert_eq!(state.records.len(), 2);
         assert_eq!(
-            sections,
+            state.open_sections,
             BTreeSet::from([Section::Working, Section::Settled])
         );
     }
