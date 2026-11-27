@@ -108,7 +108,7 @@ fn run_picker() -> io::Result<()> {
                     shown.t3 = snapshot;
                     picker.refresh(shown.items(), &shown.herdr.open_sections);
                 }
-                t3::Update::Done { op, result, .. } => picker.t3_done(op, result),
+                t3::Update::Done { thread, op, result } => picker.t3_done(&thread, op, result),
             }
         }
         let tick = usize::try_from(started.elapsed().as_millis() / 125).unwrap_or(0);
@@ -151,14 +151,15 @@ fn run_picker() -> io::Result<()> {
                 show(&mut picker, &mut shown, session.toggle_section(section));
             }
             Effect::Apply { key, action } => {
-                let leave = act(&mut session, &mut picker, &mut shown, Some((&key, action)));
+                let leave =
+                    act_or_undo(&mut session, &mut picker, &mut shown, Some((&key, action)));
                 refreshed = Instant::now();
                 if let Some(leave) = leave {
                     break Ok(leave);
                 }
             }
             Effect::Undo => {
-                let leave = act(&mut session, &mut picker, &mut shown, None);
+                let leave = act_or_undo(&mut session, &mut picker, &mut shown, None);
                 refreshed = Instant::now();
                 if let Some(leave) = leave {
                     break Ok(leave);
@@ -183,8 +184,7 @@ fn leave(session: &mut Session, leave: Leave) -> io::Result<()> {
     }
 }
 
-/// Applies `action` to the thread shown as `key`, or undoes the last change when `None`.
-fn act(
+fn act_or_undo(
     session: &mut Session,
     picker: &mut Picker,
     shown: &mut Shown,
@@ -301,7 +301,7 @@ mod tests {
         let Effect::Apply { key, action } = picker.key(press, NOW, &chrono::Utc) else {
             panic!("s should settle the selected row");
         };
-        assert!(act(session, picker, shown, Some((&key, action))).is_none());
+        assert!(act_or_undo(session, picker, shown, Some((&key, action))).is_none());
     }
 
     fn pending(picker: &Picker) -> Vec<(&str, bool)> {

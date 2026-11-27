@@ -608,10 +608,13 @@ impl Picker {
         self.inform("asking T3…".into());
     }
 
-    /// T3's answer to the oldest request still unanswered: T3 answers them in the order sent.
-    /// A settle or snooze it applied moves the cursor on, unless you have pressed a key since.
-    pub fn t3_done(&mut self, op: T3Op, result: Result<t3::Done, String>) {
-        let sent = self.asked_t3.pop_front();
+    pub fn t3_done(&mut self, thread: &str, op: T3Op, result: Result<t3::Done, String>) {
+        let key = t3::row_key(thread);
+        let sent = self
+            .asked_t3
+            .iter()
+            .position(|sent| sent.key == key)
+            .and_then(|at| self.asked_t3.remove(at));
         match result {
             Ok(t3::Done::Applied) => {
                 self.inform("done in T3".into());
@@ -2086,7 +2089,7 @@ mod tests {
         press(&mut picker, KeyCode::Char('s'));
         picker.asked_t3("t3-a");
         picker.refresh(shown(true), &closed_sections());
-        picker.t3_done(crate::t3::Op::Settle, Ok(crate::t3::Done::Applied));
+        picker.t3_done("t3-a", crate::t3::Op::Settle, Ok(crate::t3::Done::Applied));
         assert_eq!(
             picker.selected().map(|item| item.row.label()),
             Some("needs you")
@@ -2099,7 +2102,7 @@ mod tests {
         press(&mut picker, KeyCode::Char('k'));
         press(&mut picker, KeyCode::Char('j'));
         picker.refresh(shown(true), &closed_sections());
-        picker.t3_done(crate::t3::Op::Settle, Ok(crate::t3::Done::Applied));
+        picker.t3_done("t3-a", crate::t3::Op::Settle, Ok(crate::t3::Done::Applied));
         assert_eq!(
             picker.selected().map(|item| item.row.label()),
             None,
