@@ -220,7 +220,11 @@ impl Session {
         self.carry_out(|state, observed, now| {
             let key = current_key(observed, key);
             let agent = observed.iter().find(|agent| agent.key == key);
-            let after = state.apply(key, agent, action, now)?;
+            let after = match (action, state.apply(key, agent, action, now)?) {
+                // An agent naming the state it wants (MCP) is told only what is now true.
+                (Action::Ensure(_), After::SettleQueued | After::SettleCalledOff) => After::Nothing,
+                (_, after) => after,
+            };
             state.mark_left_if_elsewhere(key, observed);
             Ok((key.to_owned(), after))
         })
@@ -280,6 +284,12 @@ impl Session {
         let outcome = match after {
             Err(Refusal(refusal)) => Ok(Outcome::Refused(refusal)),
             Ok((key, After::Nothing)) => Ok(done(key, None)),
+            Ok((key, After::SettleQueued)) => {
+                Ok(done(key, Some("settles when its turn ends".into())))
+            }
+            Ok((key, After::SettleCalledOff)) => {
+                Ok(done(key, Some("won't settle when its turn ends".into())))
+            }
             Ok((key, After::ClosePane(close))) => {
                 self.close_session(&close).map(|notice| done(key, notice))
             }
@@ -1597,7 +1607,14 @@ mod tests {
             resumable_agent("w1:p2", "idle", 4),
         ]);
         let (mut session, _) = connect(&fake);
-        assert_eq!(session.act(KEY, Action::ToggleSettle).unwrap(), done(KEY));
+        assert_eq!(
+            session.act(KEY, Action::ToggleSettle).unwrap(),
+            Outcome::Done {
+                key: KEY.into(),
+                notice: Some("settles when its turn ends".into()),
+                wake_failed: None,
+            }
+        );
         assert!(fake.take("pane.close").is_empty());
         session.sync().unwrap();
         assert!(fake.take("pane.close").is_empty());
@@ -1616,6 +1633,30 @@ mod tests {
             .unwrap()
             .row;
         assert_eq!(row.status_text(NOW), "settled · closed");
+    }
+
+    #[test]
+    fn asking_for_a_waiting_settle_to_be_unsettled_calls_it_off_without_a_notice() {
+        let fake = FakeHerdr::start(vec![
+            resumable_agent("w1:p1", "working", 3),
+            resumable_agent("w1:p2", "idle", 4),
+        ]);
+        let (mut session, _) = connect(&fake);
+        session.act(KEY, Action::ToggleSettle).unwrap();
+        assert_eq!(
+            session
+                .act(KEY, Action::Ensure(triage::Want::Unsettled))
+                .unwrap(),
+            done(KEY)
+        );
+        let view = session.view().unwrap();
+        let row = &view
+            .items
+            .iter()
+            .find(|item| item.row.key == KEY)
+            .unwrap()
+            .row;
+        assert!(!row.settle_pending);
     }
 
     #[test]

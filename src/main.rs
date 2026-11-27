@@ -92,7 +92,6 @@ fn run_picker() -> io::Result<()> {
         t3: None,
     };
     let t3 = t3::Worker::start(&store::state_root());
-    let mut t3_sent = Vec::new();
     let mut picker = Picker::new(shown.items(), focus.as_deref(), &shown.herdr.open_sections);
     picker.set_undo(shown.herdr.undo.clone());
 
@@ -109,10 +108,7 @@ fn run_picker() -> io::Result<()> {
                     shown.t3 = snapshot;
                     picker.refresh(shown.items(), &shown.herdr.open_sections);
                 }
-                t3::Update::Done { op, result, .. } => {
-                    let sent = (!t3_sent.is_empty()).then(|| t3_sent.remove(0));
-                    t3_done(&mut picker, op, result, sent.as_ref());
-                }
+                t3::Update::Done { op, result, .. } => picker.t3_done(op, result),
             }
         }
         let tick = usize::try_from(started.elapsed().as_millis() / 125).unwrap_or(0);
@@ -143,8 +139,7 @@ fn run_picker() -> io::Result<()> {
             Effect::NewAgent(agent) => break Ok(Leave::NewAgent(agent)),
             Effect::T3 { thread, op } => {
                 if t3.request(&thread, op) {
-                    t3_sent.push(picker.sent(&t3::row_key(&thread)));
-                    picker.inform("asking T3…".into());
+                    picker.asked_t3(&thread);
                 } else {
                     picker.notify("T3 isn't installed here".into());
                 }
@@ -156,14 +151,14 @@ fn run_picker() -> io::Result<()> {
                 show(&mut picker, &mut shown, session.toggle_section(section));
             }
             Effect::Apply { key, action } => {
-                let leave = apply(&mut session, &mut picker, &mut shown, &key, action);
+                let leave = act(&mut session, &mut picker, &mut shown, Some((&key, action)));
                 refreshed = Instant::now();
                 if let Some(leave) = leave {
                     break Ok(leave);
                 }
             }
             Effect::Undo => {
-                let leave = undo(&mut session, &mut picker, &mut shown);
+                let leave = act(&mut session, &mut picker, &mut shown, None);
                 refreshed = Instant::now();
                 if let Some(leave) = leave {
                     break Ok(leave);
@@ -188,37 +183,19 @@ fn leave(session: &mut Session, leave: Leave) -> io::Result<()> {
     }
 }
 
-fn t3_done(
-    picker: &mut Picker,
-    op: t3::Op,
-    result: Result<t3::Done, String>,
-    sent: Option<&picker::Sent>,
-) {
-    match result {
-        Ok(t3::Done::Applied) => {
-            picker.inform("done in T3".into());
-            if let Some(sent) =
-                sent.filter(|_| matches!(op, t3::Op::Settle | t3::Op::Snooze { .. }))
-            {
-                picker.move_on_after(sent);
-            }
-        }
-        Ok(t3::Done::AtTurnEnd) => picker.inform("settles in T3 when its turn ends".into()),
-        Err(error) => picker.notify(error),
-    }
-}
-
-fn apply(
+/// Applies `action` to the thread shown as `key`, or undoes the last change when `None`.
+fn act(
     session: &mut Session,
     picker: &mut Picker,
     shown: &mut Shown,
-    key: &str,
-    action: Action,
+    action: Option<(&str, Action)>,
 ) -> Option<Leave> {
     let from = picker.selected_row().unwrap_or(0);
-    let pending = |item: &picker::Item| item.row.key == key && item.row.settle_pending;
-    let calls_off = action == Action::ToggleSettle && picker.items().iter().any(pending);
-    match session.act(key, action) {
+    let outcome = match action {
+        Some((key, action)) => session.act(key, action),
+        None => session.undo(),
+    };
+    match outcome {
         Ok(Outcome::Reopened) => return Some(Leave::Close),
         Ok(Outcome::Refused(refusal)) => {
             show(picker, shown, session.view());
@@ -233,49 +210,24 @@ fn apply(
             if let Some(notice) = notice {
                 picker.inform(notice);
             }
-            if action == Action::ToggleSettle && picker.items().iter().any(pending) {
-                picker.inform("settles when its turn ends".into());
-            } else if calls_off {
-                picker.inform("won't settle when its turn ends".into());
-            }
-            if matches!(
-                action,
-                Action::ToggleSettle
-                    | Action::SettleKeepingOpen
-                    | Action::CloseForGood { .. }
-                    | Action::Snooze(_)
-            ) {
-                picker.move_on_from(&key, from);
-            }
-            if let Some(error) = wake_failed {
-                picker.notify(format!("snooze saved, but its wake timer failed: {error}"));
-            }
-        }
-        Err(error) => picker.notify(format!("herdr: {error}")),
-    }
-    None
-}
-
-fn undo(session: &mut Session, picker: &mut Picker, shown: &mut Shown) -> Option<Leave> {
-    match session.undo() {
-        Ok(Outcome::Reopened) => return Some(Leave::Close),
-        Ok(Outcome::Refused(refusal)) => {
-            show(picker, shown, session.view());
-            picker.notify(refusal);
-        }
-        Ok(Outcome::Done {
-            notice,
-            wake_failed,
-            ..
-        }) => {
-            show(picker, shown, session.view());
-            if let Some(notice) = notice {
-                picker.inform(notice);
-            }
-            picker.inform("undone".into());
+            let snooze = if let Some((_, action)) = action {
+                if matches!(
+                    action,
+                    Action::ToggleSettle
+                        | Action::SettleKeepingOpen
+                        | Action::CloseForGood { .. }
+                        | Action::Snooze(_)
+                ) {
+                    picker.move_on_from(&key, from);
+                }
+                "saved"
+            } else {
+                picker.inform("undone".into());
+                "restored"
+            };
             if let Some(error) = wake_failed {
                 picker.notify(format!(
-                    "snooze restored, but its wake timer failed: {error}"
+                    "snooze {snooze}, but its wake timer failed: {error}"
                 ));
             }
         }
@@ -315,5 +267,87 @@ fn show(picker: &mut Picker, shown: &mut Shown, view: io::Result<View>) {
             picker.set_undo(shown.herdr.undo.clone());
         }
         Err(error) => picker.notify(format!("herdr: {error}")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use serde_json::json;
+
+    use super::*;
+    use crate::fake_herdr::{self, FakeHerdr};
+    use crate::store::Store;
+
+    const NOW: i64 = 1_800_000_000;
+
+    fn picker_on(fake: &FakeHerdr) -> (Session, Picker, Shown) {
+        let mut session = Session::new(
+            Herdr::at(&fake.socket).unwrap(),
+            Store::at(fake.state_dir()),
+            || NOW,
+            |_| Ok(()),
+        );
+        let shown = Shown {
+            herdr: session.toggle_section(triage::Section::Working).unwrap(),
+            t3: None,
+        };
+        let picker = Picker::new(shown.items(), Some("w1:p1"), &shown.herdr.open_sections);
+        (session, picker, shown)
+    }
+
+    fn settle_selected(session: &mut Session, picker: &mut Picker, shown: &mut Shown) {
+        let press = KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE);
+        let Effect::Apply { key, action } = picker.key(press, NOW, &chrono::Utc) else {
+            panic!("s should settle the selected row");
+        };
+        assert!(act(session, picker, shown, Some((&key, action))).is_none());
+    }
+
+    fn pending(picker: &Picker) -> Vec<(&str, bool)> {
+        let items = picker.items().iter();
+        items
+            .map(|item| (item.row.key.as_str(), item.row.settle_pending))
+            .collect()
+    }
+
+    #[test]
+    fn settling_a_working_agent_herdr_rekeyed_since_the_picker_showed_it_says_so() {
+        let fake = FakeHerdr::start(vec![
+            fake_herdr::agent("w1:p1", "working", 3),
+            fake_herdr::agent("w1:p2", "idle", 4),
+        ]);
+        let (mut session, mut picker, mut shown) = picker_on(&fake);
+        fake.agents.lock().unwrap()[0]["agent_session"] = json!({
+            "source": "herdr:claude", "agent": "claude", "kind": "id", "value": "id-p1"
+        });
+        settle_selected(&mut session, &mut picker, &mut shown);
+        let rekeyed = "session:claude:id:id-p1";
+        assert!(pending(&picker).contains(&(rekeyed, true)));
+        assert_eq!(picker.message(), Some("settles when its turn ends"));
+
+        settle_selected(&mut session, &mut picker, &mut shown);
+        assert!(pending(&picker).contains(&(rekeyed, false)));
+        assert_eq!(picker.message(), Some("won't settle when its turn ends"));
+    }
+
+    #[test]
+    fn settling_again_after_a_queued_settle_landed_unsettles_without_claiming_to_call_it_off() {
+        let fake = FakeHerdr::start(vec![
+            fake_herdr::agent("w1:p1", "working", 3),
+            fake_herdr::agent("w1:p2", "idle", 4),
+        ]);
+        let (mut session, mut picker, mut shown) = picker_on(&fake);
+        settle_selected(&mut session, &mut picker, &mut shown);
+        assert_eq!(picker.message(), Some("settles when its turn ends"));
+        {
+            let mut agents = fake.agents.lock().unwrap();
+            agents[0]["agent_status"] = json!("done");
+            agents[0]["state_change_seq"] = json!(5);
+        }
+        settle_selected(&mut session, &mut picker, &mut shown);
+        let row = &picker.items()[0].row;
+        assert_eq!((row.park, row.settle_pending), (None, false));
+        assert_eq!(picker.message(), None);
     }
 }
