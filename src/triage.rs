@@ -134,8 +134,6 @@ pub struct Record {
     #[serde(default)]
     pub missing_since: Option<i64>,
     #[serde(default)]
-    pub last_status: Status,
-    #[serde(default)]
     pub thread: Thread,
     #[serde(default)]
     pub reopen_pane: Option<String>,
@@ -341,7 +339,7 @@ pub struct Reconciled {
     pub closes: Vec<Close>,
 }
 
-#[derive(Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct State {
     pub records: BTreeMap<String, Record>,
     #[serde(default)]
@@ -929,7 +927,6 @@ impl State {
                 record.changed_at = Some(now);
             }
             record.last_seq = agent.seq;
-            record.last_status = agent.status;
             record.thread = agent.thread.clone();
             record.live = true;
             record.ended = false;
