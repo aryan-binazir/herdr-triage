@@ -198,11 +198,11 @@ impl Record {
 
     fn settle(&mut self, seq: u64, shown: Display, agent: Option<&Observed>) -> After {
         if self.settle_requested.take().is_some() {
-            return After::Nothing;
+            return After::SettleCalledOff;
         }
         if shown == Display::Working {
             self.settle_requested = agent.map(|agent| agent.terminal_id.clone());
-            return After::Nothing;
+            return After::SettleQueued;
         }
         self.pinned = false;
         let closing = self.resumable().then_some(agent).flatten();
@@ -523,6 +523,8 @@ pub struct Refusal(pub String);
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum After {
     Nothing,
+    SettleQueued,
+    SettleCalledOff,
     ClosePane(Close),
     Reopen(Box<ReopenPlan>),
 }
@@ -2332,8 +2334,13 @@ mod tests {
         state.reconcile(GEN, std::slice::from_ref(&working), NOW);
         assert_eq!(
             act(&mut state, &working, Action::ToggleSettle),
-            Ok(After::Nothing)
+            Ok(After::SettleQueued)
         );
+        assert_eq!(
+            act(&mut state, &working, Action::ToggleSettle),
+            Ok(After::SettleCalledOff)
+        );
+        act(&mut state, &working, Action::ToggleSettle).unwrap();
         let row = state.ordered(std::slice::from_ref(&working)).remove(0);
         assert_eq!(
             (row.rank(), row.status_text(NOW)),

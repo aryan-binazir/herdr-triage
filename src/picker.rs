@@ -1,10 +1,10 @@
 use std::cmp::Reverse;
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, VecDeque};
 
 use chrono::TimeZone;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-use crate::t3::Op as T3Op;
+use crate::t3::{self, Op as T3Op};
 use crate::triage::{Action, Park, Refusal, Row, Section, SnoozePreset, snooze_presets};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -140,10 +140,11 @@ pub struct Picker {
     offset: usize,
     rows_on_screen: usize,
     presses: u64,
+    asked_t3: VecDeque<Sent>,
 }
 
 #[derive(Debug)]
-pub struct Sent {
+struct Sent {
     key: String,
     from: usize,
     presses: u64,
@@ -174,6 +175,7 @@ impl Picker {
             offset: 0,
             rows_on_screen: 10,
             presses: 0,
+            asked_t3: VecDeque::new(),
         };
         let start = focus_pane
             .and_then(|pane| items.iter().position(|item| item.pane_id() == Some(pane)))
@@ -597,19 +599,33 @@ impl Picker {
         self.offset
     }
 
-    /// After `key` was parked, selects the first live row that needs you most, else stays at
-    /// the row it left, `from`.
-    pub fn sent(&self, key: &str) -> Sent {
-        Sent {
-            key: key.to_owned(),
+    pub fn asked_t3(&mut self, thread: &str) {
+        self.asked_t3.push_back(Sent {
+            key: t3::row_key(thread),
             from: self.selected_row().unwrap_or(0),
             presses: self.presses,
-        }
+        });
+        self.inform("asking T3…".into());
     }
 
-    pub fn move_on_after(&mut self, sent: &Sent) {
-        if self.presses == sent.presses {
-            self.move_on_from(&sent.key, sent.from);
+    pub fn t3_done(&mut self, thread: &str, op: T3Op, result: Result<t3::Done, String>) {
+        let key = t3::row_key(thread);
+        let sent = self
+            .asked_t3
+            .iter()
+            .position(|sent| sent.key == key)
+            .and_then(|at| self.asked_t3.remove(at));
+        match result {
+            Ok(t3::Done::Applied) => {
+                self.inform("done in T3".into());
+                if let Some(sent) = sent.filter(|sent| {
+                    sent.presses == self.presses && matches!(op, T3Op::Settle | T3Op::Snooze { .. })
+                }) {
+                    self.move_on_from(&sent.key, sent.from);
+                }
+            }
+            Ok(t3::Done::AtTurnEnd) => self.inform("settles in T3 when its turn ends".into()),
+            Err(error) => self.notify(error),
         }
     }
 
@@ -621,6 +637,8 @@ impl Picker {
             || self.new_agent.is_some()
     }
 
+    /// After `key` was parked, selects the first live row that needs you most, else stays at
+    /// the row it left, `from`.
     pub fn move_on_from(&mut self, key: &str, from: usize) {
         let still_listed_unparked = self
             .items
@@ -2069,9 +2087,9 @@ mod tests {
         let mut picker = Picker::new(shown(false), None, &closed_sections());
         select(&mut picker, "t3-a");
         press(&mut picker, KeyCode::Char('s'));
-        let sent = picker.sent("t3:t3-a");
+        picker.asked_t3("t3-a");
         picker.refresh(shown(true), &closed_sections());
-        picker.move_on_after(&sent);
+        picker.t3_done("t3-a", crate::t3::Op::Settle, Ok(crate::t3::Done::Applied));
         assert_eq!(
             picker.selected().map(|item| item.row.label()),
             Some("needs you")
@@ -2080,11 +2098,11 @@ mod tests {
         let mut picker = Picker::new(shown(false), None, &closed_sections());
         select(&mut picker, "t3-a");
         press(&mut picker, KeyCode::Char('s'));
-        let sent = picker.sent("t3:t3-a");
+        picker.asked_t3("t3-a");
         press(&mut picker, KeyCode::Char('k'));
         press(&mut picker, KeyCode::Char('j'));
         picker.refresh(shown(true), &closed_sections());
-        picker.move_on_after(&sent);
+        picker.t3_done("t3-a", crate::t3::Op::Settle, Ok(crate::t3::Done::Applied));
         assert_eq!(
             picker.selected().map(|item| item.row.label()),
             None,
