@@ -140,7 +140,6 @@ pub struct Picker {
     offset: usize,
     rows_on_screen: usize,
     presses: u64,
-    /// Where the cursor was as each T3 request still unanswered was sent, oldest first.
     asked_t3: VecDeque<Sent>,
 }
 
@@ -610,7 +609,7 @@ impl Picker {
     }
 
     /// T3's answer to the oldest request still unanswered: T3 answers them in the order sent.
-    /// A settle or snooze it applied moves the cursor on, unless you have moved it since.
+    /// A settle or snooze it applied moves the cursor on, unless you have pressed a key since.
     pub fn t3_done(&mut self, op: T3Op, result: Result<t3::Done, String>) {
         let sent = self.asked_t3.pop_front();
         match result {

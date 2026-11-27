@@ -206,10 +206,10 @@ fn act(
             notice,
             wake_failed,
         }) => {
-            show(picker, shown, session.view());
             if let Some(notice) = notice {
                 picker.inform(notice);
             }
+            show(picker, shown, session.view());
             let snooze = if let Some((_, action)) = action {
                 if matches!(
                     action,
@@ -346,8 +346,25 @@ mod tests {
             agents[0]["state_change_seq"] = json!(5);
         }
         settle_selected(&mut session, &mut picker, &mut shown);
-        let row = &picker.items()[0].row;
+        let item = picker
+            .items()
+            .iter()
+            .find(|item| item.pane_id() == Some("w1:p1"));
+        let row = &item.unwrap().row;
         assert_eq!((row.park, row.settle_pending), (None, false));
         assert_eq!(picker.message(), None);
+    }
+
+    #[test]
+    fn a_picker_that_could_not_refresh_after_an_action_says_so_over_its_notice() {
+        let fake = FakeHerdr::start(vec![
+            fake_herdr::agent("w1:p1", "working", 3),
+            fake_herdr::agent("w1:p2", "idle", 4),
+        ]);
+        let (mut session, mut picker, mut shown) = picker_on(&fake);
+        *fake.fail_method.lock().unwrap() = Some("tab.list".into());
+        settle_selected(&mut session, &mut picker, &mut shown);
+        assert!(picker.message().is_some_and(|m| m.starts_with("herdr: ")));
+        assert!(picker.message_is_error());
     }
 }

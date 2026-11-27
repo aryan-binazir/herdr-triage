@@ -221,8 +221,8 @@ impl Session {
             let key = current_key(observed, key);
             let agent = observed.iter().find(|agent| agent.key == key);
             let after = match (action, state.apply(key, agent, action, now)?) {
-                // An agent naming the state it wants (MCP) is told only what is now true.
-                (Action::Ensure(_), After::SettleQueued | After::SettleCalledOff) => After::Nothing,
+                // MCP asks for the state it wants; calling off a waiting settle is how it gets there.
+                (Action::Ensure(triage::Want::Unsettled), After::SettleCalledOff) => After::Nothing,
                 (_, after) => after,
             };
             state.mark_left_if_elsewhere(key, observed);

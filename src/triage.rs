@@ -523,9 +523,7 @@ pub struct Refusal(pub String);
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum After {
     Nothing,
-    /// The settle waits for the agent's turn to end.
     SettleQueued,
-    /// A settle that was waiting for the turn to end no longer will.
     SettleCalledOff,
     ClosePane(Close),
     Reopen(Box<ReopenPlan>),
