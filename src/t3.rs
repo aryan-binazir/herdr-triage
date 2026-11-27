@@ -213,8 +213,13 @@ fn display(thread: &T3Thread) -> Display {
     match thread.status.as_str() {
         "preparing" | "queued" | "starting" | "running" => Display::Working,
         "waiting" => Display::Blocked,
-        status if FINISHED.contains(&status) && thread.unseen => Display::Done,
-        status if FINISHED.contains(&status) => Display::Idle,
+        status if FINISHED.contains(&status) => {
+            if thread.unseen {
+                Display::Done
+            } else {
+                Display::Idle
+            }
+        }
         "idle" => Display::Idle,
         _ => Display::Unknown,
     }
