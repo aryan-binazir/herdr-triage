@@ -13,6 +13,7 @@ use crate::picker::{Item, Target};
 use crate::triage::{Display, Park, Row, Status, Thread};
 
 pub use client::{Client, Done};
+use db::FINISHED;
 
 fn home() -> Option<PathBuf> {
     let set = |name| std::env::var_os(name).filter(|value| !value.is_empty());
@@ -212,12 +213,14 @@ fn display(thread: &T3Thread) -> Display {
     match thread.status.as_str() {
         "preparing" | "queued" | "starting" | "running" => Display::Working,
         "waiting" => Display::Blocked,
-        "completed" | "interrupted" | "failed" | "cancelled" | "rolled_back" if thread.unseen => {
-            Display::Done
+        status if FINISHED.contains(&status) => {
+            if thread.unseen {
+                Display::Done
+            } else {
+                Display::Idle
+            }
         }
-        "completed" | "interrupted" | "failed" | "cancelled" | "rolled_back" | "idle" => {
-            Display::Idle
-        }
+        "idle" => Display::Idle,
         _ => Display::Unknown,
     }
 }
@@ -408,7 +411,7 @@ mod tests {
             ]),
             NOW,
         );
-        let sections: Vec<Option<Section>> = items.iter().map(Item::section).collect();
+        let sections: Vec<Option<Section>> = items.iter().map(|item| item.row.section()).collect();
         assert_eq!(
             sections,
             [Some(Section::Working), None, Some(Section::Snoozed)]
@@ -439,6 +442,34 @@ mod tests {
     }
 
     #[test]
+    fn every_finished_t3_status_reads_done_until_seen_then_idle() {
+        let statuses = [
+            "completed",
+            "interrupted",
+            "failed",
+            "cancelled",
+            "rolled_back",
+        ];
+        let threads = statuses
+            .iter()
+            .flat_map(|status| {
+                [true, false].map(|unseen| T3Thread {
+                    unseen,
+                    ..thread(status, status, "codex", 60)
+                })
+            })
+            .collect();
+        let displays: Vec<Display> = items(&snapshot(threads), NOW)
+            .iter()
+            .map(|item| item.row.display)
+            .collect();
+        assert_eq!(
+            displays,
+            [Display::Done, Display::Idle].repeat(statuses.len())
+        );
+    }
+
+    #[test]
     fn a_pinned_t3_thread_stays_pinned_and_out_of_the_working_section() {
         let pinned = |id, status, settled| T3Thread {
             pinned: true,
@@ -453,7 +484,7 @@ mod tests {
             NOW,
         );
         assert!(items[0].row.pinned);
-        assert_eq!(items[0].section(), None);
+        assert_eq!(items[0].row.section(), None);
         assert!(!items[1].row.pinned, "settling unpins, as in T3");
     }
 
@@ -465,7 +496,7 @@ mod tests {
         };
         let items = items(&snapshot(vec![woke]), NOW);
         assert_eq!(items[0].row.park, None);
-        assert_eq!(items[0].section(), None);
+        assert_eq!(items[0].row.section(), None);
     }
 
     #[test]

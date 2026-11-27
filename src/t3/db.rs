@@ -28,7 +28,7 @@ const THREADS: &str = "
 
 const PROJECTS: &str = "SELECT project_id, title FROM projection_projects WHERE deleted_at IS NULL";
 
-const FINISHED: [&str; 5] = [
+pub(super) const FINISHED: [&str; 5] = [
     "completed",
     "interrupted",
     "failed",
