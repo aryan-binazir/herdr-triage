@@ -358,7 +358,7 @@ fn save(tx: &Transaction, state: &State, before: &State) -> rusqlite::Result<()>
             }
         }
     }
-    // Nothing uses last_status any more; v0.2.6 still needs the NOT NULL column and accepts any text.
+    // last_status is unread by this release; v0.2.6 still requires it and accepts any text.
     let mut insert = tx.prepare(
         "INSERT OR REPLACE INTO threads (key, pinned, park, snooze_until, unread, ack_seq, generation, \
          last_seq, changed_at, touched_at, live, ended, missing_since, last_status, label, agent, \
