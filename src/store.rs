@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 
-use crate::triage::{Park, Record, Section, SessionRef, State, Status, Thread, Unread};
+use crate::triage::{Park, Record, Section, SessionRef, State, Thread, Unread};
 
 const SCHEMA_VERSION: i32 = 8;
 
@@ -173,18 +173,7 @@ impl Store {
         self.import_legacy_json(&mut connection)?;
         let tx = connection.transaction().map_err(broken)?;
         let mut state = load(&tx).map_err(broken)?;
-        let State {
-            records,
-            open_sections,
-            undo,
-            last_focused,
-        } = &state;
-        let before = State {
-            records: records.clone(),
-            open_sections: open_sections.clone(),
-            undo: undo.clone(),
-            last_focused: last_focused.clone(),
-        };
+        let before = state.clone();
         let result = change(&mut state);
         save(&tx, &state, &before).map_err(broken)?;
         tx.commit().map_err(broken)?;
@@ -225,7 +214,7 @@ impl std::fmt::Display for DatabaseError {
 
 impl std::error::Error for DatabaseError {}
 
-const LATER_COLUMNS: [(&str, &str); 7] = [
+const LATER_COLUMNS: &[(&str, &str)] = &[
     ("ended", "INTEGER NOT NULL DEFAULT 0"),
     ("reopen_generation", "TEXT"),
     ("restored_at", "INTEGER"),
@@ -240,7 +229,7 @@ fn add_missing_columns(connection: &Connection) -> rusqlite::Result<()> {
     let existing: BTreeSet<String> = columns
         .query_map([], |row| row.get(0))?
         .collect::<Result<_, _>>()?;
-    for (name, definition) in LATER_COLUMNS {
+    for &(name, definition) in LATER_COLUMNS {
         if !existing.contains(name) {
             connection.execute_batch(&format!(
                 "ALTER TABLE threads ADD COLUMN {name} {definition}"
@@ -261,7 +250,7 @@ fn load(tx: &Transaction) -> rusqlite::Result<State> {
     let mut state = State::default();
     let mut threads = tx.prepare(
         "SELECT key, pinned, park, snooze_until, unread, ack_seq, generation, last_seq, \
-         changed_at, touched_at, live, ended, missing_since, last_status, label, agent, cwd, \
+         changed_at, touched_at, live, ended, missing_since, label, agent, cwd, \
          workspace_id, workspace_label, session_source, session_kind, session_value, \
          reopen_pane, reopen_at, reopen_generation, restored_at, title, launched_by, \
          settle_requested, close_requested FROM threads",
@@ -272,7 +261,7 @@ fn load(tx: &Transaction) -> rusqlite::Result<State> {
             (Some("snoozed"), Some(until)) => Some(Park::Snoozed { until }),
             _ => None,
         };
-        let session = match (row.get(19)?, row.get(20)?, row.get(21)?) {
+        let session = match (row.get(18)?, row.get(19)?, row.get(20)?) {
             (Some(source), Some(kind), Some(value)) => Some(SessionRef {
                 source,
                 kind,
@@ -299,23 +288,22 @@ fn load(tx: &Transaction) -> rusqlite::Result<State> {
             live: row.get(10)?,
             ended: row.get(11)?,
             missing_since: row.get(12)?,
-            last_status: status_from(&row.get::<_, String>(13)?),
             thread: Thread {
-                label: row.get(14)?,
-                agent: row.get(15)?,
-                cwd: row.get(16)?,
-                workspace_id: row.get(17)?,
-                workspace_label: row.get(18)?,
+                label: row.get(13)?,
+                agent: row.get(14)?,
+                cwd: row.get(15)?,
+                workspace_id: row.get(16)?,
+                workspace_label: row.get(17)?,
                 session,
             },
-            reopen_pane: row.get(22)?,
-            reopen_at: row.get(23)?,
-            reopen_generation: row.get(24)?,
-            restored_at: row.get(25)?,
-            title: row.get(26)?,
-            launched_by: row.get(27)?,
-            settle_requested: row.get(28)?,
-            close_requested: row.get(29)?,
+            reopen_pane: row.get(21)?,
+            reopen_at: row.get(22)?,
+            reopen_generation: row.get(23)?,
+            restored_at: row.get(24)?,
+            title: row.get(25)?,
+            launched_by: row.get(26)?,
+            settle_requested: row.get(27)?,
+            close_requested: row.get(28)?,
         };
         Ok((row.get::<_, String>(0)?, record))
     })?;
@@ -370,14 +358,15 @@ fn save(tx: &Transaction, state: &State, before: &State) -> rusqlite::Result<()>
             }
         }
     }
+    // Nothing reads last_status, but the column is NOT NULL and older releases still read it.
     let mut insert = tx.prepare(
         "INSERT OR REPLACE INTO threads (key, pinned, park, snooze_until, unread, ack_seq, generation, \
          last_seq, changed_at, touched_at, live, ended, missing_since, last_status, label, agent, \
          cwd, workspace_id, workspace_label, session_source, session_kind, session_value, \
          reopen_pane, reopen_at, reopen_generation, restored_at, title, launched_by, settle_requested, \
          close_requested) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, \
-         ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30)",
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, 'unknown', ?14, ?15, ?16, ?17, \
+         ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29)",
     )?;
     for (key, r) in &state.records {
         if before.records.get(key) == Some(r) {
@@ -408,7 +397,6 @@ fn save(tx: &Transaction, state: &State, before: &State) -> rusqlite::Result<()>
             r.live,
             r.ended,
             r.missing_since,
-            status_name(r.last_status),
             r.thread.label,
             r.thread.agent,
             r.thread.cwd,
@@ -469,26 +457,6 @@ fn save_last_focused(tx: &Transaction, key: Option<&str>) -> rusqlite::Result<()
     Ok(())
 }
 
-fn status_name(status: Status) -> &'static str {
-    match status {
-        Status::Idle => "idle",
-        Status::Working => "working",
-        Status::Blocked => "blocked",
-        Status::Done => "done",
-        Status::Unknown => "unknown",
-    }
-}
-
-fn status_from(name: &str) -> Status {
-    match name {
-        "idle" => Status::Idle,
-        "working" => Status::Working,
-        "blocked" => Status::Blocked,
-        "done" => Status::Done,
-        _ => Status::Unknown,
-    }
-}
-
 fn fnv1a(bytes: &[u8]) -> u64 {
     bytes.iter().fold(0xcbf2_9ce4_8422_2325, |hash, byte| {
         (hash ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3)
@@ -503,86 +471,6 @@ mod tests {
 
     use super::*;
 
-    fn save_full(tx: &Transaction, state: &State) -> rusqlite::Result<()> {
-        tx.execute("DELETE FROM threads", [])?;
-        let mut insert = tx.prepare(
-            "INSERT INTO threads (key, pinned, park, snooze_until, unread, ack_seq, generation, \
-             last_seq, changed_at, touched_at, live, ended, missing_since, last_status, label, agent, \
-             cwd, workspace_id, workspace_label, session_source, session_kind, session_value, \
-             reopen_pane, reopen_at, reopen_generation, restored_at, title, launched_by, settle_requested, \
-         close_requested) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, \
-             ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30)",
-        )?;
-        for (key, r) in &state.records {
-            let (park, until) = match r.park {
-                Some(Park::Settled) => (Some("settled"), None),
-                Some(Park::Snoozed { until }) => (Some("snoozed"), Some(until)),
-                None => (None, None),
-            };
-            let unread = r.unread.map(|unread| match unread {
-                Unread::Manual => "manual",
-                Unread::Left => "left",
-                Unread::Woke => "woke",
-            });
-            let session = r.thread.session.as_ref();
-            insert.execute(params![
-                key,
-                r.pinned,
-                park,
-                until,
-                unread,
-                r.ack_seq.and_then(|seq| i64::try_from(seq).ok()),
-                r.generation,
-                i64::try_from(r.last_seq).unwrap_or(i64::MAX),
-                r.changed_at,
-                r.touched_at,
-                r.live,
-                r.ended,
-                r.missing_since,
-                status_name(r.last_status),
-                r.thread.label,
-                r.thread.agent,
-                r.thread.cwd,
-                r.thread.workspace_id,
-                r.thread.workspace_label,
-                session.map(|s| &s.source),
-                session.map(|s| &s.kind),
-                session.map(|s| &s.value),
-                r.reopen_pane,
-                r.reopen_at,
-                r.reopen_generation,
-                r.restored_at,
-                r.title,
-                r.launched_by,
-                r.settle_requested,
-                r.close_requested,
-            ])?;
-        }
-        let sections: Vec<&str> = state
-            .open_sections
-            .iter()
-            .map(|section| match section {
-                Section::Working => "working",
-                Section::Snoozed => "snoozed",
-                Section::Settled => "settled",
-            })
-            .collect();
-        tx.execute(
-            "INSERT OR REPLACE INTO settings VALUES ('open_sections', ?1)",
-            [sections.join(",")],
-        )?;
-        match &state.undo {
-            Some(undo) => tx.execute(
-                "INSERT OR REPLACE INTO settings VALUES ('undo', ?1)",
-                [serde_json::to_string(undo)
-                    .map_err(|error| rusqlite::Error::ToSqlConversionFailure(error.into()))?],
-            )?,
-            None => tx.execute("DELETE FROM settings WHERE name = 'undo'", [])?,
-        };
-        save_last_focused(tx, state.last_focused.as_deref())
-    }
-
     fn record() -> Record {
         Record {
             pinned: true,
@@ -596,7 +484,6 @@ mod tests {
             live: false,
             ended: true,
             missing_since: Some(1_050),
-            last_status: Status::Done,
             thread: Thread {
                 label: "fix flaky test".into(),
                 agent: Some("codex".into()),
@@ -684,43 +571,30 @@ mod tests {
     }
 
     #[test]
-    fn delta_matches_full_writer_for_edits_and_legacy_import() {
-        let a = tempfile::tempdir().unwrap();
-        let b = tempfile::tempdir().unwrap();
+    fn delta_writes_keep_the_store_equal_to_the_edited_state() {
+        let dir = tempfile::tempdir().unwrap();
         let json = r#"{"records":{"legacy":{"pinned":true,"generation":"g","last_seq":3,"last_seen":500}}}"#;
-        fs::write(a.path().join("state.json"), json).unwrap();
-        fs::write(b.path().join("state.json"), json).unwrap();
-        let delta = Store::at(b.path().to_owned());
-        for dir in [a.path(), b.path()] {
-            let connection = Connection::open(dir.join("triage.sqlite3")).unwrap();
-            connection.execute_batch(SCHEMA).unwrap();
-            connection
-                .execute(
-                    "INSERT INTO settings VALUES ('open_sections', 'working')",
-                    [],
-                )
-                .unwrap();
-            let mut stale = State::default();
-            stale.records.insert("stale".into(), record());
-            stale.rename("stale", Some("stale title".into()), 1);
-            connection
-                .execute(
-                    "INSERT INTO settings VALUES ('undo', ?1)",
-                    [serde_json::to_string(&stale.undo.unwrap()).unwrap()],
-                )
-                .unwrap();
-        }
-        let mut connection = Connection::open(a.path().join("triage.sqlite3")).unwrap();
-        let tx = connection.transaction().unwrap();
-        let imported: State = serde_json::from_str(json).unwrap();
-        save_full(&tx, &imported).unwrap();
-        tx.commit().unwrap();
-        fs::rename(
-            a.path().join("state.json"),
-            a.path().join("state.json.imported"),
-        )
-        .unwrap();
-        delta.transact(|_| ()).unwrap();
+        fs::write(dir.path().join("state.json"), json).unwrap();
+        let connection = Connection::open(dir.path().join("triage.sqlite3")).unwrap();
+        connection.execute_batch(SCHEMA).unwrap();
+        connection
+            .execute(
+                "INSERT INTO settings VALUES ('open_sections', 'working')",
+                [],
+            )
+            .unwrap();
+        let mut stale = State::default();
+        stale.records.insert("stale".into(), record());
+        stale.rename("stale", Some("stale title".into()), 1);
+        connection
+            .execute(
+                "INSERT INTO settings VALUES ('undo', ?1)",
+                [serde_json::to_string(&stale.undo.unwrap()).unwrap()],
+            )
+            .unwrap();
+        let store = Store::at(dir.path().to_owned());
+        let mut expected: State = serde_json::from_str(json).unwrap();
+        assert_eq!(store.transact(|s| s.clone()).unwrap(), expected);
         for i in 0..60 {
             let edit = |s: &mut State| {
                 let key = format!("k{}", i % 7);
@@ -739,6 +613,7 @@ mod tests {
                     }
                     3 => {
                         s.toggle_section(Section::Settled);
+                        s.last_focused = (i % 4 == 3).then_some(key);
                     }
                     4 => {
                         if let Some(k) = s.records.keys().next().cloned() {
@@ -754,24 +629,15 @@ mod tests {
                     }
                 }
             };
-            let mut connection = Connection::open(a.path().join("triage.sqlite3")).unwrap();
-            let tx = connection.transaction().unwrap();
-            let mut expected = load(&tx).unwrap();
             edit(&mut expected);
-            save_full(&tx, &expected).unwrap();
-            tx.commit().unwrap();
-            delta.transact(edit).unwrap();
-            let read = |dir: &Path| {
-                let mut connection = Connection::open(dir.join("triage.sqlite3")).unwrap();
-                load(&connection.transaction().unwrap()).unwrap()
-            };
-            assert_eq!(read(a.path()), read(b.path()), "step {i}");
+            store.transact(edit).unwrap();
+            assert_eq!(store.transact(|s| s.clone()).unwrap(), expected, "step {i}");
         }
     }
 
     fn raw_row(connection: &Connection) -> BTreeMap<String, Value> {
         let mut select = connection.prepare("SELECT * FROM threads").unwrap();
-        let names: Vec<String> = select.column_names().into_iter().map(Into::into).collect();
+        let names: Vec<String> = select.column_names().map(Into::into).collect();
         select
             .query_row([], |row| {
                 names
@@ -823,7 +689,12 @@ mod tests {
         store
             .transact(|s| s.records.insert("k".into(), record()))
             .unwrap();
-        assert_eq!(raw_row(&old), written);
+        let mut rewritten = raw_row(&old);
+        assert_eq!(
+            rewritten.insert("last_status".into(), Value::Text("done".into())),
+            Some(Value::Text("unknown".into()))
+        );
+        assert_eq!(rewritten, written);
     }
 
     #[test]
