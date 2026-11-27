@@ -897,7 +897,7 @@ mod tests {
             [&read[..], &["tab.list", view_set]].concat()
         );
 
-        *fake.fail_method.lock().unwrap() = Some("pane.close".into());
+        fake.fail("pane.close");
         assert!(
             session
                 .act("session:claude:id:id-w1:p2", Action::ToggleSettle)
@@ -996,9 +996,9 @@ mod tests {
     fn a_close_herdr_refuses_leaves_the_thread_open_and_undo_does_not_reopen_it() {
         let fake = two_resumable_agents();
         let (mut session, _) = connect(&fake);
-        *fake.fail_method.lock().unwrap() = Some("pane.close".into());
+        fake.fail("pane.close");
         assert!(session.act(KEY, Action::ToggleSettle).is_err());
-        *fake.fail_method.lock().unwrap() = None;
+        fake.stop_failing();
         let closed = store(&fake).transact(|state| state.ordered(&[])).unwrap();
         assert!(closed.is_empty(), "the thread is not listed as closed");
 
@@ -1043,7 +1043,7 @@ mod tests {
         );
         assert_eq!(fake.take("pane.focus"), [json!({"pane_id": "w1:p91"})]);
 
-        *fake.fail_method.lock().unwrap() = Some("pane.focus".into());
+        fake.fail("pane.focus");
         session.act(KEY, Action::Reopen).unwrap();
         assert_eq!(
             fake.take("tab.create").len(),
@@ -1107,14 +1107,14 @@ mod tests {
         let fake = two_resumable_agents();
         let (mut session, _) = connect(&fake);
         session.act(KEY, Action::ToggleSettle).unwrap();
-        *fake.fail_method.lock().unwrap() = Some("pane.send_input".into());
+        fake.fail("pane.send_input");
         assert!(session.act(KEY, Action::Reopen).is_err());
         assert_eq!(
             fake.take("pane.close").last(),
             Some(&json!({"pane_id": "w1:p91"}))
         );
 
-        *fake.fail_method.lock().unwrap() = None;
+        fake.stop_failing();
         fake.take("tab.create");
         session.act(KEY, Action::Reopen).unwrap();
         assert_eq!(
@@ -1227,7 +1227,7 @@ mod tests {
             let key = "session:opencode:id:ses_original";
             session.act(key, Action::ToggleSettle).unwrap();
             fake.take("pane.close");
-            *fake.fail_method.lock().unwrap() = Some(failing.into());
+            fake.fail(failing);
 
             assert!(session.act(key, Action::Reopen).is_err());
             assert_eq!(fake.take("pane.close"), [json!({"pane_id": "w1:p91"})]);
@@ -1235,7 +1235,7 @@ mod tests {
                 assert!(fake.take("pane.send_input").is_empty());
             }
 
-            *fake.fail_method.lock().unwrap() = None;
+            fake.stop_failing();
             fake.take("tab.create");
             assert_eq!(session.act(key, Action::Reopen).unwrap(), Outcome::Reopened);
             assert_eq!(fake.take("tab.create").len(), 1);
@@ -1331,7 +1331,7 @@ mod tests {
         fake.agents.lock().unwrap()[0]["agent_session"] = Value::Null;
         let (mut session, _) = connect(&fake);
         let key = "terminal:t-w1:p1";
-        *fake.fail_method.lock().unwrap() = Some("pane.close".into());
+        fake.fail("pane.close");
         assert!(session.act(key, Action::CloseForGood { seq: 3 }).is_err());
         assert!(fake.take("notification.show").is_empty());
         let kept = store(&fake)
@@ -1383,7 +1383,7 @@ mod tests {
         fake.agents.lock().unwrap()[0]["agent_session"] = Value::Null;
         let (mut session, _) = connect(&fake);
         let key = "terminal:t-w1:p1";
-        *fake.fail_method.lock().unwrap() = Some("notification.show".into());
+        fake.fail("notification.show");
         assert_eq!(
             session.act(key, Action::CloseForGood { seq: 3 }).unwrap(),
             Outcome::Done {
@@ -1474,7 +1474,7 @@ mod tests {
         let (mut session, _) = connect(&fake);
         let key = "session:codex:id:0199-abc";
         session.act(key, Action::ToggleSettle).unwrap();
-        *fake.fail_method.lock().unwrap() = Some("pane.report_agent_session".into());
+        fake.fail("pane.report_agent_session");
         assert!(session.act(key, Action::Reopen).is_err());
         assert_eq!(
             fake.take("pane.close").last(),
@@ -1509,7 +1509,7 @@ mod tests {
     fn a_failing_sync_still_serves_waiting_hook_requests_and_publishes_what_it_can() {
         let fake = two_resumable_agents();
         let (mut session, _) = connect(&fake);
-        *fake.fail_method.lock().unwrap() = Some("pane.report_metadata".into());
+        fake.fail("pane.report_metadata");
         store(&fake).request_sync().unwrap();
         assert!(session.view().is_err());
         assert!(
@@ -1531,7 +1531,7 @@ mod tests {
         let fake = two_resumable_agents();
         let (mut session, _) = connect(&fake);
         session.act(KEY, Action::ToggleSettle).unwrap();
-        *fake.fail_method.lock().unwrap() = Some("pane.send_input".into());
+        fake.fail("pane.send_input");
         hook_fires_during(&fake, "tab.create");
         assert!(session.act(KEY, Action::Reopen).is_err());
         assert!(
@@ -1816,9 +1816,9 @@ mod tests {
             agents[0]["agent_status"] = json!("idle");
             agents[0]["state_change_seq"] = json!(9);
         }
-        *fake.fail_method.lock().unwrap() = Some("pane.report_metadata".into());
+        fake.fail("pane.report_metadata");
         assert!(session.sync().is_err());
-        *fake.fail_method.lock().unwrap() = None;
+        fake.stop_failing();
         assert_eq!(fake.take("pane.close"), [json!({"pane_id": "w1:p1"})]);
     }
 
@@ -1894,7 +1894,7 @@ mod tests {
             agents[0]["agent_status"] = json!("idle");
             agents[0]["state_change_seq"] = json!(9);
         }
-        *fake.fail_method.lock().unwrap() = Some("pane.close".into());
+        fake.fail("pane.close");
         session.sync().unwrap();
         let notices = fake.take("notification.show");
         assert!(
@@ -1945,7 +1945,7 @@ mod tests {
             .lock()
             .unwrap()
             .retain(|a| a["pane_id"] != "w1:p2");
-        *fake.fail_method.lock().unwrap() = Some("agent.view.set".into());
+        fake.fail("agent.view.set");
         assert!(
             session
                 .act("terminal:t-w1:p1", Action::Snooze(NOW + 3600))

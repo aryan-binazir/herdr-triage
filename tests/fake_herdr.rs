@@ -8,19 +8,25 @@ use serde_json::{Value, json};
 use support::fake_herdr::{FakeHerdr, agent};
 
 trait RunBinary {
+    fn command(&self, args: &[&str]) -> Command;
     fn run(&self, args: &[&str]) -> Output;
 }
 
 impl RunBinary for FakeHerdr {
-    fn run(&self, args: &[&str]) -> Output {
-        let output = Command::new(env!("CARGO_BIN_EXE_herdr-triage"))
+    /// The binary as Herdr starts it for a plugin hook or keybinding.
+    fn command(&self, args: &[&str]) -> Command {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_herdr-triage"));
+        command
             .args(args)
             .env("HERDR_SOCKET_PATH", &self.socket)
             .env("HERDR_PLUGIN_ID", "ar.triage")
-            .env("HERDR_PLUGIN_STATE_DIR", self.dir.path().join("state"))
-            .env("HERDR_PLUGIN_CONFIG_DIR", self.dir.path().join("config"))
-            .output()
-            .unwrap();
+            .env("HERDR_PLUGIN_STATE_DIR", self.state_dir())
+            .env("HERDR_PLUGIN_CONFIG_DIR", self.dir.path().join("config"));
+        command
+    }
+
+    fn run(&self, args: &[&str]) -> Output {
+        let output = self.command(args).output().unwrap();
         assert!(
             output.status.success(),
             "{}",
@@ -129,11 +135,8 @@ fn next_advances_from_the_pane_it_was_invoked_from() {
     let mut focused = agent("w1:p3", "blocked", 2);
     focused["focused"] = json!(true);
     let herdr = FakeHerdr::start(vec![focused, agent("w1:p1", "blocked", 9)]);
-    let output = Command::new(env!("CARGO_BIN_EXE_herdr-triage"))
-        .arg("next")
-        .env("HERDR_SOCKET_PATH", &herdr.socket)
-        .env("HERDR_PLUGIN_ID", "ar.triage")
-        .env("HERDR_PLUGIN_STATE_DIR", herdr.dir.path().join("state"))
+    let output = herdr
+        .command(&["next"])
         .env(
             "HERDR_PLUGIN_CONTEXT_JSON",
             r#"{"focused_pane_id":"w1:p1"}"#,
@@ -178,15 +181,7 @@ fn a_burst_of_hooks_coalesces_into_a_few_syncs() {
     herdr.take("agent.list");
     *herdr.list_delay.lock().unwrap() = std::time::Duration::from_millis(100);
     let hooks: Vec<_> = (0..30)
-        .map(|_| {
-            Command::new(env!("CARGO_BIN_EXE_herdr-triage"))
-                .arg("sync")
-                .env("HERDR_SOCKET_PATH", &herdr.socket)
-                .env("HERDR_PLUGIN_ID", "ar.triage")
-                .env("HERDR_PLUGIN_STATE_DIR", herdr.state_dir())
-                .spawn()
-                .unwrap()
-        })
+        .map(|_| herdr.command(&["sync"]).spawn().unwrap())
         .collect();
     for mut hook in hooks {
         assert!(hook.wait().unwrap().success());
@@ -199,7 +194,6 @@ fn a_burst_of_hooks_coalesces_into_a_few_syncs() {
 fn startup_rearms_snooze_timers_even_when_publishing_fails() {
     let herdr = FakeHerdr::start(vec![agent("w1:p1", "idle", 3)]);
     herdr.run(&["sync"]);
-    let state_dir = herdr.state_dir();
     let since_epoch = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap();
@@ -208,13 +202,8 @@ fn startup_rearms_snooze_timers_even_when_publishing_fails() {
         i64::try_from(since_epoch.as_secs()).unwrap() + 3_600 + i64::from(unique_to_this_run);
     park(&herdr, "terminal:t-w1:p1", "snoozed", Some(wake));
 
-    *herdr.fail_method.lock().unwrap() = Some("agent.view.set".into());
-    let output = Command::new(env!("CARGO_BIN_EXE_herdr-triage"))
-        .arg("startup")
-        .env("HERDR_SOCKET_PATH", &herdr.socket)
-        .env("HERDR_PLUGIN_STATE_DIR", &state_dir)
-        .output()
-        .unwrap();
+    herdr.fail("agent.view.set");
+    let output = herdr.command(&["startup"]).output().unwrap();
     assert!(!output.status.success());
     let sleeper = format!("{} wake-at {wake}", env!("CARGO_BIN_EXE_herdr-triage"));
     let sleepers = Command::new("pgrep")
@@ -244,10 +233,8 @@ fn next_says_so_when_nothing_needs_you() {
 #[test]
 fn open_launches_the_picker_popup_aimed_at_the_invoking_pane() {
     let herdr = FakeHerdr::start(vec![]);
-    let output = Command::new(env!("CARGO_BIN_EXE_herdr-triage"))
-        .arg("open")
-        .env("HERDR_SOCKET_PATH", &herdr.socket)
-        .env("HERDR_PLUGIN_ID", "ar.triage")
+    let output = herdr
+        .command(&["open"])
         .env(
             "HERDR_PLUGIN_CONTEXT_JSON",
             r#"{"focused_pane_id":"w1:p7"}"#,
@@ -270,7 +257,7 @@ fn open_launches_the_picker_popup_aimed_at_the_invoking_pane() {
 #[test]
 fn sync_and_next_do_not_depend_on_tabs() {
     let herdr = FakeHerdr::start(vec![agent("w1:p1", "blocked", 3)]);
-    *herdr.fail_method.lock().unwrap() = Some("tab.list".into());
+    herdr.fail("tab.list");
     herdr.run(&["sync"]);
     let requests = std::mem::take(&mut *herdr.requests.lock().unwrap());
     let methods: Vec<_> = requests
@@ -349,10 +336,8 @@ fn wakers_share_each_deadline_and_remove_expired_locks() {
     let mut wakers: Vec<_> = [now + 4, now + 4, now + 4, now + 4, now + 6]
         .into_iter()
         .map(|until| {
-            Command::new(env!("CARGO_BIN_EXE_herdr-triage"))
-                .args(["wake-at", &until.to_string()])
-                .env("HERDR_SOCKET_PATH", &herdr.socket)
-                .env("HERDR_PLUGIN_STATE_DIR", herdr.state_dir())
+            herdr
+                .command(&["wake-at", &until.to_string()])
                 .spawn()
                 .unwrap()
         })
@@ -424,14 +409,7 @@ fn an_overdue_waker_started_during_sync_requests_another_sync() {
         .open(server_dir(&herdr).join("state.lock"))
         .unwrap();
     *herdr.list_delay.lock().unwrap() = std::time::Duration::from_secs(2);
-    let spawn = || {
-        Command::new(env!("CARGO_BIN_EXE_herdr-triage"))
-            .args(["wake-at", "0"])
-            .env("HERDR_SOCKET_PATH", &herdr.socket)
-            .env("HERDR_PLUGIN_STATE_DIR", herdr.state_dir())
-            .spawn()
-            .unwrap()
-    };
+    let spawn = || herdr.command(&["wake-at", "0"]).spawn().unwrap();
     let mut first = spawn();
     let started = std::time::Instant::now();
     let syncing = loop {

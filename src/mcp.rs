@@ -521,7 +521,7 @@ mod tests {
         }
 
         fn refuse(&self, method: &str, code: &str) {
-            *self.fake.fail_method.lock().unwrap() = Some(method.to_owned());
+            self.fake.fail(method);
             *self.fake.fail_code.lock().unwrap() = code.to_owned();
         }
 
@@ -1158,7 +1158,7 @@ mod tests {
             (&json!(true), &json!("working"))
         );
 
-        *rig.fake.fail_method.lock().unwrap() = None;
+        rig.fake.stop_failing();
         rig.fake.agents.lock().unwrap()[0]["agent_status"] = json!("blocked");
         let waited = rig.ok("herdr_wait", json!({"thread": "w1:p1"}));
         assert_eq!(waited["timed_out"], false);
