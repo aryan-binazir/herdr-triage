@@ -5,7 +5,7 @@ use chrono::TimeZone;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::t3::Op as T3Op;
-use crate::triage::{Action, Display, Park, Refusal, Row, Section, SnoozePreset, snooze_presets};
+use crate::triage::{Action, Park, Refusal, Row, Section, SnoozePreset, snooze_presets};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Target {
@@ -191,7 +191,7 @@ impl Picker {
             .iter()
             .position(|&entry| entry == Entry::Agent(index))
             .or_else(|| {
-                let section = self.items[index].section()?;
+                let section = self.items[index].row.section()?;
                 self.entries.iter().position(
                     |entry| matches!(entry, Entry::Section { section: s, .. } if *s == section),
                 )
@@ -538,7 +538,7 @@ impl Picker {
             matches
                 .iter()
                 .copied()
-                .filter(|&i| items[i].section() == section)
+                .filter(|&i| items[i].row.section() == section)
                 .collect()
         };
         let mut entries: Vec<Entry> = in_section(None).into_iter().map(Entry::Agent).collect();
@@ -819,19 +819,6 @@ impl Item {
         match &self.target {
             Target::Pane(pane) => Some(pane),
             Target::Closed | Target::T3 { .. } => None,
-        }
-    }
-
-    pub fn section(&self) -> Option<Section> {
-        match (&self.target, self.row.park) {
-            (Target::T3 { .. }, Some(park)) => Some(park.section()),
-            (Target::T3 { .. }, None)
-                if self.row.display == Display::Working && !self.row.pinned =>
-            {
-                Some(Section::Working)
-            }
-            (Target::T3 { .. }, None) => None,
-            _ => self.row.section(),
         }
     }
 }

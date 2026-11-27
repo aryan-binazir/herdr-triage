@@ -651,9 +651,7 @@ impl Row {
     pub fn section(&self) -> Option<Section> {
         match self.park {
             Some(park) => Some(park.section()),
-            None if self.display == Display::Working && !self.pinned && self.live() => {
-                Some(Section::Working)
-            }
+            None if self.display == Display::Working && !self.pinned => Some(Section::Working),
             None => None,
         }
     }
